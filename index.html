@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Clipwise — Meeting intelligence that surfaces what matters</title>
+  <meta name="description" content="Clipwise captures your meetings and surfaces the moments your team needs to see. AI-native. Open source. Your data stays yours." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0D0D0D;
+      --surface:   #151515;
+      --orange:    #F4620A;
+      --orange-dim:#7A3106;
+      --yellow:    #F5C842;
+      --white:     #F5F0EB;
+      --muted:     #6B6B6B;
+      --border:    #222222;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--white);
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── NAV ── */
+    nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 24px 48px;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      background: rgba(13,13,13,0.92);
+      backdrop-filter: blur(12px);
+      z-index: 100;
+    }
+
+    .nav-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+    }
+
+    .nav-logo svg { width: 32px; height: 32px; }
+
+    .nav-wordmark {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--white);
+      letter-spacing: -0.02em;
+    }
+
+    .nav-cta {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--bg);
+      background: var(--orange);
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: opacity 0.15s;
+    }
+    .nav-cta:hover { opacity: 0.85; }
+
+    /* ── HERO ── */
+    .hero {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      padding: 100px 24px 80px;
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    .eyebrow {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--orange);
+      margin-bottom: 28px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .eyebrow::before, .eyebrow::after {
+      content: '';
+      display: block;
+      width: 24px;
+      height: 1px;
+      background: var(--orange-dim);
+    }
+
+    /* Animated waveform — the signature element */
+    .waveform {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      margin-bottom: 48px;
+      height: 64px;
+    }
+
+    .waveform-bar {
+      width: 4px;
+      background: var(--orange);
+      border-radius: 2px;
+      animation: pulse 1.4s ease-in-out infinite;
+      transform-origin: bottom center;
+    }
+
+    .waveform-bar:nth-child(1)  { height: 18px; animation-delay: 0s;    opacity: 0.4; }
+    .waveform-bar:nth-child(2)  { height: 30px; animation-delay: 0.1s;  opacity: 0.6; }
+    .waveform-bar:nth-child(3)  { height: 48px; animation-delay: 0.2s;  opacity: 0.9; }
+    .waveform-bar:nth-child(4)  { height: 56px; animation-delay: 0.05s; opacity: 1;   }
+    .waveform-bar:nth-child(5)  { height: 40px; animation-delay: 0.15s; opacity: 0.8; }
+    .waveform-bar:nth-child(6)  { height: 56px; animation-delay: 0.25s; opacity: 1;   }
+    .waveform-bar:nth-child(7)  { height: 48px; animation-delay: 0.1s;  opacity: 0.9; }
+    .waveform-bar:nth-child(8)  { height: 30px; animation-delay: 0.2s;  opacity: 0.6; }
+    .waveform-bar:nth-child(9)  { height: 18px; animation-delay: 0s;    opacity: 0.4; }
+
+    @keyframes pulse {
+      0%, 100% { transform: scaleY(1); }
+      50%       { transform: scaleY(0.45); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .waveform-bar { animation: none; }
+    }
+
+    .rec-dot {
+      width: 9px;
+      height: 9px;
+      background: var(--yellow);
+      border-radius: 50%;
+      margin-left: 4px;
+      animation: blink 2s ease-in-out infinite;
+      flex-shrink: 0;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.2; }
+    }
+
+    h1 {
+      font-size: clamp(36px, 6vw, 68px);
+      font-weight: 900;
+      line-height: 1.04;
+      letter-spacing: -0.03em;
+      color: var(--white);
+      margin-bottom: 24px;
+    }
+
+    h1 em {
+      font-style: normal;
+      color: var(--orange);
+    }
+
+    .hero-sub {
+      font-size: clamp(16px, 2.2vw, 20px);
+      font-weight: 400;
+      line-height: 1.6;
+      color: var(--muted);
+      max-width: 580px;
+      margin-bottom: 48px;
+    }
+
+    /* ── WAITLIST FORM ── */
+    .waitlist {
+      display: flex;
+      gap: 10px;
+      width: 100%;
+      max-width: 440px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .waitlist input[type="email"] {
+      flex: 1;
+      min-width: 220px;
+      padding: 14px 18px;
+      font-family: 'Inter', sans-serif;
+      font-size: 15px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--white);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    .waitlist input[type="email"]::placeholder { color: var(--muted); }
+    .waitlist input[type="email"]:focus { border-color: var(--orange); }
+
+    .waitlist button {
+      padding: 14px 24px;
+      font-family: 'Inter', sans-serif;
+      font-size: 15px;
+      font-weight: 600;
+      background: var(--orange);
+      color: var(--bg);
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      white-space: nowrap;
+    }
+    .waitlist button:hover { opacity: 0.85; }
+
+    .waitlist-note {
+      margin-top: 14px;
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: 0.01em;
+    }
+
+    /* ── DIVIDER ── */
+    .divider {
+      width: 100%;
+      max-width: 960px;
+      margin: 0 auto;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* ── FEATURES ── */
+    .features {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 80px 48px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 48px 40px;
+    }
+
+    .feature-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--orange);
+      margin-bottom: 12px;
+    }
+
+    .feature h3 {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--white);
+      margin-bottom: 10px;
+      line-height: 1.2;
+    }
+
+    .feature p {
+      font-size: 14px;
+      line-height: 1.7;
+      color: var(--muted);
+    }
+
+    /* ── OPEN SOURCE BAND ── */
+    .oss-band {
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 48px;
+      flex-wrap: wrap;
+    }
+
+    .oss-band-text h2 {
+      font-size: clamp(22px, 3.5vw, 32px);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 8px;
+    }
+
+    .oss-band-text p {
+      font-size: 15px;
+      color: var(--muted);
+      line-height: 1.6;
+      max-width: 420px;
+    }
+
+    .oss-pills {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      padding: 8px 14px;
+      border-radius: 100px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+
+    .pill.active {
+      border-color: var(--orange-dim);
+      color: var(--orange);
+      background: rgba(244,98,10,0.07);
+    }
+
+    /* ── FOOTER ── */
+    footer {
+      padding: 40px 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    .footer-logo {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      text-decoration: none;
+    }
+
+    .footer-logo svg { width: 24px; height: 24px; }
+
+    .footer-wordmark {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 24px;
+    }
+
+    .footer-links a {
+      font-size: 13px;
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+    .footer-links a:hover { color: var(--white); }
+
+    /* ── SUCCESS STATE ── */
+    .success-msg {
+      display: none;
+      margin-top: 16px;
+      font-size: 14px;
+      color: var(--orange);
+      font-weight: 500;
+    }
+
+    /* ── MOBILE ── */
+    @media (max-width: 640px) {
+      nav { padding: 18px 20px; }
+      .hero { padding: 72px 20px 60px; }
+      .features { padding: 60px 20px; }
+      .oss-band { padding: 40px 20px; gap: 32px; }
+      footer { padding: 32px 20px; flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <a href="/" class="nav-logo" aria-label="Clipwise home">
+    <!-- Icon mark: orange rounded square with waveform bars + yellow dot -->
+    <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect width="40" height="40" rx="9" fill="#F4620A"/>
+      <rect x="10" y="17" width="3.5" height="10" rx="1.75" fill="white" opacity="0.6"/>
+      <rect x="15.5" y="12" width="3.5" height="15" rx="1.75" fill="white" opacity="0.8"/>
+      <rect x="21" y="8"  width="3.5" height="20" rx="1.75" fill="white"/>
+      <rect x="26.5" y="13" width="3.5" height="13" rx="1.75" fill="white" opacity="0.7"/>
+      <circle cx="34" cy="7" r="4" fill="#F5C842"/>
+    </svg>
+    <span class="nav-wordmark">Clipwise</span>
+  </a>
+  <a href="#waitlist" class="nav-cta">Join waitlist</a>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="eyebrow">
+    Early access
+    <span class="rec-dot" aria-hidden="true"></span>
+  </div>
+
+  <div class="waveform" aria-hidden="true">
+    <div class="waveform-bar"></div>
+    <div class="waveform-bar"></div>
+    <div class="waveform-bar"></div>
+    <div class="waveform-bar"></div>
+    <div class="waveform-bar"></div>
+    <div class="waveform-bar"></div>
+    <div class="waveform-bar"></div>
+    <div class="waveform-bar"></div>
+    <div class="waveform-bar"></div>
+  </div>
+
+  <h1>Your meetings hold<br/><em>more than you remember</em></h1>
+
+  <p class="hero-sub">
+    Clipwise captures every meeting and surfaces the moments your team actually needs to see — decisions, insights, and the clips worth sharing. AI-native. Open source. Your data stays yours.
+  </p>
+
+  <div class="waitlist" id="waitlist">
+    <input type="email" id="email-input" placeholder="your@email.com" autocomplete="email" aria-label="Email address" />
+    <button onclick="handleSubmit()">Get early access</button>
+  </div>
+  <p class="waitlist-note">No spam. Early access invite when we're ready.</p>
+  <p class="success-msg" id="success-msg">✓ You're on the list. We'll be in touch.</p>
+</section>
+
+<div class="divider"></div>
+
+<!-- FEATURES -->
+<section class="features" aria-label="What Clipwise does">
+
+  <div class="feature">
+    <div class="feature-label">Intelligence</div>
+    <h3>Surface what matters, automatically</h3>
+    <p>AI identifies the moments worth revisiting — decisions made, questions raised, commitments given. Not a wall of transcript.</p>
+  </div>
+
+  <div class="feature">
+    <div class="feature-label">Clips</div>
+    <h3>Share the exact moment, not the whole meeting</h3>
+    <p>Create and share short clips from any meeting. Bring context to the people who weren't in the room without asking them to watch an hour of video.</p>
+  </div>
+
+  <div class="feature">
+    <div class="feature-label">Team memory</div>
+    <h3>Institutional knowledge that doesn't walk out the door</h3>
+    <p>Every important conversation, searchable. Onboard new teammates faster. Stop re-litigating decisions that were already made.</p>
+  </div>
+
+  <div class="feature">
+    <div class="feature-label">Privacy</div>
+    <h3>Your conversations never leave your infrastructure</h3>
+    <p>Self-host Clipwise on your own infrastructure. Meeting recordings and transcripts stay completely within your control.</p>
+  </div>
+
+</section>
+
+<!-- OSS BAND -->
+<div class="oss-band">
+  <div class="oss-band-text">
+    <h2>Built to be open</h2>
+    <p>Clipwise is open source and self-hostable. Enterprise teams get full control. We're building in public from day one.</p>
+  </div>
+  <div class="oss-pills">
+    <span class="pill active">Open source</span>
+    <span class="pill active">Self-hostable</span>
+    <span class="pill">Apache 2.0</span>
+    <span class="pill">Real-time transcription</span>
+    <span class="pill">CRM sync</span>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<footer>
+  <a href="/" class="footer-logo" aria-label="Clipwise">
+    <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect width="40" height="40" rx="9" fill="#F4620A"/>
+      <rect x="10" y="17" width="3.5" height="10" rx="1.75" fill="white" opacity="0.6"/>
+      <rect x="15.5" y="12" width="3.5" height="15" rx="1.75" fill="white" opacity="0.8"/>
+      <rect x="21" y="8"  width="3.5" height="20" rx="1.75" fill="white"/>
+      <rect x="26.5" y="13" width="3.5" height="13" rx="1.75" fill="white" opacity="0.7"/>
+      <circle cx="34" cy="7" r="4" fill="#F5C842"/>
+    </svg>
+    <span class="footer-wordmark">Clipwise</span>
+  </a>
+  <nav class="footer-links" aria-label="Footer navigation">
+    <a href="https://github.com/clipwiseapp/clipwise" target="_blank" rel="noopener">GitHub</a>
+    <a href="mailto:jd@clipwiseapp.com">Contact</a>
+  </nav>
+</footer>
+
+<script>
+  function handleSubmit() {
+    const input = document.getElementById('email-input');
+    const success = document.getElementById('success-msg');
+    const email = input.value.trim();
+
+    if (!email || !email.includes('@')) {
+      input.focus();
+      input.style.borderColor = '#F4620A';
+      setTimeout(() => input.style.borderColor = '', 1200);
+      return;
+    }
+
+    // TODO: wire to your waitlist backend (Mailchimp, Loops, Buttondown, etc.)
+    console.log('Waitlist signup:', email);
+
+    input.style.display = 'none';
+    input.nextElementSibling.style.display = 'none';
+    success.style.display = 'block';
+  }
+
+  document.getElementById('email-input').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') handleSubmit();
+  });
+</script>
+
+</body>
+</html>
