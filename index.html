@@ -497,7 +497,7 @@
 </footer>
 
 <script>
-  function handleSubmit() {
+  async function handleSubmit() {
     const input = document.getElementById('email-input');
     const success = document.getElementById('success-msg');
     const email = input.value.trim();
@@ -509,12 +509,28 @@
       return;
     }
 
-    // TODO: wire to your waitlist backend (Mailchimp, Loops, Buttondown, etc.)
-    console.log('Waitlist signup:', email);
+    try {
+      const res = await fetch('/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
 
-    input.style.display = 'none';
-    input.nextElementSibling.style.display = 'none';
-    success.style.display = 'block';
+      const data = await res.json();
+
+      if (!res.ok) throw new Error(data.error || 'Something went wrong');
+
+      input.style.display = 'none';
+      input.nextElementSibling.style.display = 'none';
+      success.style.display = 'block';
+    } catch (err) {
+      input.style.borderColor = '#F4620A';
+      input.placeholder = err.message || 'Something went wrong, try again';
+      setTimeout(() => {
+        input.style.borderColor = '';
+        input.placeholder = 'your@email.com';
+      }, 3000);
+    }
   }
 
   document.getElementById('email-input').addEventListener('keydown', function(e) {
