@@ -10,7 +10,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const response = await fetch('https://api.resend.com/contacts', {
+    const response = await fetch('https://api.resend.com/audiences/5130b127-948a-4598-a66c-e2189911bd21/contacts', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
