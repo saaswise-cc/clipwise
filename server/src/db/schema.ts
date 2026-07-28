@@ -12,11 +12,12 @@ import {
   uniqueIndex,
   uuid,
   varchar,
+  vector,
 } from "drizzle-orm/pg-core";
 
-// NOTE: pgvector embedding columns (e.g. transcripts.embedding, moments.embedding)
-// will be added via a separate migration once the `vector` extension is enabled
-// on the Neon database.
+// NOTE: The `embedding vector(1536)` columns on moments and segments require
+// the pgvector extension. Enable it on the Neon database (CREATE EXTENSION
+// IF NOT EXISTS vector) before running the generated migration.
 
 export const accounts = pgTable(
   "accounts",
@@ -151,6 +152,7 @@ export const segments = pgTable(
     endSec: doublePrecision("end_sec").notNull(),
     text: text("text").notNull(),
     orderIndex: integer("order_index").notNull(),
+    embedding: vector("embedding", { dimensions: 1536 }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`now()`),
@@ -177,6 +179,7 @@ export const moments = pgTable(
     startSec: doublePrecision("start_sec").notNull(),
     endSec: doublePrecision("end_sec").notNull(),
     score: doublePrecision("score"),
+    embedding: vector("embedding", { dimensions: 1536 }),
     metadata: jsonb("metadata"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
