@@ -1,6 +1,7 @@
 import { relations, sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   doublePrecision,
   index,
   integer,
@@ -12,6 +13,10 @@ import {
   uuid,
   varchar,
 } from "drizzle-orm/pg-core";
+
+// NOTE: pgvector embedding columns (e.g. transcripts.embedding, moments.embedding)
+// will be added via a separate migration once the `vector` extension is enabled
+// on the Neon database.
 
 export const accounts = pgTable(
   "accounts",
@@ -63,6 +68,7 @@ export const recordings = pgTable(
     accountId: uuid("account_id")
       .notNull()
       .references(() => accounts.id, { onDelete: "cascade" }),
+    slug: varchar("slug", { length: 128 }),
     title: varchar("title", { length: 512 }),
     source: varchar("source", { length: 64 }),
     sourceId: varchar("source_id", { length: 256 }),
@@ -71,6 +77,7 @@ export const recordings = pgTable(
     startedAt: timestamp("started_at", { withTimezone: true }),
     endedAt: timestamp("ended_at", { withTimezone: true }),
     status: varchar("status", { length: 32 }).notNull().default("pending"),
+    meetingKind: varchar("meeting_kind", { length: 32 }),
     metadata: jsonb("metadata"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -82,6 +89,7 @@ export const recordings = pgTable(
   (t) => ({
     accountIdx: index("recordings_account_idx").on(t.accountId),
     sourceIdx: index("recordings_source_idx").on(t.source, t.sourceId),
+    slugIdx: uniqueIndex("recordings_slug_idx").on(t.slug),
   }),
 );
 
@@ -198,6 +206,7 @@ export const clips = pgTable(
     createdBy: uuid("created_by").references(() => people.id, {
       onDelete: "set null",
     }),
+    slug: varchar("slug", { length: 128 }),
     title: varchar("title", { length: 512 }),
     description: text("description"),
     startSec: doublePrecision("start_sec").notNull(),
@@ -215,6 +224,7 @@ export const clips = pgTable(
   (t) => ({
     accountIdx: index("clips_account_idx").on(t.accountId),
     recordingIdx: index("clips_recording_idx").on(t.recordingId),
+    slugIdx: uniqueIndex("clips_slug_idx").on(t.slug),
   }),
 );
 
@@ -231,6 +241,7 @@ export const attendees = pgTable(
     email: varchar("email", { length: 320 }),
     name: varchar("name", { length: 256 }),
     role: varchar("role", { length: 64 }),
+    domainKind: varchar("domain_kind", { length: 32 }),
     isHost: boolean("is_host").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -241,6 +252,9 @@ export const attendees = pgTable(
   }),
 );
 
+// A share points to either a clip OR a recording (not both, not neither).
+// The `shares_target_exactly_one` check constraint below enforces XOR:
+// exactly one of clip_id or recording_id must be non-null.
 export const shares = pgTable(
   "shares",
   {
@@ -248,9 +262,12 @@ export const shares = pgTable(
     accountId: uuid("account_id")
       .notNull()
       .references(() => accounts.id, { onDelete: "cascade" }),
-    clipId: uuid("clip_id")
-      .notNull()
-      .references(() => clips.id, { onDelete: "cascade" }),
+    clipId: uuid("clip_id").references(() => clips.id, {
+      onDelete: "cascade",
+    }),
+    recordingId: uuid("recording_id").references(() => recordings.id, {
+      onDelete: "cascade",
+    }),
     createdBy: uuid("created_by").references(() => people.id, {
       onDelete: "set null",
     }),
@@ -270,6 +287,11 @@ export const shares = pgTable(
   (t) => ({
     tokenIdx: uniqueIndex("shares_token_idx").on(t.token),
     clipIdx: index("shares_clip_idx").on(t.clipId),
+    recordingIdx: index("shares_recording_idx").on(t.recordingId),
+    targetExactlyOne: check(
+      "shares_target_exactly_one",
+      sql`(${t.clipId} IS NOT NULL) <> (${t.recordingId} IS NOT NULL)`,
+    ),
   }),
 );
 
@@ -299,6 +321,7 @@ export const recordingsRelations = relations(recordings, ({ one, many }) => ({
   moments: many(moments),
   clips: many(clips),
   attendees: many(attendees),
+  shares: many(shares),
 }));
 
 export const transcriptsRelations = relations(transcripts, ({ one, many }) => ({
@@ -379,6 +402,10 @@ export const sharesRelations = relations(shares, ({ one }) => ({
   clip: one(clips, {
     fields: [shares.clipId],
     references: [clips.id],
+  }),
+  recording: one(recordings, {
+    fields: [shares.recordingId],
+    references: [recordings.id],
   }),
   creator: one(people, {
     fields: [shares.createdBy],
