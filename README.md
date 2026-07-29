@@ -24,7 +24,7 @@ Clipwise inverts that:
 
 ```
 ┌────────────────────────────┐         ┌──────────────────────────────┐
-│  Mac Desktop Recorder      │         │  Self-Hosted Docker Server   │
+│  Mac Desktop Recorder      │         │  Self-Hosted Server          │
 │  ────────────────────────  │         │  ──────────────────────────  │
 │  • Electron shell          │  HTTPS  │  • Recording + transcript    │
 │  • Core Audio Taps         │────────▶│    storage                   │
@@ -47,7 +47,7 @@ Clipwise inverts that:
 ### Components
 
 1. **Mac desktop recorder** — Electron app using Core Audio Taps (macOS 14.2+) to capture both system audio and mic natively. No Recall.ai, no meeting-bot SDK, no third-party dependency in the capture path. Local Whisper handles transcription on-device.
-2. **Docker server** — Self-hostable container that stores raw recordings, transcripts, extracted clips, and the moments database. Exposes an MCP interface for AI clients.
+2. **Self-hosted server** — Stores raw recordings, transcripts, extracted clips, and the moments database, and exposes an MCP interface for AI clients. Currently runs on Vercel + Neon Postgres; a Docker Compose packaging for fully local self-hosting is coming later.
 3. **Clipwise MCP** — The bridge that lets Claude query your meeting history: search transcripts, pull clips, ask questions across the full corpus.
 
 Primary recording target is **Google Meet**. Other platforms will follow.
@@ -71,7 +71,7 @@ If you're a solo operator, small team, or security-conscious org that doesn't wa
 - ✅ Landing page live at [clipwiseapp.com](https://clipwiseapp.com)
 - ✅ Waitlist open
 - 🚧 Mac recorder (Electron + Core Audio Taps + local Whisper)
-- 🚧 Docker server + moments database
+- ✅ Self-hosted server + moments database (Neon, live)
 - 🚧 Clipwise MCP for Claude
 
 ## License
