@@ -4,6 +4,9 @@
   "private": true,
   "description": "Clipwise API server",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=20.11 <21"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",

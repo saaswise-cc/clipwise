@@ -1,5 +1,7 @@
 import "dotenv/config";
 import express, { type Request, type Response } from "express";
+import { sql } from "drizzle-orm";
+import { db } from "./db/index.js";
 import { accountsRouter } from "./routes/accounts.js";
 import { peopleRouter } from "./routes/people.js";
 import { recordingsRouter } from "./routes/recordings.js";
@@ -11,8 +13,14 @@ const app = express();
 
 app.use(express.json({ limit: "16mb" }));
 
-app.get("/health", (_req: Request, res: Response) => {
-  res.status(200).json({ status: "ok" });
+app.get("/health", async (_req: Request, res: Response) => {
+  try {
+    await db.execute(sql`select 1`);
+    res.status(200).json({ status: "ok", db: "ok" });
+  } catch (err) {
+    console.error("health check: database unreachable:", err);
+    res.status(503).json({ status: "error", db: "unreachable" });
+  }
 });
 
 app.use("/accounts", accountsRouter);
