@@ -142,6 +142,12 @@ export const segments = pgTable(
   "segments",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
+    recordingId: uuid("recording_id")
+      .notNull()
+      .references(() => recordings.id, { onDelete: "cascade" }),
     transcriptId: uuid("transcript_id")
       .notNull()
       .references(() => transcripts.id, { onDelete: "cascade" }),
@@ -158,10 +164,16 @@ export const segments = pgTable(
       .default(sql`now()`),
   },
   (t) => ({
+    accountIdx: index("segments_account_idx").on(t.accountId),
+    recordingIdx: index("segments_recording_idx").on(t.recordingId),
     transcriptIdx: index("segments_transcript_idx").on(t.transcriptId),
     transcriptOrderIdx: uniqueIndex("segments_transcript_order_idx").on(
       t.transcriptId,
       t.orderIndex,
+    ),
+    embeddingIdx: index("segments_embedding_idx").using(
+      "hnsw",
+      t.embedding.op("vector_cosine_ops"),
     ),
   }),
 );
@@ -170,6 +182,9 @@ export const moments = pgTable(
   "moments",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
     recordingId: uuid("recording_id")
       .notNull()
       .references(() => recordings.id, { onDelete: "cascade" }),
@@ -189,7 +204,12 @@ export const moments = pgTable(
       .default(sql`now()`),
   },
   (t) => ({
+    accountIdx: index("moments_account_idx").on(t.accountId),
     recordingIdx: index("moments_recording_idx").on(t.recordingId),
+    embeddingIdx: index("moments_embedding_idx").using(
+      "hnsw",
+      t.embedding.op("vector_cosine_ops"),
+    ),
   }),
 );
 
@@ -301,6 +321,8 @@ export const shares = pgTable(
 export const accountsRelations = relations(accounts, ({ many }) => ({
   people: many(people),
   recordings: many(recordings),
+  segments: many(segments),
+  moments: many(moments),
   clips: many(clips),
   shares: many(shares),
 }));
@@ -336,6 +358,14 @@ export const transcriptsRelations = relations(transcripts, ({ one, many }) => ({
 }));
 
 export const segmentsRelations = relations(segments, ({ one }) => ({
+  account: one(accounts, {
+    fields: [segments.accountId],
+    references: [accounts.id],
+  }),
+  recording: one(recordings, {
+    fields: [segments.recordingId],
+    references: [recordings.id],
+  }),
   transcript: one(transcripts, {
     fields: [segments.transcriptId],
     references: [transcripts.id],
@@ -359,6 +389,10 @@ export const speakersRelations = relations(speakers, ({ one, many }) => ({
 }));
 
 export const momentsRelations = relations(moments, ({ one, many }) => ({
+  account: one(accounts, {
+    fields: [moments.accountId],
+    references: [accounts.id],
+  }),
   recording: one(recordings, {
     fields: [moments.recordingId],
     references: [recordings.id],
