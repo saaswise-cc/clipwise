@@ -195,6 +195,13 @@ export const moments = pgTable(
     endSec: doublePrecision("end_sec").notNull(),
     score: doublePrecision("score"),
     embedding: vector("embedding", { dimensions: 1536 }),
+    // Flag for candid commentary about a named colleague's performance,
+    // as distinct from decisions, topics, or initiatives. Set at extraction
+    // time so eventual access work (Phase 4) keys off an existing column
+    // instead of reclassifying accumulated moments. Per SAA-66.
+    isPersonnelAssessment: boolean("is_personnel_assessment")
+      .notNull()
+      .default(false),
     metadata: jsonb("metadata"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
