@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clipwise.dev/schema/normalized-transcript/v1.json",
+  "title": "Normalized Transcript v1",
+  "description": "The integration surface between Clipwise and 1on1, per Architecture Decision #12: share a format, not code. Carries the literal record only. Extraction, interpretation, and identity resolution across meetings stay on each consumer's side of the line. Adapters duplicate parser code freely; they never duplicate this contract.",
+  "type": "object",
+  "required": ["contract_version", "meeting", "speakers", "segments"],
+  "additionalProperties": false,
+
+  "properties": {
+    "contract_version": {
+      "const": "1.0",
+      "description": "Bumped on any change that is not purely additive."
+    },
+
+    "meeting": {
+      "type": "object",
+      "required": ["source", "source_recording_id", "start_time"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Source label. Consumers key deduplication on (source, source_recording_id), so this value is load-bearing: re-emitting the same recording under a changed label will duplicate rather than collide.",
+          "examples": ["clipwise", "fathom", "granola", "zoom-vtt"]
+        },
+        "source_recording_id": {
+          "type": "string",
+          "description": "The id the source uses for the recording itself. Where a source exposes several ids for one meeting, this is the one that identifies the recording, not the call, share link, or web view."
+        },
+        "source_alt_ids": {
+          "type": "object",
+          "description": "Any other ids the source exposes for the same meeting, keyed by kind (e.g. call_id, share_token). Present so consumers can resolve links without guessing which id is canonical.",
+          "additionalProperties": { "type": "string" }
+        },
+        "title": { "type": ["string", "null"] },
+        "start_time": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601, timezone-aware. Never a bare date."
+        },
+        "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "duration_basis": {
+          "type": ["string", "null"],
+          "enum": ["source_metadata", "last_segment_end", "last_segment_start", null],
+          "description": "How duration_ms was arrived at. Required to be honest rather than convenient: last_segment_start is a floor and has undershot a real call by eight minutes. A consumer that needs a true duration must check this field, not just read the number."
+        }
+      }
+    },
+
+    "speakers": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Meeting-scoped. A speaker id means nothing outside this document. Deciding that a speaker here is the same person as a speaker in another meeting is each consumer's own problem — sharing that would couple the two identity graphs, which is the coupling AD #12 exists to prevent.",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "description": "Stable within this document only." },
+          "display_name": {
+            "type": ["string", "null"],
+            "description": "Null where diarization failed to attach a name. Null is a per-document defect, not a normal state, but consumers must handle it."
+          },
+          "is_recorder": {
+            "type": ["boolean", "null"],
+            "description": "Whether this speaker is the person who captured the meeting — the me-vs-them split that falls out of two-track capture without diarization, per AD #5. Null where the source does not expose it."
+          },
+          "is_external": { "type": ["boolean", "null"] }
+        }
+      }
+    },
+
+    "segments": {
+      "type": "array",
+      "description": "Ordered by start_ms ascending. Overlapping segments are permitted and are common where diarization is imperfect; consumers must not assume disjoint spans.",
+      "items": {
+        "type": "object",
+        "required": ["speaker_id", "start_ms", "text"],
+        "additionalProperties": false,
+        "properties": {
+          "speaker_id": { "type": "string" },
+          "start_ms": { "type": "integer", "minimum": 0 },
+          "end_ms": {
+            "type": ["integer", "null"],
+            "description": "Null where the source supplies start offsets only. Deliberately not required: forcing it would make adapters synthesize an end from the next segment's start, which is a fabrication that reads as measurement."
+          },
+          "text": { "type": "string" },
+          "source_url": {
+            "type": ["string", "null"],
+            "format": "uri",
+            "description": "Deep link into the recording at this offset, where the source provides one."
+          },
+          "words": {
+            "type": ["array", "null"],
+            "description": "Per-word timings. Enrichment; absence is normal.",
+            "items": {
+              "type": "object",
+              "required": ["text", "start_ms"],
+              "additionalProperties": false,
+              "properties": {
+                "text": { "type": "string" },
+                "start_ms": { "type": "integer", "minimum": 0 },
+                "end_ms": { "type": ["integer", "null"] }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "capabilities": {
+      "type": "object",
+      "description": "What this source was able to supply. Declared rather than discovered, so a consumer degrades deliberately instead of inferring capability from nulls. A consumer that requires a capability should check here and fail loudly, not read half a transcript and proceed.",
+      "additionalProperties": false,
+      "properties": {
+        "retained_audio": { "type": "boolean" },
+        "deep_links": { "type": "boolean" },
+        "word_timings": { "type": "boolean" },
+        "segment_end_offsets": { "type": "boolean" },
+        "speaker_names": { "type": "boolean" },
+        "external_attendee_identity": { "type": "boolean" }
+      }
+    },
+
+    "audio_url": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "description": "Enrichment. Null for sources that do not retain audio."
+    },
+
+    "source_summary": {
+      "type": ["string", "null"],
+      "description": "A summary the source generated. NOT part of the record and never a substitute for segments — source summaries have been observed to invert meaning, flattening sequencing into cancellation and delegation into decision. Carried only so a consumer can use it as a map of what to look for in the transcript. A consumer that extracts from this field rather than from segments is misusing the contract."
+    }
+  },
+
+  "examples": [
+    {
+      "contract_version": "1.0",
+      "meeting": {
+        "source": "fathom",
+        "source_recording_id": "100000000",
+        "source_alt_ids": { "call_id": "700000000" },
+        "title": "Weekly sync",
+        "start_time": "2026-01-01T15:00:00Z",
+        "duration_ms": 2285000,
+        "duration_basis": "last_segment_start"
+      },
+      "speakers": [
+        { "id": "s1", "display_name": "Speaker One", "is_recorder": true, "is_external": false },
+        { "id": "s2", "display_name": null, "is_recorder": false, "is_external": true }
+      ],
+      "segments": [
+        {
+          "speaker_id": "s1",
+          "start_ms": 0,
+          "end_ms": null,
+          "text": "Placeholder utterance.",
+          "source_url": "https://example.invalid/calls/700000000?timestamp=0"
+        }
+      ],
+      "capabilities": {
+        "retained_audio": false,
+        "deep_links": true,
+        "word_timings": false,
+        "segment_end_offsets": false,
+        "speaker_names": true,
+        "external_attendee_identity": false
+      },
+      "audio_url": null,
+      "source_summary": null
+    }
+  ]
+}
