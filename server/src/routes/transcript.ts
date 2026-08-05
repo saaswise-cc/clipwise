@@ -18,6 +18,20 @@ const segmentInputSchema = z.object({
   orderIndex: z.number().int().nonnegative().optional(),
 });
 
+// SAA-78. The fidelity declaration a client must send with every
+// transcript payload. Counts MUST be taken off the source's raw
+// turn/text fields (Fathom transcript_messages, Whisper segments,
+// etc.) BEFORE any parsing or normalization — a client that counts
+// from the object it's about to POST will declare its own losses
+// and pass its own check. `countedFrom` names the field the count
+// was taken from so the next client can either match it or notice
+// the mismatch loudly.
+const sourceFidelitySchema = z.object({
+  declaredTurnCount: z.number().int().nonnegative(),
+  declaredBodyChars: z.number().int().nonnegative(),
+  countedFrom: z.string().min(1).max(512),
+});
+
 const importTranscriptSchema = z.object({
   provider: z.string().max(64).optional(),
   language: z.string().max(16).optional(),
@@ -25,7 +39,32 @@ const importTranscriptSchema = z.object({
   status: z.string().max(32).optional(),
   speakers: z.array(speakerInputSchema).optional(),
   segments: z.array(segmentInputSchema).min(1),
+  sourceFidelity: sourceFidelitySchema,
 });
+
+// The fidelity counting rule, applied identically on both sides of
+// the check. A declaring client using this same rule against its
+// source's raw turn/text fields will produce numbers that match a
+// faithful server-side count.
+//
+// Rule (SAA-78):
+//   turnCount = number of turns  (one per source turn = one segment)
+//   bodyChars = sum over segments of segment.text.length, where
+//               .length is JS String length in UTF-16 code units,
+//               with NO trimming, NO whitespace normalization, and
+//               NO inclusion of speaker labels or timestamps.
+//
+// Do not change this rule without updating every declaring client at
+// the same time — a rule change on one side without the other
+// silently re-enables the failure this check exists to catch.
+function countObservedFidelity(
+  segments: { text: string }[],
+): { turnCount: number; bodyChars: number } {
+  return {
+    turnCount: segments.length,
+    bodyChars: segments.reduce((n, s) => n + s.text.length, 0),
+  };
+}
 
 export const transcriptRouter = Router();
 
@@ -88,6 +127,26 @@ transcriptRouter.post(
     if (!recording) throw new HttpError(404, "recording_not_found");
 
     const body = parseBody(importTranscriptSchema, req);
+
+    // Fidelity check runs before any DB work — a mismatch never
+    // partially writes. See sourceFidelitySchema for the counting rule.
+    const observed = countObservedFidelity(body.segments);
+    const declared = body.sourceFidelity;
+    if (
+      observed.turnCount !== declared.declaredTurnCount ||
+      observed.bodyChars !== declared.declaredBodyChars
+    ) {
+      throw new HttpError(422, "transcript_fidelity_mismatch", {
+        declaredTurnCount: declared.declaredTurnCount,
+        observedTurnCount: observed.turnCount,
+        turnCountDelta: observed.turnCount - declared.declaredTurnCount,
+        declaredBodyChars: declared.declaredBodyChars,
+        observedBodyChars: observed.bodyChars,
+        bodyCharsDelta: observed.bodyChars - declared.declaredBodyChars,
+        countedFrom: declared.countedFrom,
+      });
+    }
+
     const speakerInputs = body.speakers ?? [];
 
     const result = await db.transaction(async (tx) => {
