@@ -11,6 +11,13 @@
 // same filter against a random bogus UUID and asserting zero moments
 // returned.
 //
+// Soft-delete filter: moments with metadata.collapsed_into set are
+// merged-away siblings from the collapse step (SAA-80). They stay in
+// the DB so a bad merge is inspectable and reversible, but the scorer
+// treats them as if deleted. This filter is a no-op on baseline runs
+// (which have no collapsed_into markers), so before/after comparability
+// against d9dbbcc5 is preserved.
+//
 // Matching uses 0-based indices into a numbered moment list (never
 // UUIDs — the model has been observed to fabricate them). Each leaf is
 // assigned at most one moment index or "none".
@@ -64,6 +71,9 @@ async function momentsForRun(runUuid: string, recordingId: string): Promise<Mome
       and(
         eq(schema.moments.recordingId, recordingId),
         sql`${schema.moments.metadata}->>'extraction_run' = ${runUuid}`,
+        // Soft-delete filter (SAA-80): row-selection change only, no
+        // scoring change. No-op on baselines with no collapsed_into.
+        sql`(${schema.moments.metadata}->>'collapsed_into') IS NULL`,
       ),
     );
   return rows;

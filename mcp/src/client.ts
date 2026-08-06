@@ -31,12 +31,14 @@ export class ClipwiseClient {
 
   searchMoments(params: {
     q?: string;
+    semanticQ?: string;
     recordingId?: string;
     kind?: string;
     limit?: number;
   }): Promise<{ moments: MomentSummary[] }> {
     return this.get(`/accounts/${this.config.accountId}/moments`, {
       q: params.q,
+      semantic_q: params.semanticQ,
       recordingId: params.recordingId,
       kind: params.kind,
       limit: params.limit?.toString(),
@@ -67,6 +69,14 @@ export interface MomentSummary {
   createdAt: string;
   recordingTitle: string | null;
   recordingSlug: string | null;
+  // Present only on semantic-path results. Cosine similarity in [-1, 1];
+  // 1 is identical. See AD #13 on why the raw score is surfaced rather
+  // than filtered with a threshold.
+  similarity?: number;
+  // Present only on semantic-path results. Identifies which embedding
+  // model produced this row's vector; useful when the corpus is in
+  // transition across a model change.
+  embeddingModel?: string | null;
 }
 
 export interface RecordingRecord {

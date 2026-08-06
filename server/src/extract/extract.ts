@@ -14,9 +14,11 @@
 // so per-span cost is output-bound.
 
 import Anthropic from "@anthropic-ai/sdk";
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { db, schema } from "../db/index.js";
+import { runCollapse, type CollapseInput, type CollapseResult } from "./collapse.js";
+import { embedMomentsByIds } from "./embeddings.js";
 
 // Sonnet 4.6 — matches prior extraction cost profile (~$0.30-0.50/call).
 const MODEL = "claude-sonnet-4-6";
@@ -29,7 +31,11 @@ Do not merge related topics into a single span "for tidiness." The extractor dow
 
 Emit spans in document order. Each span references a contiguous range of segment indices from the input.`;
 
-const MOMENT_EXTRACTION_SYSTEM = `You are extracting the moments inside one topic span. Emit every distinct claim, decision, question, commitment, initiative, or personnel assessment made in this span. Prefer more moments over fewer; a discussion of five points is five moments, not one.
+const MOMENT_EXTRACTION_SYSTEM = `You are extracting the moments inside one topic span. A moment records one distinct claim, decision, question, commitment, initiative, or personnel assessment.
+
+Aim for the SMALLEST number of moments that captures what was actually said in the span. One moment per distinct claim — not one per sentence, not one per exchange, not one per restatement. Two sentences making the same point are one moment. A single argument developed across three turns is one moment. Restatements, illustrating examples, and rephrasings do not each get their own moment. If two moments in your draft would say the same thing in different words, merge them into one better-worded moment before emitting.
+
+Prefer fewer moments over more. A note-taker jotting the distinct takeaways from this span would write a small number, not one bullet per sentence.
 
 Moment kinds:
 - decision — a conclusion reached, an action committed
@@ -44,7 +50,7 @@ Separately, set is_personnel_assessment=true when a moment is candid commentary 
 
 For each moment, name the speaker(s) if known and give a start/end offset in seconds within the span.
 
-Zero moments is a valid answer if the span is pure filler. Do not force moments; but if the span contains any distinct claim, extract it.`;
+Zero moments is a valid answer if the span is pure filler. Otherwise, err on the side of one strong moment rather than several thin ones.`;
 
 type Segment = {
   orderIndex: number;
@@ -299,7 +305,21 @@ export type ExtractionResult = {
   runUuid: string;
   spans: Span[];
   spansYieldingZeroMoments: Span[];
-  momentsInserted: number;
+  preCollapseMomentCount: number;
+  // Number of moments visible after collapse — i.e. reps + singletons.
+  // Nothing is actually deleted; losers stay in the DB with
+  // metadata.collapsed_into, filtered out by the harness / search.
+  // Distinct from preCollapseMomentCount which is the rows-written count.
+  momentsVisibleAfterCollapse: number;
+  collapseGroupCount: number;
+  momentsInCollapseGroups: number;
+  collapseDroppedCount: number;
+  collapseBackstops: {
+    outOfRangeDropped: number;
+    collisionsDropped: number;
+    groupsDiscarded: number;
+    representativesReplaced: number;
+  };
   personnelAssessmentCount: number;
   outOfRangeCount: number;
   tilingGaps: number;
@@ -307,7 +327,11 @@ export type ExtractionResult = {
   elapsedMs: number;
 };
 
-export async function runExtraction(recordingId: string): Promise<ExtractionResult> {
+export async function runExtraction(
+  recordingId: string,
+  options: { applyCollapse?: boolean } = {},
+): Promise<ExtractionResult> {
+  const applyCollapseStep = options.applyCollapse ?? true;
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error("ANTHROPIC_API_KEY not set");
   }
@@ -357,8 +381,11 @@ export async function runExtraction(recordingId: string): Promise<ExtractionResu
   }
 
   const zeroYield: Span[] = [];
-  let inserted = 0;
-  let personnelCount = 0;
+  // In-memory buffer of everything we insert per-span, keyed by insert
+  // order. Used to hand a flat list to the collapse step and to identify
+  // exact DB rows to update on collapse commit. The DB is the durable
+  // record — this array is only for building the collapse plan.
+  const buffered: BufferedMoment[] = [];
   let outOfRange = 0;
   for (let i = 0; i < spans.length; i++) {
     const span = spans[i];
@@ -389,7 +416,9 @@ export async function runExtraction(recordingId: string): Promise<ExtractionResu
 
     if (moments.length === 0) {
       zeroYield.push(span);
-      console.log(`extract: span ${i}/${spans.length - 1} "${span.label}" — 0 moments (visible gap) — running total ${inserted}`);
+      console.log(
+        `extract: span ${i}/${spans.length - 1} "${span.label}" — 0 moments (visible gap) — running total ${buffered.length}`,
+      );
       continue;
     }
     const rows = moments.map((m) => ({
@@ -415,26 +444,337 @@ export async function runExtraction(recordingId: string): Promise<ExtractionResu
           : {}),
       },
     }));
-    await db.insert(schema.moments).values(rows);
-    inserted += rows.length;
-    personnelCount += rows.filter((r) => r.isPersonnelAssessment).length;
+    const insertedRows = await db
+      .insert(schema.moments)
+      .values(rows)
+      .returning({ id: schema.moments.id });
+    for (let k = 0; k < rows.length; k++) {
+      const r = rows[k];
+      buffered.push({
+        id: insertedRows[k].id,
+        kind: r.kind,
+        title: r.title,
+        summary: r.summary,
+        startSec: r.startSec,
+        endSec: r.endSec,
+        spanLabel: span.label,
+        isPersonnelAssessment: r.isPersonnelAssessment,
+        metadata: r.metadata,
+      });
+    }
     console.log(
-      `extract: span ${i}/${spans.length - 1} "${span.label}" — ${moments.length} moment(s) — running total ${inserted}`,
+      `extract: span ${i}/${spans.length - 1} "${span.label}" — ${moments.length} moment(s) — running total ${buffered.length}`,
     );
   }
   if (outOfRange > 0) {
     console.warn(`extract: ${outOfRange} moment(s) had out-of-range offsets, clamped to span bounds`);
   }
 
+  const preCollapseCount = buffered.length;
+  console.log(`extract: pre-collapse — ${preCollapseCount} moment(s) inserted under run ${runUuid}`);
+
+  const collapse = applyCollapseStep
+    ? await runAndApplyCollapse(client, runUuid, buffered)
+    : ({
+        groups: [],
+        keptIndices: new Set(buffered.map((_, i) => i)),
+        droppedCount: 0,
+        backstops: {
+          outOfRangeDropped: 0,
+          collisionsDropped: 0,
+          groupsDiscarded: 0,
+          representativesReplaced: 0,
+        },
+      } satisfies CollapseResult);
+  if (!applyCollapseStep) {
+    console.log(`extract: collapse SKIPPED (--no-collapse) — ${preCollapseCount} raw moments visible`);
+  }
+
+  // Embed the moments this run just produced. Decide the id set from
+  // the same branch that produced `collapse`, not from keptIndices on
+  // the object — the no-collapse fallback happens to populate that
+  // field correctly today, but relying on it means a future edit to
+  // the fallback silently reduces this to a no-op that logs "0
+  // embedded" and reads as a clean run.
+  //
+  // Post-collapse ordering is a trade, not a free choice. Embedding
+  // before collapse would leave losers already vectorised, so a later
+  // resetCollapseMarkers() call (SAA-80) would surface them as
+  // searchable with no further work. Embedding after saves the tokens
+  // for those losers now, at the cost that a later collapse reset
+  // needs a fresh sweep — new Voyage spend, and the losers are
+  // unsearchable in the window between reset and sweep. The sweep in
+  // embeddings.ts is the recovery path; anyone resetting collapse
+  // should run it afterwards or search will look thin.
+  //
+  // Verified against collapse.ts:16-18 — collapse is lexical, does not
+  // read moment.embedding, so ordering is safe to defer.
+  const idsToEmbed = applyCollapseStep
+    ? [...collapse.keptIndices].map((i) => buffered[i].id)
+    : buffered.map((b) => b.id);
+  const embedResult = await embedMomentsByIds(idsToEmbed);
+  console.log(
+    `extract: embeddings — ${embedResult.embedded} embedded, ${embedResult.failed} failed (retry via sweep), ${embedResult.skipped} skipped (empty title+summary)`,
+  );
+
+  const finalPersonnelCount = await personnelCountForRun(recordingId, runUuid);
+
   return {
     runUuid,
     spans,
     spansYieldingZeroMoments: zeroYield,
-    momentsInserted: inserted,
-    personnelAssessmentCount: personnelCount,
+    preCollapseMomentCount: preCollapseCount,
+    momentsVisibleAfterCollapse: preCollapseCount - collapse.droppedCount,
+    collapseGroupCount: collapse.groups.length,
+    momentsInCollapseGroups: collapse.groups.reduce((n, g) => n + g.indices.length, 0),
+    collapseDroppedCount: collapse.droppedCount,
+    collapseBackstops: collapse.backstops,
+    personnelAssessmentCount: finalPersonnelCount,
     outOfRangeCount: outOfRange,
     tilingGaps: gaps.length,
     tilingOverlaps: overlaps.length,
     elapsedMs: Date.now() - t0,
   };
+}
+
+// In-memory record of an inserted moment. Carries the DB id so the
+// collapse commit can target exact rows by primary key.
+type BufferedMoment = {
+  id: string;
+  kind: string;
+  title: string;
+  summary: string;
+  startSec: number;
+  endSec: number;
+  spanLabel: string;
+  isPersonnelAssessment: boolean;
+  metadata: Record<string, unknown>;
+};
+
+async function personnelCountForRun(recordingId: string, runUuid: string): Promise<number> {
+  const rows = await db
+    .select({ id: schema.moments.id })
+    .from(schema.moments)
+    .where(
+      and(
+        eq(schema.moments.recordingId, recordingId),
+        sql`${schema.moments.metadata}->>'extraction_run' = ${runUuid}`,
+        sql`(${schema.moments.metadata}->>'collapsed_into') IS NULL`,
+        eq(schema.moments.isPersonnelAssessment, true),
+      ),
+    );
+  return rows.length;
+}
+
+// Runs the collapse step against the buffered moments and applies the
+// plan to the DB (UPDATE reps with merged_from + OR'd personnel flag;
+// UPDATE losers with collapsed_into = <rep_id>). Both mutations are
+// soft-marker changes only — no DELETEs — so a wrong run UUID never
+// destroys data and a re-collapse is free after a reset.
+async function runAndApplyCollapse(
+  client: Anthropic,
+  runUuid: string,
+  buffered: BufferedMoment[],
+): Promise<CollapseResult> {
+  if (buffered.length < 2) {
+    console.log(`extract: collapse — skipping (only ${buffered.length} moment(s) in run)`);
+    return {
+      groups: [],
+      keptIndices: new Set(buffered.map((_, i) => i)),
+      droppedCount: 0,
+      backstops: {
+        outOfRangeDropped: 0,
+        collisionsDropped: 0,
+        groupsDiscarded: 0,
+        representativesReplaced: 0,
+      },
+    };
+  }
+
+  const inputs: CollapseInput[] = buffered.map((m) => ({
+    kind: m.kind,
+    title: m.title,
+    summary: m.summary,
+    startSec: m.startSec,
+    endSec: m.endSec,
+    spanLabel: m.spanLabel,
+  }));
+
+  console.log(`extract: collapse — grouping ${buffered.length} moments`);
+  let plan: CollapseResult;
+  try {
+    plan = await runCollapse(client, inputs);
+  } catch (err) {
+    console.error(
+      `extract: collapse FAILED — raw extraction is intact in DB (run ${runUuid}, ${buffered.length} moments). Re-run 'run.ts collapse <recording_id> --run ${runUuid}' to retry.`,
+    );
+    throw err;
+  }
+  console.log(
+    `extract: collapse — ${plan.groups.length} groups covering ${plan.groups.reduce((n, g) => n + g.indices.length, 0)} moments; ${plan.droppedCount} to be marked collapsed_into representatives`,
+  );
+  const b = plan.backstops;
+  console.log(
+    `extract: collapse backstops — out-of-range: ${b.outOfRangeDropped}, collisions: ${b.collisionsDropped}, groups discarded: ${b.groupsDiscarded}, reps replaced: ${b.representativesReplaced}`,
+  );
+
+  await applyCollapse(runUuid, buffered, plan);
+  return plan;
+}
+
+// Apply the collapse plan to the DB (soft-delete only):
+// - UPDATE each representative: metadata.merged_from = [<loser ids>].
+// - UPDATE each loser: metadata.collapsed_into = <rep id>.
+// Runs in a single transaction. Losers stay in the DB — search_moments
+// and the harness filter them out by the presence of collapsed_into.
+//
+// The is_personnel_assessment column is NOT mutated here. Each row's
+// flag continues to describe THAT row only. A consumer wanting the
+// merged personnel view walks metadata.merged_from and ORs the losers'
+// flags itself. This keeps re-collapse fully reversible via
+// resetCollapseMarkers — otherwise the OR would ratchet the flag true
+// permanently across iterations.
+export async function applyCollapse(
+  runUuid: string,
+  buffered: BufferedMoment[],
+  plan: CollapseResult,
+): Promise<void> {
+  if (plan.groups.length === 0) return;
+
+  type RepUpdate = { id: string; metadata: Record<string, unknown> };
+  type LoserUpdate = { id: string; metadata: Record<string, unknown> };
+  const repUpdates: RepUpdate[] = [];
+  const loserUpdates: LoserUpdate[] = [];
+  const seenIds = new Set<string>();
+
+  for (const group of plan.groups) {
+    const rep = buffered[group.representativeIndex];
+    if (!rep) throw new Error(`collapse apply: representative index ${group.representativeIndex} out of bounds`);
+    const droppedMoments = group.indices
+      .filter((i) => i !== group.representativeIndex)
+      .map((i) => {
+        const m = buffered[i];
+        if (!m) throw new Error(`collapse apply: dropped index ${i} out of bounds`);
+        return m;
+      });
+    repUpdates.push({
+      id: rep.id,
+      metadata: { ...rep.metadata, merged_from: droppedMoments.map((m) => m.id) },
+    });
+    for (const m of droppedMoments) {
+      if (seenIds.has(m.id)) {
+        throw new Error(
+          `collapse apply: loser ${m.id} appears in two groups; aborting to keep raw extraction intact under ${runUuid}`,
+        );
+      }
+      seenIds.add(m.id);
+      loserUpdates.push({
+        id: m.id,
+        metadata: { ...m.metadata, collapsed_into: rep.id },
+      });
+    }
+  }
+
+  await db.transaction(async (tx) => {
+    for (const u of repUpdates) {
+      await tx
+        .update(schema.moments)
+        .set({ metadata: u.metadata, updatedAt: sql`now()` })
+        .where(eq(schema.moments.id, u.id));
+    }
+    for (const u of loserUpdates) {
+      await tx
+        .update(schema.moments)
+        .set({ metadata: u.metadata, updatedAt: sql`now()` })
+        .where(eq(schema.moments.id, u.id));
+    }
+  });
+  console.log(
+    `extract: collapse applied — ${repUpdates.length} rep(s) tagged merged_from, ${loserUpdates.length} loser(s) tagged collapsed_into`,
+  );
+}
+
+// Reset collapse markers on all moments in the given run. Removes
+// metadata.merged_from and metadata.collapsed_into. Used by
+// runCollapseOnly before re-collapse so iteration on the collapse prompt
+// stays free and reversible.
+export async function resetCollapseMarkers(recordingId: string, runUuid: string): Promise<number> {
+  const rows = await db
+    .select({ id: schema.moments.id, metadata: schema.moments.metadata })
+    .from(schema.moments)
+    .where(
+      and(
+        eq(schema.moments.recordingId, recordingId),
+        sql`${schema.moments.metadata}->>'extraction_run' = ${runUuid}`,
+      ),
+    );
+  let touched = 0;
+  await db.transaction(async (tx) => {
+    for (const r of rows) {
+      const meta = (r.metadata as Record<string, unknown> | null) ?? {};
+      if (!("merged_from" in meta) && !("collapsed_into" in meta)) continue;
+      const cleaned: Record<string, unknown> = { ...meta };
+      delete cleaned.merged_from;
+      delete cleaned.collapsed_into;
+      await tx
+        .update(schema.moments)
+        .set({ metadata: cleaned, updatedAt: sql`now()` })
+        .where(eq(schema.moments.id, r.id));
+      touched++;
+    }
+  });
+  return touched;
+}
+
+// Standalone collapse over an existing extraction run. Non-destructive:
+// resets any prior collapse markers on the run, then runs collapse.
+// Safe to point at any run UUID — nothing is deleted. Used to iterate
+// on the collapse prompt without re-extracting.
+export async function runCollapseOnly(
+  recordingId: string,
+  runUuid: string,
+): Promise<CollapseResult> {
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
+  const client = new Anthropic();
+
+  const resetCount = await resetCollapseMarkers(recordingId, runUuid);
+  console.log(`extract: collapse-only — reset markers on ${resetCount} moment(s) in run ${runUuid}`);
+
+  const rows = await db
+    .select({
+      id: schema.moments.id,
+      kind: schema.moments.kind,
+      title: schema.moments.title,
+      summary: schema.moments.summary,
+      startSec: schema.moments.startSec,
+      endSec: schema.moments.endSec,
+      isPersonnelAssessment: schema.moments.isPersonnelAssessment,
+      metadata: schema.moments.metadata,
+    })
+    .from(schema.moments)
+    .where(
+      and(
+        eq(schema.moments.recordingId, recordingId),
+        sql`${schema.moments.metadata}->>'extraction_run' = ${runUuid}`,
+      ),
+    )
+    .orderBy(asc(schema.moments.createdAt), asc(schema.moments.id));
+
+  if (rows.length === 0) {
+    throw new Error(`collapse-only: no moments found for recording ${recordingId} run ${runUuid}`);
+  }
+
+  const buffered: BufferedMoment[] = rows.map((r) => ({
+    id: r.id,
+    kind: r.kind,
+    title: r.title ?? "",
+    summary: r.summary ?? "",
+    startSec: r.startSec,
+    endSec: r.endSec,
+    spanLabel: ((r.metadata as { span_label?: string } | null) ?? {}).span_label ?? "(unknown span)",
+    isPersonnelAssessment: r.isPersonnelAssessment,
+    metadata: (r.metadata as Record<string, unknown>) ?? {},
+  }));
+
+  return runAndApplyCollapse(client, runUuid, buffered);
 }

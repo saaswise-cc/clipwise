@@ -15,9 +15,13 @@ import {
   vector,
 } from "drizzle-orm/pg-core";
 
-// NOTE: The `embedding vector(1536)` columns on moments and segments require
+// NOTE: The `embedding vector(1024)` columns on moments and segments require
 // the pgvector extension. Enable it on the Neon database (CREATE EXTENSION
-// IF NOT EXISTS vector) before running the generated migration.
+// IF NOT EXISTS vector) before running the generated migration. The 1024
+// width is set by voyage-4 (Voyage's 4-series default, no truncation). Per
+// AD #13, all voyage-4-series models share this space and are cross-
+// compatible for retrieval, so upgrading model within the series does not
+// require a re-embed. Changing series (or vendors) does.
 
 export const accounts = pgTable(
   "accounts",
@@ -158,7 +162,7 @@ export const segments = pgTable(
     endSec: doublePrecision("end_sec").notNull(),
     text: text("text").notNull(),
     orderIndex: integer("order_index").notNull(),
-    embedding: vector("embedding", { dimensions: 1536 }),
+    embedding: vector("embedding", { dimensions: 1024 }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`now()`),
@@ -194,7 +198,13 @@ export const moments = pgTable(
     startSec: doublePrecision("start_sec").notNull(),
     endSec: doublePrecision("end_sec").notNull(),
     score: doublePrecision("score"),
-    embedding: vector("embedding", { dimensions: 1536 }),
+    embedding: vector("embedding", { dimensions: 1024 }),
+    // Which model produced this row's embedding. Nullable — a row with a
+    // null embedding also has a null model, and vice versa. Per AD #13,
+    // model version is state: this column lets a re-embed sweep target
+    // rows on a specific old model, and lets the search path know which
+    // series (and therefore which query embedder) the vector belongs to.
+    embeddingModel: varchar("embedding_model", { length: 64 }),
     // Flag for candid commentary about a named colleague's performance,
     // as distinct from decisions, topics, or initiatives. Set at extraction
     // time so eventual access work (Phase 4) keys off an existing column
