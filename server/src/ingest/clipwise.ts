@@ -1,7 +1,9 @@
 // Ingest one merged transcript from recorder/transcribe.py into Postgres.
 //
-// Usage:
-//   tsx src/ingest/clipwise.ts <transcript.json>
+// Library only. Exports `ingestTranscript(transcriptPath)`, which throws on
+// any validation or fidelity failure and does not touch process state
+// (no exit, no pool.end). The historical `tsx` entry point now lives in
+// `ingest/cli.ts`.
 //
 // The transcript file is the payload written by recorder/transcribe.py:
 //   { inputs, downsampled, model, labels, segments: [...] }
@@ -11,7 +13,7 @@
 // the existing rows leave nulls, so downstream queries see one convention
 // rather than two). Speakers are `me` and `them`, derived purely from the
 // segment's `track` field. Extraction is a separate step (server extract
-// CLI) — this script does not run it.
+// CLI) — this module does not run it.
 //
 // transcripts.text is written as NULL (schema.ts:110 declares the column
 // nullable — no .notNull() — and information_schema confirms it in the
@@ -27,7 +29,7 @@
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { count, eq, sql } from "drizzle-orm";
-import { db, schema, pool } from "../db/index.js";
+import { db, schema } from "../db/index.js";
 import { slugify } from "../lib/slug.js";
 
 type Segment = {
@@ -45,10 +47,18 @@ type Transcript = {
   segments: Segment[];
 };
 
-function die(msg: string): never {
-  process.stderr.write(`ingest: ${msg}\n`);
-  process.exit(1);
-}
+export type IngestResult = {
+  recordingId: string;
+  transcriptId: string;
+  segmentCount: number;
+  title: string;
+  slug: string;
+  accountId: string;
+  accountSlug: string;
+  declared: { turnCount: number; bodyChars: number };
+  observed: { turnCount: number; bodyChars: number };
+  recording: Record<string, unknown>;
+};
 
 // Convert the ISO stamp used in transcribe output filenames
 // ("2026-08-07T12-23-54Z") into a real ISO-8601 timestamp
@@ -60,19 +70,16 @@ function stampToIso(stamp: string): string | null {
   return `${m[1]}T${m[2]}:${m[3]}:${m[4]}Z`;
 }
 
-async function main(): Promise<void> {
-  const transcriptPath = process.argv[2];
-  if (!transcriptPath) die("usage: tsx src/ingest/clipwise.ts <transcript.json>");
-
+export async function ingestTranscript(transcriptPath: string): Promise<IngestResult> {
   const raw = readFileSync(transcriptPath, "utf8");
   const doc = JSON.parse(raw) as Transcript;
   if (!Array.isArray(doc.segments) || doc.segments.length === 0) {
-    die(`no segments in ${transcriptPath}`);
+    throw new Error(`no segments in ${transcriptPath}`);
   }
 
   const labelSet = new Set(doc.segments.map((s) => s.track));
   if (labelSet.size !== 2 || !labelSet.has("me") || !labelSet.has("them")) {
-    die(
+    throw new Error(
       `expected labels {me, them}; got {${[...labelSet].sort().join(", ")}}`,
     );
   }
@@ -86,7 +93,7 @@ async function main(): Promise<void> {
 
   const accounts = await db.select().from(schema.accounts);
   if (accounts.length !== 1) {
-    die(
+    throw new Error(
       `expected exactly one account; found ${accounts.length}. Set an explicit account when this stops being the case.`,
     );
   }
@@ -218,19 +225,21 @@ async function main(): Promise<void> {
     observedTurns !== declared.turnCount ||
     observedChars !== declared.bodyChars
   ) {
-    die(
+    throw new Error(
       `fidelity mismatch — declared ${declared.turnCount}/${declared.bodyChars}, observed ${observedTurns}/${observedChars}`,
     );
   }
 
-  process.stdout.write(`\nrecording_id: ${result.recording.id}\n`);
+  return {
+    recordingId: result.recording.id,
+    transcriptId: result.transcript.id,
+    segmentCount: result.segmentCount,
+    title,
+    slug,
+    accountId: account.id,
+    accountSlug: account.slug,
+    declared,
+    observed: { turnCount: observedTurns, bodyChars: observedChars },
+    recording: dbRecording as unknown as Record<string, unknown>,
+  };
 }
-
-main()
-  .catch((err) => {
-    console.error(err);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await pool.end();
-  });
