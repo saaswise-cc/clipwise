@@ -519,6 +519,31 @@ export async function runExtraction(
 
   const finalPersonnelCount = await personnelCountForRun(recordingId, runUuid);
 
+  // Promote this run to `current_extraction_run` on the recording. The
+  // search gate (routes/moments.ts:110) joins on
+  //   moment.metadata.extraction_run = recording.metadata.current_extraction_run
+  // so without this write, every moment this run just produced is
+  // unreachable via search_moments — regardless of source.
+  //
+  // Done at the very end, after collapse and embed, on purpose: this is
+  // the only durable statement in the whole function that says "this run
+  // succeeded." If any earlier step fails, the recording stays pointed at
+  // whatever run was previously current, and the failed run's rows remain
+  // queryable outside the gate for inspection but do not become visible.
+  //
+  // Merge into existing metadata rather than replacing it — recordings
+  // may carry other keys (transcript source paths, capture stamps, etc.)
+  // that this update must not clobber.
+  await db
+    .update(schema.recordings)
+    .set({
+      metadata: sql`coalesce(${schema.recordings.metadata}, '{}'::jsonb) || jsonb_build_object('current_extraction_run', ${runUuid}::text)`,
+    })
+    .where(eq(schema.recordings.id, recordingId));
+  console.log(
+    `extract: promoted current_extraction_run = ${runUuid} on recording ${recordingId}`,
+  );
+
   return {
     runUuid,
     spans,
