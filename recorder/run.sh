@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-OUTDIR="${OUTDIR:-/tmp/clipwise-out}"
+OUTDIR="${OUTDIR:-$HOME/Library/Application Support/clipwise/recordings}"
 mkdir -p "$OUTDIR"
 
 STAMP=$(date -u +%Y-%m-%dT%H-%M-%SZ)
@@ -19,10 +19,11 @@ MIC_WAV="$OUTDIR/mic-$STAMP.wav"
 MIC_LOG="$OUTDIR/mic-$STAMP.log"
 CLEANUP_LOG="$OUTDIR/cleanup-$STAMP.log"
 
-SYSTEMTAP_BIN=/Users/jd/clipwise/recorder/systemtap/.build/release/systemtap
-AUDIODEVS=/Users/jd/clipwise/recorder/audiodevs
+RECORDER_DIR="$(dirname "$0")"
+SYSTEMTAP_BIN="$RECORDER_DIR/systemtap/.build/release/systemtap"
+AUDIODEVS="$RECORDER_DIR/audiodevs"
 if [ ! -x "$AUDIODEVS" ]; then
-    echo "ERROR: audiodevs binary missing at $AUDIODEVS — run: swiftc -O /Users/jd/clipwise/recorder/audiodevs.swift -o $AUDIODEVS" >&2
+    echo "ERROR: audiodevs binary missing at $AUDIODEVS — run: swiftc -O $RECORDER_DIR/audiodevs.swift -o $AUDIODEVS" >&2
     exit 1
 fi
 
