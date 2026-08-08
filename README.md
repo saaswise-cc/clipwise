@@ -26,7 +26,7 @@ Clipwise inverts that:
 ┌────────────────────────────┐         ┌──────────────────────────────┐
 │  Mac Desktop Recorder      │         │  Self-Hosted Server          │
 │  ────────────────────────  │         │  ──────────────────────────  │
-│  • Shell: undecided        │  HTTPS  │  • Recording + transcript    │
+│  • Shell: Electron         │  HTTPS  │  • Recording + transcript    │
 │  • Core Audio Taps         │────────▶│    storage                   │
 │    (native macOS capture)  │         │  • Clip extraction           │
 │  • Local Whisper           │         │  • Moment DB (Postgres +     │
@@ -46,11 +46,9 @@ Clipwise inverts that:
 
 ### Components
 
-1. **Mac desktop recorder** — the app shell is not yet chosen; Electron, Tauri and a native Swift app are all still on the table. Capture is Clipwise's own Swift binary using Core Audio Taps (macOS 14.2+) to record system audio and mic natively — no Recall.ai, no meeting-bot SDK, no third-party dependency in the capture path. Transcription runs on-device via whisper.cpp.
+1. **Mac desktop recorder** — an Electron menu bar app spawning the capture and transcription subprocesses. Capture is Clipwise's own Swift binary using Core Audio Taps (macOS 14.2+) to record system audio and mic natively — no Recall.ai, no meeting-bot SDK, no third-party dependency in the capture path. Transcription runs on-device via whisper.cpp, spawned as a CLI.
 2. **Self-hosted server** — A long-running Node/TypeScript container that stores raw recordings, transcripts, extracted clips, and the moments database, and exposes a REST API consumed by the recorder and the MCP. It's a single Docker artifact from day one: the hosted deployment (Fly.io / Railway / Render) and any user-run self-hosted deployment run the same image. Persistence is standard Postgres (with `pgvector`); Neon is the currently-used managed provider, but the connection is plain `pg` so any Postgres works.
-3. **Clipwise MCP** — The bridge that lets Claude query your meeting history: search transcripts, pull clips, ask questions across the full corpus.
-
-Primary recording target is **Google Meet**. Other platforms will follow.
+3. **Clipwise MCP** — The bridge that lets Claude query your meeting history: search transcripts, pull clips, ask questions across every meeting.
 
 ## What makes it different
 
@@ -70,7 +68,7 @@ If you're a solo operator, small team, or security-conscious org that doesn't wa
 
 - ✅ Landing page live at [clipwiseapp.com](https://clipwiseapp.com)
 - ✅ Waitlist open
-- 🚧 Mac recorder (Swift Core Audio Taps + local whisper.cpp; shell undecided)
+- 🚧 Mac recorder (Electron shell around Swift Core Audio Taps capture + local whisper.cpp CLI)
 - ✅ Self-hosted server + moments database (Neon, live)
 - 🚧 Clipwise MCP for Claude
 
