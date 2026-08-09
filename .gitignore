@@ -1,2 +1,3 @@
 recorder/audiodevs
 recorder/systemtap/.build/
+recorder/app/node_modules/
