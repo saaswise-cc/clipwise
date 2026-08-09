@@ -20,11 +20,12 @@ TAP_BIN="$TAP_PROJ/.build/release/systemtap"
 test -x "$TAP_BIN" || { echo "!! tap binary not built at $TAP_BIN"; exit 1; }
 
 echo "==> Packaging Electron app"
-rm -rf "$SCRIPT_DIR/out"
+rm -rf "$SCRIPT_DIR/out" "$SCRIPT_DIR/$PRODUCT_NAME-darwin-arm64"
 cd "$SCRIPT_DIR"
 npx @electron/packager . "$PRODUCT_NAME" \
   --platform=darwin \
   --arch=arm64 \
+  --out=out \
   --app-bundle-id="$BUNDLE_ID" \
   --extend-info=info-plist-extras.plist \
   --extra-resource="$TAP_BIN" \
