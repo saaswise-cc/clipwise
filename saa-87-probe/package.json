@@ -1,0 +1,15 @@
+{
+  "name": "saa-87-probe",
+  "version": "0.0.1",
+  "description": "SAA-87 TCC probe — Electron shell that spawns systemtap for a fixed capture window",
+  "private": true,
+  "main": "main.js",
+  "productName": "Clipwise-TCC-Probe",
+  "scripts": {
+    "package": "./build.sh"
+  },
+  "devDependencies": {
+    "electron": "42.8.1",
+    "@electron/packager": "20.2.0"
+  }
+}
