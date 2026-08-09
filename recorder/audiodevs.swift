@@ -56,7 +56,7 @@ if mode == "--once" {
 if mode == "--poll" {
     var lastLine = ""
     setvbuf(stdout, nil, _IOLBF, 0)
-    // Handle SIGINT/SIGTERM so run.sh's cleanup wait doesn't hang forever.
+    // Handle SIGINT/SIGTERM so the shell's teardown doesn't hang waiting on this.
     let sigInt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     let sigTerm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
     signal(SIGINT, SIG_IGN)

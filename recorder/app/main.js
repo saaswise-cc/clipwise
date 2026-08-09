@@ -1,8 +1,8 @@
 // Clipwise recorder — Electron menu bar shell.
 // Main process only. Spawns tap + mic + poller directly (no bash wrapper),
 // tracks a four-label state machine, and tears everything down on Stop or
-// Quit. Filenames, timestamp format and output directory match the
-// existing recorder/run.sh (which will be removed in a follow-up commit).
+// Quit. Filenames, timestamp format and output directory match what
+// recorder/transcribe.py expects.
 
 const { app, Tray, Menu, nativeImage } = require('electron');
 const { spawn, execFileSync } = require('child_process');
