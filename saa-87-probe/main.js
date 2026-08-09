@@ -18,7 +18,15 @@ const STDERR_LOG = path.join(OUTDIR, 'stderr.log');
 const STATUS_JSON = path.join(OUTDIR, 'status.json');
 const PCM_OUT = path.join(OUTDIR, 'system.f32le.pcm');
 const TAP_BIN = path.join(process.resourcesPath, 'systemtap');
-const CAPTURE_SECONDS = 10;
+const secArg = getArg('seconds');
+let CAPTURE_SECONDS = 10;
+if (secArg !== null) {
+  const n = Number(secArg);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`invalid --seconds value: ${JSON.stringify(secArg)}`);
+  }
+  CAPTURE_SECONDS = n;
+}
 
 function writeStatus(obj) {
   try {
@@ -50,6 +58,7 @@ app.whenReady().then(() => {
     const stoppedAt = Date.now();
     writeStatus({
       tap_binary: TAP_BIN,
+      capture_seconds_arg: secArg,
       capture_seconds_requested: CAPTURE_SECONDS,
       sigint_sent_by_main: sigintSent,
       exit_code: code,
@@ -65,6 +74,8 @@ app.whenReady().then(() => {
     clearTimeout(sigintTimer);
     writeStatus({
       tap_binary: TAP_BIN,
+      capture_seconds_arg: secArg,
+      capture_seconds_requested: CAPTURE_SECONDS,
       spawn_error: String(err),
       spawn_errno: err.code || null,
       exit_code: null,

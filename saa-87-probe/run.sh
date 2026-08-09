@@ -3,9 +3,16 @@ set -euo pipefail
 
 STATE="${1:-}"
 case "$STATE" in
-  pending|granted|denied) ;;
-  *) echo "usage: $0 <pending|granted|denied>"; exit 1 ;;
+  pending|granted|granted-revoke|denied) ;;
+  *) echo "usage: $0 <pending|granted|granted-revoke|denied>"; exit 1 ;;
 esac
+
+CAPTURE_SECONDS_ARG="${SECONDS_OVERRIDE:-10}"
+if ! [[ "$CAPTURE_SECONDS_ARG" =~ ^[1-9][0-9]*$ ]]; then
+  echo "!! SECONDS_OVERRIDE must be a positive integer, got: '$CAPTURE_SECONDS_ARG'" >&2
+  exit 2
+fi
+HARD_CAP=$((CAPTURE_SECONDS_ARG + 30))
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRODUCT_NAME="Clipwise-TCC-Probe"
@@ -18,20 +25,20 @@ mkdir -p "$OUTDIR"
 
 echo "==> State: $STATE"
 echo "==> Output: $OUTDIR"
-echo "==> Launching $APP_PATH (60s hard cap)"
+echo "==> Launching $APP_PATH (${HARD_CAP}s hard cap, capture=${CAPTURE_SECONDS_ARG}s)"
 
 # Launch via LaunchServices so TCC attributes the grant to the .app, not this shell.
-# `open -W` waits for the app to exit; a polling loop enforces the hard 60s cap.
-open -W -a "$APP_PATH" --args --outdir "$OUTDIR" &
+# `open -W` waits for the app to exit; a polling loop enforces the hard cap.
+open -W -a "$APP_PATH" --args --outdir "$OUTDIR" --seconds "$CAPTURE_SECONDS_ARG" &
 OPEN_PID=$!
 TIMED_OUT=false
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "$HARD_CAP"); do
   kill -0 "$OPEN_PID" 2>/dev/null || break
   sleep 1
 done
 if kill -0 "$OPEN_PID" 2>/dev/null; then
   TIMED_OUT=true
-  echo "!! hard 60s timeout — killing app and open"
+  echo "!! hard ${HARD_CAP}s timeout — killing app and open"
   pkill -f "$APP_PATH/Contents/MacOS/" 2>/dev/null || true
   kill -TERM "$OPEN_PID" 2>/dev/null || true
   sleep 2
@@ -90,10 +97,10 @@ elif [ ! -f "$OUTDIR/stderr.log" ]; then
   echo "  (no stderr.log — cannot derive format or duration)"
 else
   ACTUAL=$(wc -c < "$PCM" | tr -d ' ')
-  RATE=$(grep -oE 'sample_rate=[0-9]+' "$OUTDIR/stderr.log" | head -1 | cut -d= -f2)
-  CH=$(grep -oE 'channels=[0-9]+' "$OUTDIR/stderr.log" | head -1 | cut -d= -f2)
-  BITS=$(grep -oE 'bits=[0-9]+' "$OUTDIR/stderr.log" | head -1 | cut -d= -f2)
-  DUR_S=$(grep -oE 'duration_s=[0-9.]+' "$OUTDIR/stderr.log" | head -1 | cut -d= -f2)
+  RATE=$(grep -oE 'sample_rate=[0-9]+' "$OUTDIR/stderr.log" | head -1 | cut -d= -f2 || true)
+  CH=$(grep -oE 'channels=[0-9]+' "$OUTDIR/stderr.log" | head -1 | cut -d= -f2 || true)
+  BITS=$(grep -oE 'bits=[0-9]+' "$OUTDIR/stderr.log" | head -1 | cut -d= -f2 || true)
+  DUR_S=$(grep -oE 'duration_s=[0-9.]+' "$OUTDIR/stderr.log" | head -1 | cut -d= -f2 || true)
   if [ -n "$RATE" ] && [ -n "$CH" ] && [ -n "$BITS" ] && [ -n "$DUR_S" ]; then
     EXPECTED=$(python3 -c "print(int($RATE * ($BITS/8) * $CH * $DUR_S))")
     PCT=$(python3 -c "e=$EXPECTED; print(f'{100.0 * $ACTUAL / e:.2f}' if e else 'n/a')")
