@@ -72,6 +72,40 @@ If you're a solo operator, small team, or security-conscious org that doesn't wa
 - ✅ Self-hosted server + moments database (Neon, live)
 - 🚧 Clipwise MCP for Claude
 
+## Recorder setup
+
+Covers the Mac recorder only; the server and MCP have their own setup.
+
+**Prerequisites**
+
+- macOS 14.2+ (Core Audio Taps floor)
+- Swift and Node toolchains
+- `ffmpeg` on `PATH` — `brew install ffmpeg`. Required for mic capture, not optional.
+
+**Build the Swift binaries.** Both are gitignored build outputs, so a fresh clone has neither.
+
+```sh
+(cd recorder && swiftc -O audiodevs.swift -o audiodevs)
+(cd recorder/systemtap && swift build -c release)
+```
+
+**Install the app shell.**
+
+```sh
+(cd recorder/app && npm install && npx install-electron)
+```
+
+`npx install-electron` is not optional. Electron 43's package manifest has no
+`scripts` key at all, so nothing fetches the runtime binary during `npm install`
+— the install exits clean and reports no vulnerabilities while leaving an app
+that cannot launch. Verified from the installed package on disk 2026-08-09, with
+`ignore-scripts` confirmed `false`.
+
+**Transcription** — only needed for `transcribe.py`, not for recording.
+
+- `brew install whisper-cpp` for the `whisper-cli` binary
+- The GGML model — `transcribe.py` prints the download command in its error message.
+
 ## License
 
 [Apache License 2.0](./LICENSE)
