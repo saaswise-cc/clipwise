@@ -348,6 +348,20 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
     throw err;
   }
 
+  // Checked before the step is marked running. runExtraction throws on a
+  // missing key before it touches the database, so treating that as a partial
+  // run would demand --force-extract to recover from a config mistake that
+  // wrote nothing. Pre-flight failures are plainly retryable; only a failure
+  // after the run begins is ambiguous.
+  if (!process.env.ANTHROPIC_API_KEY) {
+    finish("extract", "failed", null, "ANTHROPIC_API_KEY not set");
+    throw new PipelineError(
+      "ANTHROPIC_API_KEY not set — extraction cannot run. The pipeline is spawned " +
+        "by the recorder and inherits no shell, so the key belongs in server/.env.",
+      "extract",
+    );
+  }
+
   begin("extract");
   try {
     const extraction = await runExtraction(dbRecordingId);
