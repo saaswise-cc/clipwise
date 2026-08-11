@@ -396,6 +396,13 @@ def main() -> int:
         "downsampled": {"tap_16k": str(tap_16k), "mic_16k": str(mic_16k)},
         "model": str(model_path),
         "labels": labels,
+        # Per-track sample statistics, measured above on the 16k copies that
+        # Whisper actually reads. Persisted rather than only printed because
+        # consumers cannot recompute them once the downsampled files are gone,
+        # and because silence classification (SAA-89) is going to be built on
+        # exactly these numbers. Nothing here interprets them — peak == 0 on
+        # the tap is the ordinary case when no system audio was playing.
+        "content": {"tap": tap_stats, "mic": mic_stats},
         "segments": merged,
     }
     out_path.write_text(json.dumps(payload, indent=2) + "\n")

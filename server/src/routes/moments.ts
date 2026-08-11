@@ -161,6 +161,10 @@ momentsRouter.get(
           createdAt: schema.moments.createdAt,
           recordingTitle: schema.recordings.title,
           recordingSlug: schema.recordings.slug,
+          // External identity of the recording — for Clipwise captures this
+          // is the manifest recording_id. Selected so a moment traces back to
+          // the capture it came from without a second round trip.
+          recordingSourceId: schema.recordings.sourceId,
           // Cosine similarity = 1 - cosine distance. Voyage vectors are
           // unit-normalised (verified in the pre-check recorded on
           // AD #13), so the range is [-1, 1] with 1 being identical.
@@ -192,6 +196,7 @@ momentsRouter.get(
         createdAt: schema.moments.createdAt,
         recordingTitle: schema.recordings.title,
         recordingSlug: schema.recordings.slug,
+        recordingSourceId: schema.recordings.sourceId,
       })
       .from(schema.moments)
       .innerJoin(

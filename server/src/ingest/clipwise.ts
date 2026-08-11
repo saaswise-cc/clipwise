@@ -28,7 +28,7 @@
 
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import { count, eq, sql } from "drizzle-orm";
+import { and, count, eq, sql } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { slugify } from "../lib/slug.js";
 
@@ -39,13 +39,34 @@ type Segment = {
   text: string;
 };
 
+type TrackContent = {
+  samples?: number;
+  duration_s?: number;
+  nonzero_fraction?: number;
+  rms?: number;
+  peak?: number;
+};
+
 type Transcript = {
   inputs?: { tap?: string; mic?: string };
   downsampled?: { tap_16k?: string; mic_16k?: string };
   model?: string;
   labels?: string[];
+  content?: { tap?: TrackContent; mic?: TrackContent };
   segments: Segment[];
 };
+
+// The SAA-93 capture manifest, as much of it as ingest reads. The seam hands
+// this in; it is not re-read from disk here.
+export type CaptureIdentity = {
+  recordingId: string;
+  startedAt: string;
+  stem: string;
+  manifestFile: string;
+  tracks?: unknown;
+};
+
+export const CLIPWISE_SOURCE = "clipwise-recorder";
 
 export type IngestResult = {
   recordingId: string;
@@ -58,6 +79,12 @@ export type IngestResult = {
   declared: { turnCount: number; bodyChars: number };
   observed: { turnCount: number; bodyChars: number };
   recording: Record<string, unknown>;
+  // The external identity this recording was filed under: the manifest's
+  // recording_id when a manifest was supplied, else the filename stamp.
+  sourceId: string;
+  // True when an existing row was adopted rather than a new one inserted.
+  // The seam relies on this to make retry safe.
+  reused: boolean;
 };
 
 // Convert the ISO stamp used in transcribe output filenames
@@ -70,7 +97,10 @@ function stampToIso(stamp: string): string | null {
   return `${m[1]}T${m[2]}:${m[3]}:${m[4]}Z`;
 }
 
-export async function ingestTranscript(transcriptPath: string): Promise<IngestResult> {
+export async function ingestTranscript(
+  transcriptPath: string,
+  capture?: CaptureIdentity,
+): Promise<IngestResult> {
   const raw = readFileSync(transcriptPath, "utf8");
   const doc = JSON.parse(raw) as Transcript;
   if (!Array.isArray(doc.segments) || doc.segments.length === 0) {
@@ -87,8 +117,18 @@ export async function ingestTranscript(transcriptPath: string): Promise<IngestRe
   const stampMatch = basename(transcriptPath).match(
     /(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)/,
   );
-  const stamp = stampMatch ? stampMatch[1] : null;
-  const startedAtIso = stamp ? stampToIso(stamp) : null;
+  const stamp = capture?.stem ?? (stampMatch ? stampMatch[1] : null);
+
+  // Identity comes from the manifest when there is one. The stamp is a
+  // fallback for transcripts that predate SAA-93 — it identifies nothing
+  // durable (it collides, is clock-dependent, and dies with the filename),
+  // which is why the manifest exists.
+  const sourceId = capture?.recordingId ?? stamp ?? basename(transcriptPath);
+
+  // The manifest's start time is the recorded instant, to the millisecond.
+  // Reconstructing it from the filename stem loses sub-second precision and
+  // assumes the stem was never renamed, so prefer the manifest.
+  const startedAtIso = capture?.startedAt ?? (stamp ? stampToIso(stamp) : null);
   const startedAt = startedAtIso ? new Date(startedAtIso) : undefined;
 
   const accounts = await db.select().from(schema.accounts);
@@ -123,6 +163,56 @@ export async function ingestTranscript(transcriptPath: string): Promise<IngestRe
     `ingest: declared turnCount=${declared.turnCount} bodyChars=${declared.bodyChars} labels=${[...labelSet].sort().join(",")}\n`,
   );
 
+  // Idempotency on external identity. The seam retries by re-running from the
+  // first incomplete step, so ingest must be safe to reach twice for the same
+  // capture — inserting a second recording would fork the transcript and give
+  // extraction two rows to argue over. Keyed on (source, source_id), the pair
+  // the normalized transcript contract dedupes on, so this stays true for any
+  // future producer that files under the same convention.
+  const [existing] = await db
+    .select()
+    .from(schema.recordings)
+    .where(
+      and(
+        eq(schema.recordings.accountId, account.id),
+        eq(schema.recordings.source, CLIPWISE_SOURCE),
+        eq(schema.recordings.sourceId, sourceId),
+      ),
+    );
+  if (existing) {
+    const [transcript] = await db
+      .select()
+      .from(schema.transcripts)
+      .where(eq(schema.transcripts.recordingId, existing.id));
+    const [counts] = await db
+      .select({
+        turnCount: count(),
+        bodyChars: sql<number>`coalesce(sum(char_length(${schema.segments.text})), 0)::bigint`,
+      })
+      .from(schema.segments)
+      .where(eq(schema.segments.recordingId, existing.id));
+    process.stdout.write(
+      `ingest: recording already exists for source_id=${sourceId} → reusing ${existing.id} (no insert)\n`,
+    );
+    return {
+      recordingId: existing.id,
+      transcriptId: transcript?.id ?? "",
+      segmentCount: Number(counts.turnCount),
+      title: existing.title ?? title,
+      slug: existing.slug ?? slug,
+      accountId: account.id,
+      accountSlug: account.slug,
+      declared,
+      observed: {
+        turnCount: Number(counts.turnCount),
+        bodyChars: Number(counts.bodyChars),
+      },
+      recording: existing as unknown as Record<string, unknown>,
+      sourceId,
+      reused: true,
+    };
+  }
+
   const result = await db.transaction(async (tx) => {
     const [recording] = await tx
       .insert(schema.recordings)
@@ -130,8 +220,8 @@ export async function ingestTranscript(transcriptPath: string): Promise<IngestRe
         accountId: account.id,
         slug,
         title,
-        source: "clipwise-recorder",
-        sourceId: stamp ?? basename(transcriptPath),
+        source: CLIPWISE_SOURCE,
+        sourceId,
         mediaUrl: null,
         durationSec: null,
         startedAt,
@@ -144,6 +234,19 @@ export async function ingestTranscript(transcriptPath: string): Promise<IngestRe
           inputs: doc.inputs ?? null,
           downsampled: doc.downsampled ?? null,
           whisper_model: doc.model ?? null,
+          content: doc.content ?? null,
+          // The capture manifest, denormalised onto the recording: which
+          // device fed each track and at what rate. Recoverable from the
+          // manifest file, but that file lives outside the server and
+          // outlives nothing in particular.
+          capture: capture
+            ? {
+                manifest_file: capture.manifestFile,
+                stem: capture.stem,
+                started_at: capture.startedAt,
+                tracks: capture.tracks ?? null,
+              }
+            : null,
         },
       })
       .returning();
@@ -241,5 +344,7 @@ export async function ingestTranscript(transcriptPath: string): Promise<IngestRe
     declared,
     observed: { turnCount: observedTurns, bodyChars: observedChars },
     recording: dbRecording as unknown as Record<string, unknown>,
+    sourceId,
+    reused: false,
   };
 }

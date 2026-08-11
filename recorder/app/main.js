@@ -3,6 +3,11 @@
 // tracks a four-label state machine, and tears everything down on Stop or
 // Quit. Filenames, timestamp format and output directory match what
 // recorder/transcribe.py expects.
+//
+// On Stop it also spawns the capture→moments pipeline, which is what makes
+// the loop unattended: nothing between a capture ending and moments existing
+// is a human. The recorder is the trigger; the manifest it wrote at capture
+// start is the record the pipeline keys on.
 
 const { app, Tray, Menu, nativeImage } = require('electron');
 const { spawn, execFileSync } = require('child_process');
@@ -49,6 +54,24 @@ const SYSTEMTAP_BIN = path.join(RECORDER_DIR, 'systemtap', '.build', 'release', 
 const AUDIODEVS_BIN = path.join(RECORDER_DIR, 'audiodevs');
 const OUTDIR = path.join(os.homedir(), 'Library', 'Application Support', 'clipwise', 'recordings');
 
+// The capture→moments pipeline. Run through the server's own tsx so the seam
+// always executes current source — a built dist would silently run whatever
+// it was last compiled from. cwd is the server directory so dotenv/config
+// finds server/.env; the recorder never handles a secret itself.
+const SERVER_DIR = path.resolve(RECORDER_DIR, '..', 'server');
+const TSX_BIN = path.join(SERVER_DIR, 'node_modules', '.bin', 'tsx');
+const PIPELINE_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'cli.ts');
+
+// A GUI-launched Electron inherits a minimal PATH with no Homebrew on it, and
+// the pipeline shells out to python3, ffmpeg and whisper-cli. Launched from a
+// terminal this changes nothing.
+const PIPELINE_PATH = [
+    ...new Set([
+        ...(process.env.PATH || '').split(':').filter(Boolean),
+        '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
+    ]),
+].join(':');
+
 // --- state ----------------------------------------------------------------
 
 let tray = null;
@@ -57,11 +80,23 @@ let state = 'stopped';
 let session = null;
 let teardownInFlight = false;
 
+// Pipeline state is tracked separately from capture state, not folded into
+// it. Transcription and extraction take minutes and outlive the capture that
+// triggered them; a single state variable would leave the tray claiming to be
+// busy and refusing to start the next meeting's recording for no reason.
+// { stem, state: 'running' | 'failed', proc }
+let pipeline = null;
+
 const LABEL = {
     stopped:   'Stopped',
     starting:  'Starting',
     recording: 'Recording',
     stalled:   'Recording (stalled)',
+};
+
+const PIPELINE_SUFFIX = {
+    running: ' · Processing',
+    failed:  ' · Processing failed',
 };
 
 // --- helpers --------------------------------------------------------------
@@ -165,21 +200,104 @@ function spawnChild(cmd, args, env, logPath) {
 
 function renderTray() {
     const label = LABEL[state];
-    tray.setTitle(label);
+    const suffix = pipeline ? PIPELINE_SUFFIX[pipeline.state] : '';
+    tray.setTitle(label + suffix);
     const active = state !== 'stopped';
-    const menu = Menu.buildFromTemplate([
-        { label: `Status: ${label}`, enabled: false },
+    const items = [
+        { label: `Status: ${label}${suffix}`, enabled: false },
         { type: 'separator' },
         { label: 'Start', enabled: !active, click: startRecording },
         { label: 'Stop',  enabled:  active, click: stopRecording },
-        { type: 'separator' },
-        { label: 'Quit', click: quitApp },
-    ]);
-    tray.setContextMenu(menu);
+    ];
+    // A failed run is a menu item, not just a line in a log. Retry re-enters
+    // the pipeline for that stem; it resumes from the first incomplete step.
+    if (pipeline && pipeline.state === 'failed') {
+        items.push(
+            { type: 'separator' },
+            { label: `Retry processing (${pipeline.stem})`, click: retryPipeline },
+            { label: 'Dismiss failure', click: dismissPipelineFailure },
+        );
+    }
+    items.push({ type: 'separator' }, { label: 'Quit', click: quitApp });
+    tray.setContextMenu(Menu.buildFromTemplate(items));
 }
 
 function setState(next) {
     state = next;
+    renderTray();
+}
+
+// --- pipeline -------------------------------------------------------------
+
+// Spawned detached and unref'd so it survives the app quitting: a capture
+// that has already ended should still become moments even if the user quits
+// while it is being transcribed. The exit listener still fires for as long as
+// this process is alive, which is what drives the tray.
+function startPipeline(stem, opts = {}) {
+    if (!stem) return;
+    const logPath = path.join(OUTDIR, `pipeline-${stem}.log`);
+    const args = [PIPELINE_ENTRY, OUTDIR, '--stem', stem];
+    if (opts.force) args.push('--force-extract');
+    let fd;
+    try {
+        fd = fs.openSync(logPath, 'a');
+        fs.writeSync(
+            fd,
+            `\n[clipwise-recorder] ${new Date().toISOString()} pipeline start ` +
+            `stem=${stem}${opts.force ? ' force-extract' : ''}\n`,
+        );
+    } catch (err) {
+        console.error(`pipeline log ${logPath}: ${String(err)}`);
+        return;
+    }
+    const proc = spawn(TSX_BIN, args, {
+        cwd: SERVER_DIR,
+        env: { ...process.env, PATH: PIPELINE_PATH },
+        stdio: ['ignore', fd, fd],
+        detached: true,
+    });
+    fs.closeSync(fd);
+    proc.unref();
+    pipeline = { stem, state: 'running', proc };
+    renderTray();
+
+    proc.once('error', (err) => {
+        try {
+            fs.appendFileSync(logPath, `[clipwise-recorder] spawn failed: ${String(err)}\n`);
+        } catch {}
+        if (pipeline && pipeline.proc === proc) {
+            pipeline = { stem, state: 'failed', proc: null };
+            renderTray();
+        }
+    });
+    proc.once('exit', (code, signal) => {
+        if (!pipeline || pipeline.proc !== proc) return;
+        if (code === 0) {
+            pipeline = null;
+        } else {
+            try {
+                fs.appendFileSync(
+                    logPath,
+                    `[clipwise-recorder] pipeline exited code=${code} signal=${signal} — ` +
+                    `see pipeline-${stem}.json for the failing step\n`,
+                );
+            } catch {}
+            pipeline = { stem, state: 'failed', proc: null };
+        }
+        renderTray();
+    });
+}
+
+function retryPipeline() {
+    if (!pipeline || pipeline.state !== 'failed') return;
+    startPipeline(pipeline.stem);
+}
+
+// Clears the tray badge only. The sidecar keeps the failure — dismissing is
+// about the menu bar, not about deciding the capture was fine.
+function dismissPipelineFailure() {
+    if (!pipeline || pipeline.state !== 'failed') return;
+    pipeline = null;
     renderTray();
 }
 
@@ -233,7 +351,12 @@ function startRecording() {
     session = {
         tap: tapProc, mic: micProc, poller: pollProc,
         paths,
+        stem: stamp,
         recordingId: manifest.recording_id,
+        // Set once both tracks have produced bytes. A capture that never got
+        // there has nothing worth transcribing, so it does not trigger the
+        // pipeline — see stopRecording.
+        reachedRecording: false,
         growth: { tap: { size: 0, ts: 0 }, mic: { size: 0, ts: 0 } },
         timers: {},
     };
@@ -278,6 +401,7 @@ function pollTick() {
     if (state === 'starting') {
         if (s.growth.tap.size > 0 && s.growth.mic.size > 0) {
             clearTimeout(s.timers.starting);
+            s.reachedRecording = true;
             setState('recording');
         }
     } else if (state === 'recording' || state === 'stalled') {
@@ -316,13 +440,24 @@ function stopRecording() {
     // Tray flips to Stopped up to KILL_GRACE_MS before children actually
     // exit. Accepted: Stop is user-initiated and nobody is watching the
     // gap. Record the gap here so it isn't rediscovered as a bug later.
+    const stem = session && session.reachedRecording ? session.stem : null;
     setState('stopped');
-    teardown();
+    // The pipeline starts from teardown's completion callback, never from
+    // this click. ffmpeg finalizes the WAV header when it handles SIGINT, so
+    // a transcribe kicked off before it exits reads a truncated file.
+    teardown(() => startPipeline(stem));
 }
 
 function quitApp() {
+    // A capture that already happened should still become moments, so quitting
+    // mid-recording hands off rather than discards. The child is detached, so
+    // it outlives this process.
+    const stem = session && session.reachedRecording ? session.stem : null;
     if (state !== 'stopped') setState('stopped');
-    teardown(() => app.exit(0));
+    teardown(() => {
+        startPipeline(stem);
+        app.exit(0);
+    });
 }
 
 // --- app boot -------------------------------------------------------------
