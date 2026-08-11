@@ -62,7 +62,7 @@ Clipwise inverts that:
 | **License**                | Apache 2.0, open source         | Proprietary, closed            |
 | **Credentials / recordings** | Never leave your infra         | Uploaded to vendor             |
 
-If you're a solo operator, small team, or security-conscious org that doesn't want your meeting audio sitting on someone else's servers — Clipwise is built for you.
+If you want your meeting intelligence to live on infrastructure you control rather than a vendor's cloud, Clipwise is built for you.
 
 ## Status
 
