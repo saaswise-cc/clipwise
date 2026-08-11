@@ -14,6 +14,19 @@ func getDeviceID(_ selector: AudioObjectPropertySelector) -> AudioObjectID {
     return id
 }
 
+// Nominal sample rate is a Float64. Every rate this has seen is integral, and
+// the callers (manifest, log diffing) want an integer, so it is narrowed here
+// rather than at each use. 0 means the query failed — callers treat it as
+// unknown, never as a rate.
+func getRate(_ deviceID: AudioObjectID) -> Int {
+    var value: Float64 = 0
+    var size = UInt32(MemoryLayout<Float64>.size)
+    var a = addr(kAudioDevicePropertyNominalSampleRate)
+    let status = AudioObjectGetPropertyData(deviceID, &a, 0, nil, &size, &value)
+    if status != noErr || !value.isFinite || value <= 0 { return 0 }
+    return Int(value)
+}
+
 func getString(_ deviceID: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String {
     var value: CFString = "" as CFString
     var size = UInt32(MemoryLayout<CFString>.stride)
@@ -25,7 +38,9 @@ func getString(_ deviceID: AudioObjectID, _ selector: AudioObjectPropertySelecto
     return value as String
 }
 
-// Compare only the device identity fields, ignoring wall_ns/iso.
+// Compare only the device identity fields, ignoring wall_ns/iso. The rates sit
+// inside the compared region deliberately: a device that stays put but
+// renegotiates its rate mid-capture is exactly the event worth flagging.
 func sameDevices(_ a: String, _ b: String) -> Bool {
     func fields(_ s: String) -> String {
         if let r = s.range(of: "in_id=") { return String(s[r.lowerBound...]) }
@@ -39,11 +54,14 @@ func snapshot() -> String {
     let outID = getDeviceID(kAudioHardwarePropertyDefaultOutputDevice)
     let inName = getString(inID, kAudioObjectPropertyName)
     let inUID = getString(inID, kAudioDevicePropertyDeviceUID)
+    let inRate = getRate(inID)
     let outName = getString(outID, kAudioObjectPropertyName)
     let outUID = getString(outID, kAudioDevicePropertyDeviceUID)
+    let outRate = getRate(outID)
     let ns = Int64(Date().timeIntervalSince1970 * 1e9)
     let iso = ISO8601DateFormatter().string(from: Date())
-    return "wall_ns=\(ns) iso=\(iso) in_id=\(inID) in_name=\"\(inName)\" in_uid=\"\(inUID)\" out_id=\(outID) out_name=\"\(outName)\" out_uid=\"\(outUID)\""
+    return "wall_ns=\(ns) iso=\(iso) in_id=\(inID) in_name=\"\(inName)\" in_uid=\"\(inUID)\" in_rate=\(inRate)"
+        + " out_id=\(outID) out_name=\"\(outName)\" out_uid=\"\(outUID)\" out_rate=\(outRate)"
 }
 
 let mode = CommandLine.arguments.dropFirst().first ?? "--once"

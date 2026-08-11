@@ -101,6 +101,24 @@ Covers the Mac recorder only; the server and MCP have their own setup.
 that cannot launch. Verified from the installed package on disk 2026-08-09, with
 `ignore-scripts` confirmed `false`.
 
+**Capture output.** Each capture writes to
+`~/Library/Application Support/clipwise/recordings/`, sharing one timestamp
+stem: the two audio tracks, a log per child, and `manifest-<stem>.json`.
+
+The manifest is written at capture start, before any child spawns, and is what
+identifies a recording. Its `recording_id` is a generated UUID — the stem stays
+the human-readable handle, but it is not an identifier: timestamps collide and
+depend on a correct clock. Consumers key on `recording_id` (it is what the
+normalized transcript contract carries as `source_recording_id`).
+
+It also records the device and sample rate per track, which nothing else
+preserves — a headset can put the mic at 24 kHz against a 48 kHz tap, and the
+children only mention their rates in stderr logs. Both rates come from one
+CoreAudio query at start rather than from the children, which report their
+formats milliseconds later; `sample_rate_source` on each track names that
+provenance, so a manifest recovered from a capture's own artifacts is
+distinguishable from one written live.
+
 **Transcription** — only needed for `transcribe.py`, not for recording.
 
 - `brew install whisper-cpp` for the `whisper-cli` binary

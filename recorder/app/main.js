@@ -6,6 +6,7 @@
 
 const { app, Tray, Menu, nativeImage } = require('electron');
 const { spawn, execFileSync } = require('child_process');
+const { randomUUID } = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -32,6 +33,14 @@ const STARTING_TIMEOUT_MS = 9000;
 const POLL_INTERVAL_MS = 250;
 const TAP_STALE_MS = 1000;
 const MIC_STALE_MS = 3200;
+
+// Manifest schema version. Bump on any change that is not purely additive.
+const MANIFEST_VERSION = 1;
+
+// The tap is created with isMono=true, so its stream is one channel whatever
+// the output device carries. Recorded here because the tap track is headerless
+// PCM: a consumer cannot recover channel count from the file.
+const TAP_CHANNELS = 1;
 
 // --- paths ----------------------------------------------------------------
 
@@ -68,11 +77,78 @@ function fileSize(p) {
     try { return fs.statSync(p).size; } catch { return 0; }
 }
 
-function readMicName() {
+// One pre-flight CoreAudio snapshot: the mic name ffmpeg is pointed at, plus
+// the device identity and nominal rate that go into the manifest. Taken before
+// the children spawn, because neither child has reported its own format yet at
+// the moment the manifest is written — see writeManifest.
+function readDevices() {
     const out = execFileSync(AUDIODEVS_BIN, ['--once'], { encoding: 'utf8' });
-    const m = out.match(/in_name="([^"]+)"/);
-    if (!m) throw new Error(`audiodevs --once: could not parse in_name from: ${out}`);
-    return m[1];
+    const field = (re, label) => {
+        const m = out.match(re);
+        if (!m) throw new Error(`audiodevs --once: could not parse ${label} from: ${out}`);
+        return m[1];
+    };
+    // audiodevs reports 0 when the rate query fails. Unknown is null in the
+    // manifest, never a plausible-looking number.
+    const rate = (re, label) => {
+        const n = Number(field(re, label));
+        return Number.isFinite(n) && n > 0 ? n : null;
+    };
+    return {
+        inName:  field(/\bin_name="([^"]*)"/, 'in_name'),
+        inUid:   field(/\bin_uid="([^"]*)"/, 'in_uid'),
+        inRate:  rate(/\bin_rate=(\S+)/, 'in_rate'),
+        outName: field(/\bout_name="([^"]*)"/, 'out_name'),
+        outUid:  field(/\bout_uid="([^"]*)"/, 'out_uid'),
+        outRate: rate(/\bout_rate=(\S+)/, 'out_rate'),
+    };
+}
+
+// The manifest is what makes a capture a thing rather than a naming
+// convention: an opaque id that does not depend on a correct clock, and the
+// per-track device and rate that are otherwise recoverable only from child
+// stderr that nothing preserves.
+//
+// Rates come from the CoreAudio query above, not from the children. systemtap
+// and ffmpeg both report their real format milliseconds after they start;
+// waiting for that would make this a post-hoc artifact rather than something
+// written at capture start. sample_rate_source records that provenance in the
+// file so a consumer never has to guess which it is holding.
+function buildManifest(stamp, startedAt, dev, paths) {
+    return {
+        manifest_version: MANIFEST_VERSION,
+        recording_id: randomUUID().toUpperCase(),
+        started_at: startedAt,
+        // The filename stem stays the human-readable handle. It is recorded,
+        // not derived from — recording_id is the identifier.
+        stem: stamp,
+        tracks: [
+            {
+                track: 'system',
+                file: path.basename(paths.tap),
+                encoding: 'f32le',
+                container: 'raw',
+                channels: TAP_CHANNELS,
+                sample_rate: dev.outRate,
+                sample_rate_source: 'coreaudio_nominal_output',
+                // The tap captures the default output device, so that is the
+                // device this track belongs to.
+                device_name: dev.outName,
+                device_uid: dev.outUid,
+            },
+            {
+                track: 'mic',
+                file: path.basename(paths.mic),
+                encoding: 'f32le',
+                container: 'wav',
+                sample_rate: dev.inRate,
+                sample_rate_source: 'coreaudio_nominal_input',
+                device_name: dev.inName,
+                device_uid: dev.inUid,
+            },
+        ],
+        logs: [paths.tapLog, paths.micLog, paths.pollLog].map(p => path.basename(p)),
+    };
 }
 
 function spawnChild(cmd, args, env, logPath) {
@@ -113,20 +189,29 @@ function startRecording() {
     if (state !== 'stopped' || session) return;
     fs.mkdirSync(OUTDIR, { recursive: true });
     const stamp = utcStamp();
+    const startedAt = new Date().toISOString();
     const paths = {
-        tap:     path.join(OUTDIR, `system-${stamp}.f32le.pcm`),
-        tapLog:  path.join(OUTDIR, `systemtap-${stamp}.log`),
-        mic:     path.join(OUTDIR, `mic-${stamp}.wav`),
-        micLog:  path.join(OUTDIR, `mic-${stamp}.log`),
-        pollLog: path.join(OUTDIR, `poller-${stamp}.log`),
+        tap:      path.join(OUTDIR, `system-${stamp}.f32le.pcm`),
+        tapLog:   path.join(OUTDIR, `systemtap-${stamp}.log`),
+        mic:      path.join(OUTDIR, `mic-${stamp}.wav`),
+        micLog:   path.join(OUTDIR, `mic-${stamp}.log`),
+        pollLog:  path.join(OUTDIR, `poller-${stamp}.log`),
+        manifest: path.join(OUTDIR, `manifest-${stamp}.json`),
     };
-    let micName;
+    let dev, manifest;
     try {
-        micName = readMicName();
+        dev = readDevices();
+        manifest = buildManifest(stamp, startedAt, dev, paths);
+        // Written before the children spawn, so no audio file can exist
+        // without one. OUTDIR was just created, so a failure here means the
+        // directory is unwritable and the capture would have been lost
+        // anyway — refusing is honest, and leaves nothing half-formed.
+        fs.writeFileSync(paths.manifest, JSON.stringify(manifest, null, 2) + '\n');
     } catch (err) {
         console.error(String(err));
         return;
     }
+    const micName = dev.inName;
     const tapProc = spawnChild(
         SYSTEMTAP_BIN, [],
         { ...process.env, SYSTEMTAP_OUT: paths.tap },
@@ -148,6 +233,7 @@ function startRecording() {
     session = {
         tap: tapProc, mic: micProc, poller: pollProc,
         paths,
+        recordingId: manifest.recording_id,
         growth: { tap: { size: 0, ts: 0 }, mic: { size: 0, ts: 0 } },
         timers: {},
     };
@@ -167,6 +253,7 @@ function onCaptureChildExit(which) {
         const proc    = which === 'tap' ? session.tap    : session.mic;
         const logPath = which === 'tap' ? session.paths.tapLog : session.paths.micLog;
         const line = `[clipwise-recorder] ${new Date().toISOString()} ` +
+                     `recording_id=${session.recordingId} ` +
                      `child=${which} exited unexpectedly ` +
                      `code=${proc.exitCode} signal=${proc.signalCode}\n`;
         try { fs.appendFileSync(logPath, line); } catch {}
