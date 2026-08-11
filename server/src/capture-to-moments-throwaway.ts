@@ -1,10 +1,16 @@
-// SAA-83 throwaway trigger — capture directory in, moments out, no
+// Throwaway trigger — capture directory in, moments out, no
 // human-copied identifiers in between.
 //
-// THIS FILE IS DELIBERATELY DISPOSABLE. Delete it when the SAA-72
-// recorder-shell decision lands and the recorder/server invocation
-// seam is designed (see SAA-83 for why). It has no state, no retry,
-// no jobs-table integration, no directory watching. It is glue.
+// THIS FILE IS DELIBERATELY DISPOSABLE. Delete it once a real
+// capture-to-moments seam exists in code: the recorder uploads a
+// finished capture and the server ingests and extracts it
+// automatically, with no manual invocation of this script in
+// between. A ticket closing is not that condition — check the
+// recorder and server source for an actual upload/ingest path
+// before deleting this. Until that path exists, this file is the
+// only working route from a recording to a moment. It has no
+// state, no retry, no jobs-table integration, no directory
+// watching. It is glue.
 //
 // What it does:
 //   1. Reads the capture directory.
