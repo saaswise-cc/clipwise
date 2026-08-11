@@ -1,6 +1,6 @@
 # Clipwise
 
-**AI-native meeting intelligence — self-hosted, open source, surfaced through Claude.**
+**Team-owned, self-hosted meeting intelligence. Captured locally, surfaced through Claude.**
 
 Clipwise records your meetings, transcribes them locally, and builds a persistent database of the moments that matter — decisions, commitments, objections, insights — that you can query across every meeting you've ever had. It's designed to live inside Claude via MCP, not to be another destination platform you have to log into.
 
