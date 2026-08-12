@@ -340,7 +340,24 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
 
   // --- extract ---
   const prior = sidecar.steps.extract;
-  if (prior.state === "ok") {
+  // A recorded completion refers to the recording row that existed when it
+  // ran. If ingest just inserted a fresh row, that row is gone — deleted, or
+  // the database rebuilt — and its moments went with it, so the sidecar's
+  // memory of success is about something that no longer exists. Trusting it
+  // would leave the capture ingested with nothing extracted, silently. The
+  // sidecar is a cache of what happened; the database is what is true.
+  if (prior.state === "ok" && !reused) {
+    log(
+      "extraction was recorded complete, but ingest inserted a new recording row — " +
+        "the prior run's moments belonged to a row that no longer exists. Re-extracting.",
+    );
+    sidecar.steps.extract = emptyStep();
+    writeSidecar(dir, sidecar);
+  } else if (prior.state === "ok" && opts.forceExtract) {
+    log("extraction already complete, but --force-extract was passed — re-extracting");
+    sidecar.steps.extract = emptyStep();
+    writeSidecar(dir, sidecar);
+  } else if (prior.state === "ok") {
     log("extraction already completed for this capture — nothing to do");
     return {
       stem,
