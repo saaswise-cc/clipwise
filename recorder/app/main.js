@@ -471,26 +471,37 @@ function startRecording() {
         return;
     }
 
-    // Both grants denied is the only state worth refusing over: there is no
-    // capturable half, so the whole hour would be a correctly-sized silent
-    // file nobody discovers until playback. One grant denied still yields a
-    // real side of the conversation, and refusing it would discard content
-    // and strand anyone who cannot grant the other (managed devices). Start,
-    // and say plainly what is missing — a person is at the Start click.
+    // Any denied grant refuses the capture.
+    //
+    // The earlier policy started anyway on one denial, reasoning that half a
+    // conversation beats none. A denied microphone cannot produce a half:
+    // avfoundation refuses the device outright — "Failed to create AV capture
+    // input device" — so no mic file is ever created, the start gate never
+    // sees both tracks grow, and the capture is torn down at the timeout
+    // having discarded the real system audio it did capture. Measured: 8.9s,
+    // 99.3% nonzero, thrown away while the tray said the capture never
+    // started. Making that half reachable means changing the start gate, the
+    // timeout, the child-death teardown and the transcribe step, for a
+    // one-sided track of low standalone value.
+    //
+    // Start is always a manual click, so someone is present to act: one toggle
+    // buys a whole recording rather than half of one. This is only about
+    // START — a track dying mid-capture is a different case, and the
+    // classifier's keep-with-flag path still exists for it.
     const denied = deniedServices(dev);
-    if (denied.length === 2) {
+    if (denied.length) {
         permissionIssue = {
             denied,
             blocked: true,
-            note: 'Both audio permissions are off — capture would record nothing',
+            note: denied.length === 2
+                ? 'Both audio permissions are off — capture would record nothing'
+                : `${denied[0]} permission is off — fix it to record`,
         };
         renderTray();
         console.error(`start refused: denied permissions: ${denied.join(', ')}`);
         return;
     }
-    permissionIssue = denied.length === 1
-        ? { denied, blocked: false, note: `${denied[0]} permission is off — capturing the other track only` }
-        : null;
+    permissionIssue = null;
 
     try {
         manifest = buildManifest(stamp, startedAt, dev, paths);
