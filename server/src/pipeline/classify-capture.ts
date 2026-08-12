@@ -63,14 +63,33 @@ export type CaptureClassification = {
   thresholds: { floorRms: number; gapMinSeconds: number; windowSeconds: number };
 };
 
-// Between SAA-87's transient-gap noise floor (~0.00005) and the measured
-// quiet-room mic floor (0.018): ~20x above the first, ~18x below the second.
-// Deliberately not a knife-edge in either direction.
-const FLOOR_RMS = 1e-3;
+// Above SAA-87's transient-gap noise floor (~0.00005) and below every real
+// microphone capture measured here. That spread is wider than first assumed:
+// quiet rooms on this machine have come in at 0.022, 0.0057 and 0.0012 rms,
+// the last one a capture with no speech at all. An earlier 1e-3 boundary was
+// set from the loudest of those and cleared the quietest by only 1.22x, which
+// is not a margin. 1e-4 sits ~12x under the quietest real capture and ~2x over
+// the only measured noise floor.
+//
+// Microphone gain varies by device, distance and room, so no absolute constant
+// is safe forever. This one only has to separate "a microphone is producing
+// something" from "a microphone is producing nothing" — a coarser question
+// than it looks, and the reason gap detection below does not use it.
+const FLOOR_RMS = 1e-4;
 
 // A dropout shorter than this is not worth annotating — natural pauses in
 // speech reach the floor for a second or two.
 const GAP_MIN_SECONDS = 5;
+
+// A dropout is relative, not absolute. A window is part of a gap when it falls
+// to a tenth of what the track carries when it is carrying anything. An
+// absolute threshold cannot express this: it read a uniformly quiet room as a
+// twelve-second dropout, because "quiet" and "dropped out" are the same number
+// and different facts. The reference level is taken over windows above the
+// absolute floor, so a gap covering most of the capture still has live windows
+// to be measured against — a plain median would sink into the gap itself once
+// the gap ran past half the recording.
+const GAP_RELATIVE_FACTOR = 0.1;
 
 type TrackContent = {
   samples?: number;
@@ -96,17 +115,28 @@ function bandOf(c: TrackContent): Band {
   return "live";
 }
 
-// Runs of consecutive windows at or below the floor, inside a track that is
-// live overall. Only meaningful for a track that had signal to lose.
+function median(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// Runs of consecutive windows far below what this track normally carries,
+// inside a track that is live overall. Only meaningful for a track that had
+// signal to lose — see GAP_RELATIVE_FACTOR for why the test is relative.
 function findGaps(c: TrackContent): Span[] {
   const series = c.windows_rms;
   const w = c.window_s;
   if (!Array.isArray(series) || typeof w !== "number" || w <= 0) return [];
+  const carrying = series.filter((v) => v >= FLOOR_RMS);
+  if (carrying.length === 0) return [];
+  const threshold = median(carrying) * GAP_RELATIVE_FACTOR;
+  if (!(threshold > 0)) return [];
   const minWindows = Math.ceil(GAP_MIN_SECONDS / w);
   const spans: Span[] = [];
   let run = 0;
   for (let i = 0; i <= series.length; i++) {
-    const quiet = i < series.length && series[i] < FLOOR_RMS;
+    const quiet = i < series.length && series[i] < threshold;
     if (quiet) {
       run++;
       continue;
