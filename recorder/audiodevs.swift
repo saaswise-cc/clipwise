@@ -1,6 +1,52 @@
+import AVFoundation
 import CoreAudio
 import Darwin
 import Foundation
+
+// --- permission state -----------------------------------------------------
+//
+// Reported on --once only, never on --poll. A denied grant is a permission
+// question, not a silence question: SAA-87 established that a denied tap and a
+// granted tap with nothing playing are bitwise identical, so sample content
+// cannot tell them apart and only this can.
+//
+// Mic uses the public AVFoundation API. System audio has no public equivalent,
+// so it goes through TCC.framework's private TCCAccessPreflight — the approach
+// AudioCap uses. Preflight reports state; it is TCCAccessRequest that prompts,
+// and that is deliberately not called here.
+//
+// Private API, so every failure path degrades to "unavailable" and none of them
+// can stop a capture. A vanished symbol must never cost a meeting. Note the
+// weaker risk this does not defend against: a silent change to the return-code
+// meaning would be read as a real answer. Re-run the probe after an OS bump.
+
+typealias TCCPreflightFn = @convention(c) (CFString, CFDictionary?) -> Int32
+
+let tccPreflight: TCCPreflightFn? = {
+    guard let h = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_NOW),
+          let sym = dlsym(h, "TCCAccessPreflight") else { return nil }
+    return unsafeBitCast(sym, to: TCCPreflightFn.self)
+}()
+
+func tapPermission() -> String {
+    guard let preflight = tccPreflight else { return "unavailable" }
+    switch preflight("kTCCServiceAudioCapture" as CFString, nil) {
+    case 0:  return "granted"
+    case 1:  return "denied"
+    case 2:  return "notDetermined"
+    case let other: return "unexpected(\(other))"
+    }
+}
+
+func micPermission() -> String {
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:    return "granted"
+    case .denied:        return "denied"
+    case .restricted:    return "restricted"
+    case .notDetermined: return "notDetermined"
+    @unknown default:    return "unavailable"
+    }
+}
 
 func addr(_ s: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress(mSelector: s, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
@@ -67,7 +113,10 @@ func snapshot() -> String {
 let mode = CommandLine.arguments.dropFirst().first ?? "--once"
 
 if mode == "--once" {
-    print(snapshot())
+    // Permission fields are appended here rather than inside snapshot(), so
+    // --poll's per-second line — and the region its CHANGE diff compares —
+    // stays exactly as it was.
+    print(snapshot() + " mic_perm=\(micPermission()) tap_perm=\(tapPermission())")
     exit(0)
 }
 

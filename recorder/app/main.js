@@ -9,9 +9,10 @@
 // is a human. The recorder is the trigger; the manifest it wrote at capture
 // start is the record the pipeline keys on.
 
-const { app, Tray, Menu, nativeImage } = require('electron');
+const { app, Tray, Menu, nativeImage, shell } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const { randomUUID } = require('crypto');
+const zlib = require('zlib');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -87,6 +88,10 @@ let teardownInFlight = false;
 // { stem, state: 'running' | 'failed', proc }
 let pipeline = null;
 
+// Most recent permission finding, shown in the tray until dismissed.
+// { denied: ['System Audio', …], blocked: bool, note: string|null }
+let permissionIssue = null;
+
 const LABEL = {
     stopped:   'Stopped',
     starting:  'Starting',
@@ -94,9 +99,12 @@ const LABEL = {
     stalled:   'Recording (stalled)',
 };
 
-const PIPELINE_SUFFIX = {
-    running: ' · Processing',
-    failed:  ' · Processing failed',
+// Menu-item text, not title text — see renderTray. These were tray-title
+// suffixes and were the same overflow hazard as the permission suffix that
+// actually triggered it.
+const PIPELINE_NOTE = {
+    running: 'Processing capture…',
+    failed:  'Processing failed — see pipeline-<stem>.json',
 };
 
 // --- helpers --------------------------------------------------------------
@@ -136,7 +144,26 @@ function readDevices() {
         outName: field(/\bout_name="([^"]*)"/, 'out_name'),
         outUid:  field(/\bout_uid="([^"]*)"/, 'out_uid'),
         outRate: rate(/\bout_rate=(\S+)/, 'out_rate'),
+        micPerm: field(/\bmic_perm=(\S+)/, 'mic_perm'),
+        tapPerm: field(/\btap_perm=(\S+)/, 'tap_perm'),
     };
+}
+
+// Settings panes, for the affordance offered when a grant is missing. Telling
+// someone permission is off without a way to fix it is only half an answer.
+const SETTINGS_PANE = {
+    'System Audio': 'x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture',
+    'Microphone':   'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',
+};
+
+// Only an explicit denial counts. notDetermined resolves with a click (the
+// prompt fires on first use, and SAA-90's start gate covers a non-answer), and
+// unavailable/restricted are not statements about this user's grant.
+function deniedServices(dev) {
+    const out = [];
+    if (dev.micPerm === 'denied') out.push('Microphone');
+    if (dev.tapPerm === 'denied') out.push('System Audio');
+    return out;
 }
 
 // The manifest is what makes a capture a thing rather than a naming
@@ -183,6 +210,16 @@ function buildManifest(stamp, startedAt, dev, paths) {
             },
         ],
         logs: [paths.tapLog, paths.micLog, paths.pollLog].map(p => path.basename(p)),
+        // Permission state at capture start. This is the only thing that can
+        // tell a denied tap from a tap with nothing playing — the two are
+        // bitwise identical in the audio itself (SAA-87). The classifier
+        // downstream reads these; without them a silent tap is indeterminate.
+        permissions: {
+            mic: dev.micPerm,
+            tap: dev.tapPerm,
+            mic_source: 'avcapturedevice_authorization_status',
+            tap_source: 'tcc_access_preflight_kTCCServiceAudioCapture',
+        },
     };
 }
 
@@ -196,19 +233,129 @@ function spawnChild(cmd, args, env, logPath) {
     return proc;
 }
 
+// --- tray icon ------------------------------------------------------------
+//
+// The tray was title-only, and a title-only item is sized by its text. When
+// the status string grew from "Starting" to "Starting · Partial capture" the
+// item silently disappeared from a full menu bar — macOS drops what does not
+// fit, with no error and the app still running. An icon gives the item a fixed
+// width it can never outgrow, so the failure cannot recur however the status
+// vocabulary changes later. Status detail lives in the menu; the title stays
+// down to a few characters.
+//
+// The icon is generated rather than shipped as an asset: a coloured dot is a
+// few lines of PNG encoding, and that beats a binary file in the repo that
+// nothing can diff.
+
+const CRC_TABLE = (() => {
+    const t = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        t[n] = c;
+    }
+    return t;
+})();
+
+function crc32(buf) {
+    let c = -1;
+    for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ -1) >>> 0;
+}
+
+function pngChunk(type, data) {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body));
+    return Buffer.concat([len, body, crc]);
+}
+
+// 32x32 RGBA dot, rendered at 16pt via scaleFactor 2.
+function dotIcon(hex) {
+    const size = 32, radius = 10, centre = (size - 1) / 2;
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    const raw = Buffer.alloc(size * (size * 4 + 1));
+    let o = 0;
+    for (let y = 0; y < size; y++) {
+        raw[o++] = 0; // filter: none
+        for (let x = 0; x < size; x++) {
+            const d = Math.hypot(x - centre, y - centre);
+            // One pixel of feather at the edge, so it does not look jagged.
+            const a = Math.max(0, Math.min(1, radius + 0.5 - d));
+            raw[o++] = r; raw[o++] = g; raw[o++] = b; raw[o++] = Math.round(a * 255);
+        }
+    }
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(size, 0);
+    ihdr.writeUInt32BE(size, 4);
+    ihdr[8] = 8;   // bit depth
+    ihdr[9] = 6;   // colour type: RGBA
+    const png = Buffer.concat([
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        pngChunk('IHDR', ihdr),
+        pngChunk('IDAT', zlib.deflateSync(raw)),
+        pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+    return nativeImage.createFromBuffer(png, { scaleFactor: 2 });
+}
+
+const DOT = {
+    stopped:   '#8E8E93',
+    starting:  '#FF9F0A',
+    recording: '#FF453A',
+    stalled:   '#FFD60A',
+};
+
+const ICON = {};
+function iconFor(s) {
+    if (!ICON[s]) ICON[s] = dotIcon(DOT[s]);
+    return ICON[s];
+}
+
 // --- tray -----------------------------------------------------------------
 
 function renderTray() {
     const label = LABEL[state];
-    const suffix = pipeline ? PIPELINE_SUFFIX[pipeline.state] : '';
-    tray.setTitle(label + suffix);
+    const pipelineNote = pipeline ? PIPELINE_NOTE[pipeline.state] : null;
+    const permNote = permissionIssue ? permissionIssue.note : null;
+
+    // Title stays down to a few characters whatever the state vocabulary
+    // grows into: a word for capture, and single glyphs for anything wanting
+    // attention. Everything wordy is a menu item, which has room for it.
+    const attention = permissionIssue || (pipeline && pipeline.state === 'failed');
+    const title = [
+        state === 'stopped' ? '' : 'Rec',
+        pipeline && pipeline.state === 'running' ? '⚙' : '',
+        attention ? '⚠' : '',
+    ].filter(Boolean).join(' ');
+    tray.setImage(iconFor(state));
+    tray.setTitle(title ? ` ${title}` : '');
+
     const active = state !== 'stopped';
     const items = [
-        { label: `Status: ${label}${suffix}`, enabled: false },
+        { label: `Status: ${label}`, enabled: false },
+    ];
+    if (pipelineNote) items.push({ label: pipelineNote, enabled: false });
+    if (permNote) items.push({ label: permNote, enabled: false });
+    items.push(
         { type: 'separator' },
         { label: 'Start', enabled: !active, click: startRecording },
         { label: 'Stop',  enabled:  active, click: stopRecording },
-    ];
+    );
+    if (permissionIssue) {
+        items.push({ type: 'separator' });
+        for (const svc of permissionIssue.denied) {
+            items.push({
+                label: `Open ${svc} settings…`,
+                click: () => shell.openExternal(SETTINGS_PANE[svc]),
+            });
+        }
+        items.push({ label: 'Dismiss warning', click: () => { permissionIssue = null; renderTray(); } });
+    }
     // A failed run is a menu item, not just a line in a log. Retry re-enters
     // the pipeline for that stem; it resumes from the first incomplete step.
     if (pipeline && pipeline.state === 'failed') {
@@ -319,6 +466,33 @@ function startRecording() {
     let dev, manifest;
     try {
         dev = readDevices();
+    } catch (err) {
+        console.error(String(err));
+        return;
+    }
+
+    // Both grants denied is the only state worth refusing over: there is no
+    // capturable half, so the whole hour would be a correctly-sized silent
+    // file nobody discovers until playback. One grant denied still yields a
+    // real side of the conversation, and refusing it would discard content
+    // and strand anyone who cannot grant the other (managed devices). Start,
+    // and say plainly what is missing — a person is at the Start click.
+    const denied = deniedServices(dev);
+    if (denied.length === 2) {
+        permissionIssue = {
+            denied,
+            blocked: true,
+            note: 'Both audio permissions are off — capture would record nothing',
+        };
+        renderTray();
+        console.error(`start refused: denied permissions: ${denied.join(', ')}`);
+        return;
+    }
+    permissionIssue = denied.length === 1
+        ? { denied, blocked: false, note: `${denied[0]} permission is off — capturing the other track only` }
+        : null;
+
+    try {
         manifest = buildManifest(stamp, startedAt, dev, paths);
         // Written before the children spawn, so no audio file can exist
         // without one. OUTDIR was just created, so a failure here means the
@@ -353,6 +527,7 @@ function startRecording() {
         paths,
         stem: stamp,
         recordingId: manifest.recording_id,
+        perms: { mic: dev.micPerm, tap: dev.tapPerm },
         // Set once both tracks have produced bytes. A capture that never got
         // there has nothing worth transcribing, so it does not trigger the
         // pipeline — see stopRecording.
@@ -384,8 +559,32 @@ function onCaptureChildExit(which) {
     stopRecording();
 }
 
+// A capture that never produced a byte on both tracks. SAA-90 already catches
+// and tears this down; all that is added here is saying why it probably
+// happened. A tap blocked inside Core Audio setup waiting on an unanswered
+// prompt looks exactly like this, and the permission state read at start is
+// the evidence that distinguishes it from a plain failure to start.
 function onStartingTimeout() {
     if (state !== 'starting') return;
+    const perms = session ? session.perms : null;
+    const pending = perms
+        ? ['mic', 'tap'].filter(k => perms[k] === 'notDetermined')
+        : [];
+    const why = pending.length
+        ? `a permission prompt may be waiting (${pending.map(k => `${k}_perm=notDetermined`).join(' ')})`
+        : 'no bytes on either track before the deadline';
+    if (session) {
+        const line = `[clipwise-recorder] ${new Date().toISOString()} ` +
+                     `capture never started — ${why}\n`;
+        try { fs.appendFileSync(session.paths.tapLog, line); } catch {}
+    }
+    if (pending.length) {
+        permissionIssue = {
+            denied: [],
+            blocked: false,
+            note: 'Capture never started — a permission prompt may be waiting',
+        };
+    }
     stopRecording();
 }
 
@@ -464,7 +663,7 @@ function quitApp() {
 
 app.whenReady().then(() => {
     if (app.dock) app.dock.hide();
-    tray = new Tray(nativeImage.createEmpty());
+    tray = new Tray(iconFor('stopped'));
     setState('stopped');
 });
 

@@ -64,6 +64,19 @@ export type CaptureIdentity = {
   stem: string;
   manifestFile: string;
   tracks?: unknown;
+  permissions?: { tap?: string; mic?: string };
+};
+
+// Only what ingest needs from the classifier; the full shape lives in
+// pipeline/classify-capture.ts, which ingest deliberately does not import so
+// the two can be used independently.
+export type IngestClassification = {
+  verdict: string;
+  concern: boolean;
+  reason: string;
+  excludedLabels: Array<"me" | "them">;
+  tracks?: unknown;
+  thresholds?: unknown;
 };
 
 export const CLIPWISE_SOURCE = "clipwise-recorder";
@@ -78,6 +91,10 @@ export type IngestResult = {
   accountSlug: string;
   declared: { turnCount: number; bodyChars: number };
   observed: { turnCount: number; bodyChars: number };
+  // Segments deliberately left out because their track carried no audio.
+  // Kept separate from declared/observed so a partial capture reconciles:
+  // declared + excluded == everything the transcript contained.
+  excluded: { turnCount: number; bodyChars: number };
   recording: Record<string, unknown>;
   // The external identity this recording was filed under: the manifest's
   // recording_id when a manifest was supplied, else the filename stamp.
@@ -100,6 +117,7 @@ function stampToIso(stamp: string): string | null {
 export async function ingestTranscript(
   transcriptPath: string,
   capture?: CaptureIdentity,
+  classification?: IngestClassification | null,
 ): Promise<IngestResult> {
   const raw = readFileSync(transcriptPath, "utf8");
   const doc = JSON.parse(raw) as Transcript;
@@ -107,10 +125,29 @@ export async function ingestTranscript(
     throw new Error(`no segments in ${transcriptPath}`);
   }
 
-  const labelSet = new Set(doc.segments.map((s) => s.track));
-  if (labelSet.size !== 2 || !labelSet.has("me") || !labelSet.has("them")) {
+  // A track the classifier found no audio on produces segments anyway —
+  // Whisper writes text over silence (SAA-91). Those are excluded here, and
+  // preserved verbatim on the recording rather than discarded: the "dead"
+  // verdict rests on a threshold, and a wrong call must not silently delete
+  // real speech. The transcript file on disk is never modified either, so the
+  // full record survives in two independent places.
+  const excludeLabels = new Set(classification?.excludedLabels ?? []);
+  const kept = doc.segments.filter((s) => !excludeLabels.has(s.track));
+  const dropped = doc.segments.filter((s) => excludeLabels.has(s.track));
+  if (kept.length === 0) {
     throw new Error(
-      `expected labels {me, them}; got {${[...labelSet].sort().join(", ")}}`,
+      `every segment in ${transcriptPath} belongs to a track with no audio ` +
+        `(${[...excludeLabels].join(", ")}) — nothing to ingest`,
+    );
+  }
+
+  // One label is legitimate now: a capture where only one side had audio is
+  // half a real conversation, not a malformed transcript.
+  const labelSet = new Set(kept.map((s) => s.track));
+  const unknown = [...labelSet].filter((l) => l !== "me" && l !== "them");
+  if (unknown.length) {
+    throw new Error(
+      `expected labels from {me, them}; got {${[...labelSet].sort().join(", ")}}`,
     );
   }
 
@@ -151,9 +188,16 @@ export async function ingestTranscript(
   // endpoint applies (routes/transcript.ts:60): one segment = one turn,
   // sum of segment.text.length as bodyChars. Compared against the
   // post-insert DB counts below.
+  // Counted over the segments actually being inserted. Counting the whole
+  // transcript here would make every deliberate exclusion look like lossy
+  // ingest and trip the fidelity check below on a legitimate partial capture.
   const declared = {
-    turnCount: doc.segments.length,
-    bodyChars: doc.segments.reduce((n, s) => n + s.text.length, 0),
+    turnCount: kept.length,
+    bodyChars: kept.reduce((n, s) => n + s.text.length, 0),
+  };
+  const excluded = {
+    turnCount: dropped.length,
+    bodyChars: dropped.reduce((n, s) => n + s.text.length, 0),
   };
 
   process.stdout.write(
@@ -162,6 +206,12 @@ export async function ingestTranscript(
   process.stdout.write(
     `ingest: declared turnCount=${declared.turnCount} bodyChars=${declared.bodyChars} labels=${[...labelSet].sort().join(",")}\n`,
   );
+  if (excluded.turnCount) {
+    process.stdout.write(
+      `ingest: excluded turnCount=${excluded.turnCount} bodyChars=${excluded.bodyChars} ` +
+        `label(s)=${[...excludeLabels].sort().join(",")} (no audio on that track; preserved in metadata.capture_quality)\n`,
+    );
+  }
 
   // Idempotency on external identity. The seam retries by re-running from the
   // first incomplete step, so ingest must be safe to reach twice for the same
@@ -207,6 +257,9 @@ export async function ingestTranscript(
         turnCount: Number(counts.turnCount),
         bodyChars: Number(counts.bodyChars),
       },
+      // Nothing was excluded on this path because nothing was inserted; the
+      // original ingest's exclusions are already recorded on the existing row.
+      excluded: { turnCount: 0, bodyChars: 0 },
       recording: existing as unknown as Record<string, unknown>,
       sourceId,
       reused: true,
@@ -235,6 +288,22 @@ export async function ingestTranscript(
           downsampled: doc.downsampled ?? null,
           whisper_model: doc.model ?? null,
           content: doc.content ?? null,
+          // What the classifier decided and what it cost. A partial capture
+          // has to explain itself later without anyone re-deriving it, and the
+          // excluded segments live here verbatim so a wrong "dead" call is
+          // recoverable from the row alone.
+          capture_quality: classification
+            ? {
+                verdict: classification.verdict,
+                concern: classification.concern,
+                reason: classification.reason,
+                excluded_labels: classification.excludedLabels,
+                excluded_counts: excluded,
+                tracks: classification.tracks ?? null,
+                thresholds: classification.thresholds ?? null,
+                dropped_segments: dropped,
+              }
+            : null,
           // The capture manifest, denormalised onto the recording: which
           // device fed each track and at what rate. Recoverable from the
           // manifest file, but that file lives outside the server and
@@ -264,8 +333,11 @@ export async function ingestTranscript(
       })
       .returning();
 
+    // Only for labels actually present. A `them` speaker with no segments
+    // would assert a participant who contributed nothing to the recording.
     const speakerByLabel = new Map<string, string>();
     for (const label of ["me", "them"] as const) {
+      if (!labelSet.has(label)) continue;
       const [inserted] = await tx
         .insert(schema.speakers)
         .values({ recordingId: recording.id, label })
@@ -273,7 +345,7 @@ export async function ingestTranscript(
       speakerByLabel.set(label, inserted.id);
     }
 
-    const segmentRows = doc.segments.map((s, idx) => ({
+    const segmentRows = kept.map((s, idx) => ({
       accountId: account.id,
       recordingId: recording.id,
       transcriptId: transcript.id,
@@ -343,6 +415,7 @@ export async function ingestTranscript(
     accountSlug: account.slug,
     declared,
     observed: { turnCount: observedTurns, bodyChars: observedChars },
+    excluded,
     recording: dbRecording as unknown as Record<string, unknown>,
     sourceId,
     reused: false,

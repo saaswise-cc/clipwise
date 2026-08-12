@@ -24,6 +24,11 @@ import { join, resolve } from "node:path";
 
 import { ingestTranscript, type CaptureIdentity } from "../ingest/clipwise.js";
 import { runExtraction } from "../extract/extract.js";
+import {
+  classifyCapture,
+  type CaptureClassification,
+  type TranscriptContent,
+} from "./classify-capture.js";
 
 const SIDECAR_VERSION = 1;
 
@@ -116,6 +121,7 @@ type Manifest = {
   started_at?: string;
   stem?: string;
   tracks?: unknown;
+  permissions?: { tap?: string; mic?: string };
 };
 
 function readManifest(dir: string, stem: string): CaptureIdentity {
@@ -140,6 +146,9 @@ function readManifest(dir: string, stem: string): CaptureIdentity {
     stem: doc.stem ?? stem,
     manifestFile: path,
     tracks: doc.tracks,
+    // Absent on manifests written before SAA-89. The classifier treats an
+    // unknown permission as unknown rather than assuming granted.
+    permissions: doc.permissions,
   };
 }
 
@@ -204,39 +213,44 @@ function transcribeIfMissing(dir: string, stem: string): { path: string; ran: bo
   return { path: transcriptPath, ran: true };
 }
 
-type TrackContent = { peak?: number; rms?: number; nonzero_fraction?: number };
-
-// The one silence check worth making without SAA-89's classifier.
-//
-// A bitwise-zero tap is the ordinary case, not a fault: it means no system
-// audio was playing. Denied-tap and nothing-playing-tap have the identical
-// exact-zero signature, and telling them apart is exactly what SAA-89 is for.
-// So this refuses only when BOTH tracks are exactly zero — nothing was
-// captured at all, on either side — which no legitimate capture produces.
-//
-// It does not catch a transient gap, a live-but-quiet noise floor, or Whisper
-// hallucinating over near-silence (SAA-91). Trusting the seam unattended still
-// waits on SAA-89. This only stops the loop manufacturing moments from a file
-// that contains no audio whatsoever.
-export function assertNotWhollySilent(transcriptPath: string): void {
+// Classify the capture's audio content against the permission state the
+// manifest recorded. Replaces the both-tracks-bitwise-zero check this file
+// used to carry: that refusal survives as one outcome of the classification,
+// so behaviour on a wholly silent capture is unchanged, but a single dead
+// track is now named and kept rather than passing through unnoticed.
+function classifyOrNull(
+  transcriptPath: string,
+  capture: CaptureIdentity,
+): CaptureClassification | null {
   const doc = JSON.parse(readFileSync(transcriptPath, "utf8")) as {
-    content?: { tap?: TrackContent; mic?: TrackContent };
+    content?: TranscriptContent;
   };
-  const tap = doc.content?.tap;
-  const mic = doc.content?.mic;
-  if (typeof tap?.peak !== "number" || typeof mic?.peak !== "number") {
-    log("content stats absent from transcript — silence guard skipped");
-    return;
+  const result = classifyCapture({
+    content: doc.content,
+    permissions: capture.permissions,
+  });
+  if (!result) {
+    log("content stats absent from transcript — classification skipped");
+    return null;
   }
-  log(`content: tap peak=${tap.peak} rms=${tap.rms} | mic peak=${mic.peak} rms=${mic.rms}`);
-  if (tap.peak === 0 && mic.peak === 0) {
+  const { tap, mic } = result.tracks;
+  log(`classify: tap band=${tap.band} verdict=${tap.verdict} perm=${tap.permission} rms=${tap.rms} peak=${tap.peak} nonzero=${tap.nonzero_fraction}`);
+  log(`classify: mic band=${mic.band} verdict=${mic.verdict} perm=${mic.permission} rms=${mic.rms} peak=${mic.peak} nonzero=${mic.nonzero_fraction}`);
+  for (const t of [tap, mic]) {
+    for (const g of t.gaps) log(`classify: ${t.track} dropout ${g.start_s}s → ${g.end_s}s (${g.duration_s}s)`);
+  }
+  log(`classify: verdict=${result.verdict} concern=${result.concern} — ${result.reason}`);
+  if (result.excludedLabels.length) {
+    log(`classify: excluding segments for label(s) ${result.excludedLabels.join(", ")} — no audio on that track`);
+  }
+  if (result.verdict === "unusable") {
     throw new PipelineError(
-      `both tracks are bitwise silent (tap peak=0, mic peak=0) — nothing was captured. ` +
-        `Refusing to ingest rather than transcribe silence into moments. ` +
-        `Why it was silent (denied grant, transient gap, blocked in setup) is SAA-89's job.`,
+      `capture is unusable: ${result.reason}. Refusing to ingest rather than ` +
+        `transcribe silence into moments.`,
       "ingest",
     );
   }
+  return result;
 }
 
 // --- orchestration --------------------------------------------------------
@@ -306,8 +320,8 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
   let dbRecordingId: string;
   let reused: boolean;
   try {
-    assertNotWhollySilent(transcriptPath);
-    const result = await ingestTranscript(transcriptPath, capture);
+    const classification = classifyOrNull(transcriptPath, capture);
+    const result = await ingestTranscript(transcriptPath, capture, classification);
     dbRecordingId = result.recordingId;
     reused = result.reused;
     sidecar.db_recording_id = dbRecordingId;
@@ -316,6 +330,8 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
       source_id: result.sourceId,
       reused,
       segment_count: result.segmentCount,
+      excluded_segment_count: result.excluded.turnCount,
+      classification,
     });
     log(`db recording = ${dbRecordingId}${reused ? " (reused existing row)" : ""}`);
   } catch (err) {

@@ -46,6 +46,11 @@ TAP_SAMPLE_BYTES = 4  # f32le
 
 TARGET_RATE = 16000
 
+# Window for the per-track content series. One second is fine enough to place a
+# gap and coarse enough that an hour is ~3600 values per track rather than a
+# second transcript-sized payload.
+WINDOW_S = 1.0
+
 DEFAULT_MODEL = str(
     Path.home()
     / "Library/Application Support/whisper.cpp/models/ggml-small.en.bin"
@@ -191,9 +196,36 @@ def sample_content_check(wav_path: Path) -> dict:
 
     n = len(data) // 2
     samples = struct.unpack("<" + "h" * n, data)
-    nonzero = sum(1 for s in samples if s != 0)
-    peak = max((abs(s) for s in samples), default=0)
-    sq = sum(s * s for s in samples)
+
+    # Windowed as well as whole-file. A whole-file average cannot locate a
+    # transient gap — a track that carried speech and then dropped to the noise
+    # floor for thirty seconds still averages as live. The series is what makes
+    # the gap a span rather than a suspicion. Whole-file figures are aggregated
+    # from the windows rather than computed separately, so this stays one pass:
+    # max of maxima is the maximum, sums of sums are the sum.
+    win = int(rate * WINDOW_S) if rate else n
+    if win < 1:
+        win = n or 1
+    nonzero = 0
+    peak = 0
+    sq = 0
+    w_rms: list[float] = []
+    w_peak: list[float] = []
+    for i in range(0, n, win):
+        chunk = samples[i : i + win]
+        m = len(chunk)
+        if m == 0:
+            break
+        c_nonzero = sum(1 for s in chunk if s != 0)
+        c_peak = max((abs(s) for s in chunk), default=0)
+        c_sq = sum(s * s for s in chunk)
+        nonzero += c_nonzero
+        if c_peak > peak:
+            peak = c_peak
+        sq += c_sq
+        w_rms.append(round(((c_sq / m) ** 0.5) / 32768.0, 6))
+        w_peak.append(round(c_peak / 32768.0, 6))
+
     rms_i16 = (sq / n) ** 0.5 if n else 0.0
     rms_frac = rms_i16 / 32768.0
     peak_frac = peak / 32768.0
@@ -204,6 +236,9 @@ def sample_content_check(wav_path: Path) -> dict:
         "nonzero_fraction": nonzero / n if n else 0.0,
         "rms": rms_frac,
         "peak": peak_frac,
+        "window_s": WINDOW_S,
+        "windows_rms": w_rms,
+        "windows_peak": w_peak,
     }
 
 
