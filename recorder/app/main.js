@@ -311,6 +311,79 @@ function finalizeMicFormat(paths) {
     }
 }
 
+// The same treatment for the tap track, and the more urgent half of it: the
+// 2026-08-14 capture that declared 24000 Hz for a track written at 48000 was
+// this field, not the mic's. coreaudio_nominal_output is what the output device
+// said its rate was at capture start; systemtap reports the format of the tap
+// stream it actually opened (kAudioTapPropertyFormat), which is what the bytes
+// on disk are in.
+//
+// The tap file is headerless, so there is no fmt chunk to re-read — the format
+// comes from systemtap's log and the byte count comes from the file itself,
+// which is the part no log can be wrong about. If the two disagree the file
+// wins and the discrepancy is logged.
+//
+// The tap's device is not read back: systemtap logs no device identity, so
+// device_name/device_uid stay as readDevices() saw them. Noted rather than
+// silently implied to be verified.
+function finalizeTapFormat(paths) {
+    try {
+        const log = fs.readFileSync(paths.tapLog, 'utf8');
+        const m = [...log.matchAll(
+            /^format sample_rate=(\d+) channels=(\d+) bits=(\d+) is_float=(\w+) is_packed=(\w+)/gm,
+        )].pop();
+        if (!m) {
+            console.error(`manifest: no format line in ${paths.tapLog} — tap format left as requested`);
+            return;
+        }
+        const manifest = JSON.parse(fs.readFileSync(paths.manifest, 'utf8'));
+        const track = (manifest.tracks || []).find(t => t.track === 'system');
+        if (!track) {
+            console.error('manifest: no system track to update');
+            return;
+        }
+        const rate = Number(m[1]);
+        const channels = Number(m[2]);
+        const bits = Number(m[3]);
+
+        // Ground truth for length. bytes_written is also logged, but a log line
+        // is a claim about the file and the file is the file.
+        let dataBytes = null;
+        try { dataBytes = fs.statSync(paths.tap).size; } catch {}
+        const claimed = [...log.matchAll(/^system_tap_stopped wall_ns=\d+ bytes_written=(\d+)/gm)].pop();
+        if (claimed && dataBytes !== null && Number(claimed[1]) !== dataBytes) {
+            console.error(
+                `manifest: tap bytes_written=${claimed[1]} but file is ${dataBytes} — using the file`);
+        }
+
+        track.requested_sample_rate = track.sample_rate;
+        track.requested_sample_rate_source = track.sample_rate_source;
+        track.sample_rate = rate;
+        track.sample_rate_source = 'systemtap_reported_tap_format';
+        track.requested_channels = track.channels;
+        track.channels = channels;
+        track.bits = bits;
+        track.is_float = m[4] === 'true';
+        track.is_packed = m[5] === 'true';
+        track.device_source = 'coreaudio_default_output_at_start';
+        if (dataBytes !== null) {
+            const blockAlign = (bits / 8) * channels;
+            track.data_bytes = dataBytes;
+            track.frames = blockAlign > 0 ? Math.floor(dataBytes / blockAlign) : null;
+            track.duration_s = (rate > 0 && track.frames !== null)
+                ? Number((track.frames / rate).toFixed(3))
+                : null;
+        }
+        fs.writeFileSync(paths.manifest, JSON.stringify(manifest, null, 2) + '\n');
+        if (track.requested_sample_rate !== track.sample_rate) {
+            console.error(
+                `manifest: tap rate corrected ${track.requested_sample_rate} -> ${track.sample_rate} from systemtap's reported format`);
+        }
+    } catch (err) {
+        console.error(`manifest: tap format readback failed: ${String(err)}`);
+    }
+}
+
 function spawnChild(cmd, args, env, logPath) {
     const fd = fs.openSync(logPath, 'a');
     const proc = spawn(cmd, args, {
@@ -739,6 +812,7 @@ function teardown(cb) {
         // starts the pipeline — the pipeline keys off the manifest, so the
         // manifest has to be true by the time it reads it.
         finalizeMicFormat(s.paths);
+        finalizeTapFormat(s.paths);
         teardownInFlight = false;
         if (cb) cb();
     }, KILL_GRACE_MS);
