@@ -5,7 +5,8 @@
   "description": "Clipwise recorder menu bar app (Electron main-process shell).",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "postinstall": "./fix-electron-signature.sh"
   },
   "devDependencies": {
     "electron": "43.3.0"

@@ -9,7 +9,7 @@
 // is a human. The recorder is the trigger; the manifest it wrote at capture
 // start is the record the pipeline keys on.
 
-const { app, Tray, Menu, nativeImage, shell } = require('electron');
+const { app, Tray, Menu, Notification, globalShortcut, nativeImage, shell } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const { randomUUID } = require('crypto');
 const zlib = require('zlib');
@@ -48,6 +48,29 @@ const MIC_STALE_MS = 3200;
 
 // Manifest schema version. Bump on any change that is not purely additive.
 const MANIFEST_VERSION = 1;
+
+// Global hotkeys (SAA-105). The menu bar icon is not a reliable control
+// surface: macOS silently evicts items from a full menu bar, and on 2026-08-13
+// a wide Fathom item made Clipwise's icon unreachable for a whole meeting.
+// These are additive — the tray item is unchanged and still works whenever it
+// is visible.
+//
+// Two keys, not one. A bare toggle cannot be used to ask a question: with the
+// icon gone, someone unsure whether a capture is running can only find out by
+// pressing it, which stops the capture they were checking on. HOTKEY_STATUS
+// answers without changing anything.
+//
+// Control+Option+Command is deliberately awkward — the fourth modifier is what
+// keeps it out of the way of the app that owns the window.
+const HOTKEY_TOGGLE = 'Control+Alt+Command+R';
+const HOTKEY_STATUS = 'Control+Alt+Command+S';
+
+// Minimum gap between recording↔stalled notifications. Every other transition
+// notifies unconditionally, but this pair can oscillate: staleness is evaluated
+// every POLL_INTERVAL_MS against a 1 s window, so a marginal tap can cross the
+// line several times a minute and would otherwise produce a notification each
+// time. The tray label still flips immediately; only the notification is held.
+const FLAP_NOTIFY_MIN_MS = 30000;
 
 // The tap is created with isMono=true, so its stream is one channel whatever
 // the output device carries. Recorded here because the tap track is headerless
@@ -98,6 +121,13 @@ let pipeline = null;
 // Most recent permission finding, shown in the tray until dismissed.
 // { denied: ['System Audio', …], blocked: bool, note: string|null }
 let permissionIssue = null;
+
+// Outcome of each globalShortcut.register at launch, kept so the status
+// hotkey can report on the other one. [{ name, accel, what, live, … }]
+let hotkeys = [];
+
+// Last time a recording↔stalled transition was allowed to notify.
+let lastFlapNotifyMs = 0;
 
 const LABEL = {
     stopped:   'Stopped',
@@ -530,9 +560,123 @@ function renderTray() {
     tray.setContextMenu(Menu.buildFromTemplate(items));
 }
 
+// --- notifications --------------------------------------------------------
+//
+// With the tray item evicted there is no permanent readout, so a notification
+// is the only thing that says which way the toggle went. Every notification
+// here is therefore load-bearing rather than decorative, and every path that
+// declines to start a capture has to fire one too — a hotkey press that
+// silently does nothing is the failure this issue exists to remove.
+//
+// Delivery is checked, not assumed. show() is fire-and-forget and returns
+// nothing, so the obvious version of this function cannot tell a notification
+// that appeared from one macOS dropped — which would be the same silent failure
+// as an unregistered hotkey, one layer further down. Measured on macOS 15 /
+// Electron 43.3.0: with the signature the electron package ships, every single
+// notification failed with UNErrorDomain error 1 and nothing was displayed
+// while isSupported() still answered true. isSupported() is therefore not
+// evidence of anything; the 'show' and 'failed' events are.
+//
+// fix-electron-signature.sh removes that cause at install time. The fallback
+// below is for when it has not run, or when authorization is off for some other
+// reason: osascript posts through a signed Apple binary that does not depend on
+// how this app is signed. It is a worse notification — attributed to Script
+// Editor rather than Clipwise — and it is still far better than silence, which
+// is the only other option at that point.
+//
+// A failure of the fallback too is logged and swallowed. It is never worth
+// losing a capture over.
+function notifyFallback(title, body, why) {
+    console.error(`notify: falling back to osascript (${why})`);
+    // AppleScript has only double-quoted strings, and the status report is
+    // multi-line. Backslash first, then the characters whose escapes are
+    // backslashes, so the escaping is not itself re-escaped.
+    const esc = s => String(s)
+        .replace(/\\/g, '\\\\')
+        .replace(/"/g, '\\"')
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n');
+    const script =
+        `display notification "${esc(body)}" with title "${esc(title)}"`;
+    try {
+        const proc = spawn('/usr/bin/osascript', ['-e', script], { stdio: 'ignore' });
+        proc.once('error', err => console.error(`notify fallback spawn failed: ${String(err)}`));
+        proc.once('exit', code => {
+            if (code !== 0) console.error(`notify fallback exited code=${code}`);
+        });
+    } catch (err) {
+        console.error(`notify fallback failed: ${String(err)}`);
+    }
+}
+
+function notify(title, body) {
+    console.error(`notify: ${title} — ${body}`);
+    if (!Notification.isSupported()) {
+        notifyFallback(title, body, 'Notification.isSupported() is false');
+        return;
+    }
+    try {
+        const n = new Notification({ title, body });
+        n.once('failed', (_event, err) => notifyFallback(title, body, String(err)));
+        n.show();
+    } catch (err) {
+        notifyFallback(title, body, String(err));
+    }
+}
+
+function formatElapsed(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// Both halves of the started/stopped distinction the issue asks for, plus the
+// two states in between. Reads `session` directly: every setState call happens
+// while the session it describes is still assigned (teardown clears it only
+// after stopRecording has already flipped the state).
+function notifyStateChange(prev, next) {
+    const stem = session ? session.stem : null;
+    if (next === 'starting') {
+        notify('Clipwise: capture starting', stem || 'Waiting for both tracks.');
+        return;
+    }
+    if (next === 'recording' && prev === 'starting') {
+        notify('Clipwise: recording started', stem
+            ? `Both tracks are writing — ${stem}`
+            : 'Both tracks are writing.');
+        return;
+    }
+    // The flapping pair.
+    if (next === 'recording' || next === 'stalled') {
+        const now = Date.now();
+        if (now - lastFlapNotifyMs < FLAP_NOTIFY_MIN_MS) return;
+        lastFlapNotifyMs = now;
+        if (next === 'stalled') {
+            notify('Clipwise: recording stalled',
+                'A track stopped growing. The capture is still running.');
+        } else {
+            notify('Clipwise: recording resumed', 'Both tracks are writing again.');
+        }
+        return;
+    }
+    if (next === 'stopped') {
+        // reachedRecording is what decides whether the pipeline runs, so it is
+        // the honest thing to report: a capture that never got both tracks
+        // going produced nothing and will not be processed.
+        const kept = session && session.reachedRecording;
+        const elapsed = session && session.startedAtMs
+            ? formatElapsed(Date.now() - session.startedAtMs)
+            : null;
+        notify('Clipwise: recording stopped', kept
+            ? `${elapsed ? `${elapsed} — ` : ''}${stem} — processing now.`
+            : 'The capture never started — nothing was saved.');
+    }
+}
+
 function setState(next) {
+    const prev = state;
     state = next;
     renderTray();
+    if (prev !== next) notifyStateChange(prev, next);
 }
 
 // --- pipeline -------------------------------------------------------------
@@ -629,6 +773,8 @@ function startRecording() {
         dev = readDevices();
     } catch (err) {
         console.error(String(err));
+        notify('Clipwise: capture not started',
+            'Could not read the audio devices — see the recorder log.');
         return;
     }
 
@@ -660,6 +806,7 @@ function startRecording() {
         };
         renderTray();
         console.error(`start refused: denied permissions: ${denied.join(', ')}`);
+        notify('Clipwise: capture not started', permissionIssue.note);
         return;
     }
     permissionIssue = null;
@@ -673,6 +820,8 @@ function startRecording() {
         fs.writeFileSync(paths.manifest, JSON.stringify(manifest, null, 2) + '\n');
     } catch (err) {
         console.error(String(err));
+        notify('Clipwise: capture not started',
+            'Could not write the capture manifest — see the recorder log.');
         return;
     }
     const tapProc = spawnChild(
@@ -706,6 +855,10 @@ function startRecording() {
         paths,
         stem: stamp,
         recordingId: manifest.recording_id,
+        // Wall clock at spawn, for the elapsed figure the status hotkey and
+        // the stop notification report. Separate from the manifest's
+        // started_at, which is an ISO string for consumers downstream.
+        startedAtMs: Date.now(),
         perms: { mic: dev.micPerm, tap: dev.tapPerm },
         // Set once both tracks have produced bytes. A capture that never got
         // there has nothing worth transcribing, so it does not trigger the
@@ -839,10 +992,128 @@ function quitApp() {
     // it outlives this process.
     const stem = session && session.reachedRecording ? session.stem : null;
     if (state !== 'stopped') setState('stopped');
+    globalShortcut.unregisterAll();
     teardown(() => {
         startPipeline(stem);
         app.exit(0);
     });
+}
+
+// --- hotkeys --------------------------------------------------------------
+
+function toggleRecording() {
+    // teardown holds the children for KILL_GRACE_MS and finalises the manifest
+    // after they exit, but it clears `session` and flips the tray to Stopped up
+    // front — so for that window startRecording's own guard would let a second
+    // capture through, and the two would race over finalizeMicFormat and
+    // finalizeTapFormat. Clicking the tray twice that fast is awkward; pressing
+    // a hotkey twice that fast is not, which is why the guard is added here.
+    if (teardownInFlight) {
+        notify('Clipwise: busy',
+            'The previous capture is still closing — try again in a moment.');
+        return;
+    }
+    if (state === 'stopped') startRecording();
+    else stopRecording();
+}
+
+// Reports, changes nothing. This is the whole reason there are two hotkeys.
+function reportState() {
+    // The title already carries the state label, so the body does not repeat
+    // it — it carries what the label cannot say: how long, and which capture.
+    const lines = [];
+    if (state === 'stopped') {
+        lines.push('Not recording.');
+    } else {
+        const elapsed = session && session.startedAtMs
+            ? formatElapsed(Date.now() - session.startedAtMs)
+            : null;
+        if (elapsed) lines.push(`${elapsed} elapsed`);
+        if (session) lines.push(session.stem);
+    }
+    if (pipeline) lines.push(PIPELINE_NOTE[pipeline.state]);
+    if (permissionIssue) lines.push(permissionIssue.note);
+    // Only worth saying when something is wrong: if the status hotkey is the
+    // one that answered, it is by definition live, but the toggle may not be —
+    // and that is exactly the thing someone needs told.
+    const dead = hotkeys.filter(h => !h.live);
+    for (const h of dead) lines.push(`${h.accel} (${h.what}) is not registered`);
+    notify(`Clipwise: ${LABEL[state]}`, lines.join('\n'));
+}
+
+// Registration can fail, and ignoring that is the natural way to write this —
+// which would leave a hotkey that never registered indistinguishable from one
+// the user forgot to press. That is the same class of silent failure as the
+// evicted tray icon, so the result is checked and reported rather than assumed.
+//
+// isRegistered is read back afterwards for the same reason the manifest
+// re-reads the WAV's fmt chunk: register()'s return value is a claim about
+// what happened, and a readback is the state itself. A hotkey counts as live
+// only if both agree.
+//
+// Measured on macOS 15 / Electron 43.3.0, 2026-08-15, because the two failure
+// modes are not the one the docs imply:
+//
+//   - Contention does NOT return false. Two processes registering the same
+//     combo both got register=true, isRegistered=true. So did Command+Space,
+//     Command+Tab, Command+Shift+3/4/5 and Command+Q, all of which macOS or
+//     another app already owns. Carbon hotkeys are not exclusive here, so a
+//     false return is not the way losing a combo shows up on this platform.
+//   - A malformed or unknown accelerator THROWS rather than returning false:
+//     TypeError "conversion failure from …", and isRegistered throws too.
+//
+// Both are handled: a throw leaves returned/readback at false, which is the
+// same not-live verdict a false return would give. The reporting deliberately
+// does not name a cause, because on this evidence the code cannot tell which
+// one it hit — it reports the combo, the two values, and the error if any.
+function registerHotkeys() {
+    const wanted = [
+        { name: 'toggle', accel: HOTKEY_TOGGLE, what: 'start/stop', handler: toggleRecording },
+        { name: 'status', accel: HOTKEY_STATUS, what: 'report state', handler: reportState },
+    ];
+    hotkeys = wanted.map(({ name, accel, what, handler }) => {
+        let returned = false;
+        let error = null;
+        try {
+            returned = globalShortcut.register(accel, handler) === true;
+        } catch (err) {
+            error = String(err);
+        }
+        let readback = false;
+        try {
+            readback = globalShortcut.isRegistered(accel) === true;
+        } catch (err) {
+            error = error || String(err);
+        }
+        const live = returned && readback;
+        console.error(
+            `[clipwise-recorder] hotkey ${name} accel=${accel} ` +
+            `register_returned=${returned} is_registered=${readback} live=${live}` +
+            (error ? ` error=${error}` : ''));
+        return { name, accel, what, returned, readback, live, error };
+    });
+
+    // Surfaced at launch, by notification, because the tray item is precisely
+    // what cannot be relied on to deliver this. Both outcomes are reported: on
+    // success because you have to be told which combos are live before you can
+    // press them, and on failure because a dead hotkey is otherwise invisible.
+    const dead = hotkeys.filter(h => !h.live);
+    if (dead.length === 0) {
+        notify('Clipwise hotkeys registered',
+            `${HOTKEY_TOGGLE} starts/stops. ${HOTKEY_STATUS} reports state.`);
+    } else {
+        const live = hotkeys.filter(h => h.live);
+        notify(
+            dead.length === hotkeys.length
+                ? 'Clipwise hotkeys unavailable'
+                : 'Clipwise hotkey unavailable',
+            [
+                ...dead.map(h => `${h.accel} (${h.what}) did not register.`),
+                ...live.map(h => `${h.accel} (${h.what}) is live.`),
+                'Use the menu bar icon for anything not covered.',
+            ].join('\n'));
+    }
+    return hotkeys;
 }
 
 // --- app boot -------------------------------------------------------------
@@ -851,6 +1122,12 @@ app.whenReady().then(() => {
     if (app.dock) app.dock.hide();
     tray = new Tray(iconFor('stopped'));
     setState('stopped');
+    registerHotkeys();
 });
+
+// quitApp calls app.exit, which skips will-quit — so the unregister is done in
+// both places. macOS drops them on process death anyway; this is for the case
+// where it does not get that far.
+app.on('will-quit', () => { globalShortcut.unregisterAll(); });
 
 app.on('window-all-closed', (e) => { e.preventDefault?.(); });
