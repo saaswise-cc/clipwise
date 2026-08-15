@@ -22,7 +22,10 @@ const path = require('path');
 // recording may tear down or flush differently — these are provisional.
 
 // SIGINT to all children, wait, then SIGKILL survivors. Observed exit:
-// tap 5–15 ms, ffmpeg 10–30 ms. 750 ms is ~25× the observed max.
+// tap 5–15 ms, ffmpeg 10–30 ms. 750 ms is ~25× the observed max. miccap
+// replaced ffmpeg on the mic (SAA-106); its stop path is the same shape —
+// stop the IOProc, patch the WAV header, close — and has not been re-timed,
+// so the same grace applies until it is.
 const KILL_GRACE_MS = 750;
 
 // Starting → Recording deadline. First-byte observed: tap ~100 ms,
@@ -31,9 +34,12 @@ const KILL_GRACE_MS = 750;
 const STARTING_TIMEOUT_MS = 9000;
 
 // File-size poll interval and per-child staleness windows.
-// Observed growth cadence: tap ~50 ms, ffmpeg flushes every ~1550 ms —
+// Observed growth cadence: tap ~50 ms, ffmpeg flushed every ~1550 ms —
 // per-tick growth cannot be the test. A child counts as growing if it
-// grew within its own window. Staleness switches the tray label to
+// grew within its own window. miccap writes every IOProc callback (~10.7 ms
+// at 48 kHz), so the mic is now far smoother than the window assumes; the
+// window is left as-is because it is an upper bound and a smoother writer
+// cannot trip it. Staleness switches the tray label to
 // "Recording (stalled)" but does not kill children — losing the rest of
 // a call to a possibly-wrong constant is worse than a misleading label.
 const POLL_INTERVAL_MS = 250;
@@ -52,6 +58,7 @@ const TAP_CHANNELS = 1;
 
 const RECORDER_DIR = path.resolve(__dirname, '..');
 const SYSTEMTAP_BIN = path.join(RECORDER_DIR, 'systemtap', '.build', 'release', 'systemtap');
+const MICCAP_BIN = path.join(RECORDER_DIR, 'miccap', '.build', 'release', 'miccap');
 const AUDIODEVS_BIN = path.join(RECORDER_DIR, 'audiodevs');
 const OUTDIR = path.join(os.homedir(), 'Library', 'Application Support', 'clipwise', 'recordings');
 
@@ -120,10 +127,13 @@ function fileSize(p) {
     try { return fs.statSync(p).size; } catch { return 0; }
 }
 
-// One pre-flight CoreAudio snapshot: the mic name ffmpeg is pointed at, plus
-// the device identity and nominal rate that go into the manifest. Taken before
-// the children spawn, because neither child has reported its own format yet at
-// the moment the manifest is written — see writeManifest.
+// One pre-flight CoreAudio snapshot: the device identity and nominal rate that
+// seed the manifest. Taken before the children spawn, because neither child has
+// reported its own format yet at the moment the manifest is written — see
+// writeManifest. Since SAA-106 the mic entry is no longer final at that point:
+// finalizeMicFormat overwrites it at teardown with the device and format miccap
+// read back off the written file. These values remain what the manifest carries
+// if that readback is unavailable.
 function readDevices() {
     const out = execFileSync(AUDIODEVS_BIN, ['--once'], { encoding: 'utf8' });
     const field = (re, label) => {
@@ -172,10 +182,11 @@ function deniedServices(dev) {
 // stderr that nothing preserves.
 //
 // Rates come from the CoreAudio query above, not from the children. systemtap
-// and ffmpeg both report their real format milliseconds after they start;
+// and miccap both report their real format milliseconds after they start;
 // waiting for that would make this a post-hoc artifact rather than something
 // written at capture start. sample_rate_source records that provenance in the
-// file so a consumer never has to guess which it is holding.
+// file so a consumer never has to guess which it is holding — and for the mic
+// track it is rewritten to wav_fmt_chunk_readback once the file is finished.
 function buildManifest(stamp, startedAt, dev, paths) {
     return {
         manifest_version: MANIFEST_VERSION,
@@ -221,6 +232,83 @@ function buildManifest(stamp, startedAt, dev, paths) {
             tap_source: 'tcc_access_preflight_kTCCServiceAudioCapture',
         },
     };
+}
+
+// Rewrite the manifest's mic track from the format miccap read back off the
+// finished WAV, replacing the CoreAudio nominal rate captured at start.
+//
+// The two are not always the same. A 2026-08-14 capture shipped a manifest
+// declaring 24000 Hz for a track written at 48000 — anything trusting it read
+// that timeline at half speed. The nominal rate is what the device said it
+// would do; the fmt chunk is what it did. Only the second is a fact about the
+// file, so it becomes authoritative and the first is kept alongside it under
+// requested_sample_rate rather than discarded.
+//
+// Runs after the children are gone, because the readback line is written by
+// miccap's SIGINT handler once the header has been patched. A failure here is
+// logged and swallowed: the audio is already on disk and refusing to finish
+// the capture over a metadata rewrite would be a worse outcome than a manifest
+// that still carries the requested value.
+function finalizeMicFormat(paths) {
+    try {
+        const log = fs.readFileSync(paths.micLog, 'utf8');
+        const m = [...log.matchAll(
+            /^readback format_tag=0x([0-9a-fA-F]+) channels=(\d+) sample_rate=(\d+) bits=(\d+) block_align=(\d+) data_bytes=(\d+) frames=(\d+) duration_s=([\d.]+)/gm,
+        )].pop();
+        if (!m) {
+            console.error(`manifest: no readback line in ${paths.micLog} — mic format left as requested`);
+            return;
+        }
+        const manifest = JSON.parse(fs.readFileSync(paths.manifest, 'utf8'));
+        const track = (manifest.tracks || []).find(t => t.track === 'mic');
+        if (!track) {
+            console.error('manifest: no mic track to update');
+            return;
+        }
+        // The device, from the same source, for the same reason. miccap
+        // resolves kAudioHardwarePropertyDefaultInputDevice itself, so the name
+        // readDevices() saw at start is a prediction — and the default input
+        // can change between the two. A manifest naming a device that was not
+        // the one recorded is the same class of lie as a wrong sample rate.
+        // Last match, not first: logs are opened in append mode, so a reused
+        // stem leaves earlier captures in the same file. Taking the first
+        // device line and the last format line would describe two different
+        // captures in one manifest entry.
+        const d = [...log.matchAll(/^device=(.*) uid=(\S+) id=(\d+)$/gm)].pop();
+        if (d) {
+            track.requested_device_name = track.device_name;
+            track.requested_device_uid = track.device_uid;
+            track.device_name = d[1];
+            track.device_uid = d[2];
+            track.device_id = Number(d[3]);
+            track.device_source = 'miccap_resolved_default_input';
+            if (track.requested_device_uid !== track.device_uid) {
+                console.error(
+                    `manifest: mic device corrected ${track.requested_device_uid} -> ${track.device_uid} (default input changed between start and spawn)`);
+            }
+        } else {
+            console.error(`manifest: no device line in ${paths.micLog} — mic device left as requested`);
+        }
+
+        track.requested_sample_rate = track.sample_rate;
+        track.requested_sample_rate_source = track.sample_rate_source;
+        track.sample_rate = Number(m[3]);
+        track.sample_rate_source = 'wav_fmt_chunk_readback';
+        track.format_tag = `0x${m[1].toLowerCase().padStart(4, '0')}`;
+        track.channels = Number(m[2]);
+        track.bits = Number(m[4]);
+        track.block_align = Number(m[5]);
+        track.data_bytes = Number(m[6]);
+        track.frames = Number(m[7]);
+        track.duration_s = Number(m[8]);
+        fs.writeFileSync(paths.manifest, JSON.stringify(manifest, null, 2) + '\n');
+        if (track.requested_sample_rate !== track.sample_rate) {
+            console.error(
+                `manifest: mic rate corrected ${track.requested_sample_rate} -> ${track.sample_rate} from the written file`);
+        }
+    } catch (err) {
+        console.error(`manifest: mic format readback failed: ${String(err)}`);
+    }
 }
 
 function spawnChild(cmd, args, env, logPath) {
@@ -514,17 +602,24 @@ function startRecording() {
         console.error(String(err));
         return;
     }
-    const micName = dev.inName;
     const tapProc = spawnChild(
         SYSTEMTAP_BIN, [],
         { ...process.env, SYSTEMTAP_OUT: paths.tap },
         paths.tapLog,
     );
+    // miccap, not ffmpeg (SAA-106). ffmpeg's avfoundation input delivered a
+    // rate-independent ~42,000 samples/s ceiling, losing 10.7–12.0% of every
+    // built-in-mic capture and silently compressing the mic timeline against
+    // the tap. miccap reads the default input device off the Core Audio HAL
+    // directly — same API family as systemtap — and measured +0.029% over 60 s
+    // against ffmpeg's +11.72% on the same test.
+    //
+    // It takes the device from kAudioHardwarePropertyDefaultInputDevice itself
+    // rather than being handed a name, so dev.inName is no longer passed. The
+    // two can only disagree if the default input changes between readDevices()
+    // and the spawn, which the poller already watches for.
     const micProc = spawnChild(
-        'ffmpeg',
-        ['-hide_banner', '-nostats', '-y',
-         '-f', 'avfoundation', '-i', `:${micName}`,
-         '-c:a', 'pcm_f32le', paths.mic],
+        MICCAP_BIN, [paths.mic],
         process.env,
         paths.micLog,
     );
@@ -640,6 +735,10 @@ function teardown(cb) {
                 try { k.kill('SIGKILL'); } catch {}
             }
         }
+        // After the children are gone and before the callback, which is what
+        // starts the pipeline — the pipeline keys off the manifest, so the
+        // manifest has to be true by the time it reads it.
+        finalizeMicFormat(s.paths);
         teardownInFlight = false;
         if (cb) cb();
     }, KILL_GRACE_MS);
@@ -653,8 +752,10 @@ function stopRecording() {
     const stem = session && session.reachedRecording ? session.stem : null;
     setState('stopped');
     // The pipeline starts from teardown's completion callback, never from
-    // this click. ffmpeg finalizes the WAV header when it handles SIGINT, so
-    // a transcribe kicked off before it exits reads a truncated file.
+    // this click. miccap patches the WAV header when it handles SIGINT, so a
+    // transcribe kicked off before it exits reads a file whose RIFF and data
+    // sizes are still zero — and teardown is also where the manifest gets its
+    // mic format, which the pipeline reads.
     teardown(() => startPipeline(stem));
 }
 
