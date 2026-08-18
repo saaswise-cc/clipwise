@@ -82,11 +82,13 @@ Covers the Mac recorder only; the server and MCP have their own setup.
 - Swift and Node toolchains
 - `ffmpeg` on `PATH` — `brew install ffmpeg`. Required for mic capture, not optional.
 
-**Build the Swift binaries.** Both are gitignored build outputs, so a fresh clone has neither.
+**Build the Swift binaries.** All three are gitignored build outputs, so a fresh
+clone has none of them.
 
 ```sh
 (cd recorder && swiftc -O audiodevs.swift -o audiodevs)
 (cd recorder/systemtap && swift build -c release)
+(cd recorder/miccap && swift build -c release)
 ```
 
 **Install the app shell.**
@@ -100,6 +102,27 @@ Covers the Mac recorder only; the server and MCP have their own setup.
 — the install exits clean and reports no vulnerabilities while leaving an app
 that cannot launch. Verified from the installed package on disk 2026-08-09, with
 `ignore-scripts` confirmed `false`.
+
+**Package it as an app.** `recorder/app/build-app.sh` does everything above and
+produces `recorder/app/dist/Clipwise.app` — a menu bar app you can double-click
+and add to Login Items in System Settings. It signs with the Developer ID
+identity; override with `CLIPWISE_SIGN_IDENTITY` if you have your own.
+
+```sh
+(cd recorder/app && ./build-app.sh)
+```
+
+It is not notarized and there is no DMG, so it is a build for the machine that
+built it rather than something to hand to anyone. The app never registers
+itself for launch at login — Login Items is a thing you add it to.
+
+The bundle carries the three Swift binaries. It does not carry the server, so
+`build-app.sh` stamps the path of this checkout into the bundle and the packaged
+app runs the capture→moments pipeline out of it. Move the repo and rebuild.
+
+A packaged run has no terminal to print to, so everything it would have written
+to stderr goes to `~/Library/Application Support/clipwise/recorder.log`. That is
+where notification delivery, child spawn failures and pipeline errors are.
 
 **Capture output.** Each capture writes to
 `~/Library/Application Support/clipwise/recordings/`, sharing one timestamp

@@ -79,17 +79,79 @@ const TAP_CHANNELS = 1;
 
 // --- paths ----------------------------------------------------------------
 
+// Two layouts, told apart by one file. Run from a checkout (`npm start`),
+// every path is relative to this one. Run from the .app that build-app.sh
+// produces, the three helper binaries ship inside the bundle and the server
+// checkout does not — there is no copy of it to bundle, and the pipeline has
+// to execute the current one. build-app.sh stamps that absolute path into
+// build-info.json at build time, and the presence of that file is what says
+// which layout this is.
+//
+// Presence of the file rather than app.isPackaged: isPackaged is derived from
+// the name of the executable, which is a fact about how the bundle was
+// assembled rather than a statement about where this app expects to find
+// anything. A rename would silently move every path below.
+const BUILD_INFO = (() => {
+    try {
+        return JSON.parse(fs.readFileSync(path.join(__dirname, 'build-info.json'), 'utf8'));
+    } catch {
+        return null;
+    }
+})();
+
 const RECORDER_DIR = path.resolve(__dirname, '..');
-const SYSTEMTAP_BIN = path.join(RECORDER_DIR, 'systemtap', '.build', 'release', 'systemtap');
-const MICCAP_BIN = path.join(RECORDER_DIR, 'miccap', '.build', 'release', 'miccap');
-const AUDIODEVS_BIN = path.join(RECORDER_DIR, 'audiodevs');
-const OUTDIR = path.join(os.homedir(), 'Library', 'Application Support', 'clipwise', 'recordings');
+const BUNDLED_BIN = path.resolve(__dirname, '..', 'bin');
+const SYSTEMTAP_BIN = BUILD_INFO
+    ? path.join(BUNDLED_BIN, 'systemtap')
+    : path.join(RECORDER_DIR, 'systemtap', '.build', 'release', 'systemtap');
+const MICCAP_BIN = BUILD_INFO
+    ? path.join(BUNDLED_BIN, 'miccap')
+    : path.join(RECORDER_DIR, 'miccap', '.build', 'release', 'miccap');
+const AUDIODEVS_BIN = BUILD_INFO
+    ? path.join(BUNDLED_BIN, 'audiodevs')
+    : path.join(RECORDER_DIR, 'audiodevs');
+
+const SUPPORT_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'clipwise');
+const OUTDIR = path.join(SUPPORT_DIR, 'recordings');
 
 // The capture→moments pipeline. Run through the server's own tsx so the seam
 // always executes current source — a built dist would silently run whatever
 // it was last compiled from. cwd is the server directory so dotenv/config
 // finds server/.env; the recorder never handles a secret itself.
-const SERVER_DIR = path.resolve(RECORDER_DIR, '..', 'server');
+const SERVER_DIR = BUILD_INFO
+    ? BUILD_INFO.server_dir
+    : path.resolve(RECORDER_DIR, '..', 'server');
+
+// --- log ------------------------------------------------------------------
+//
+// Everything this process reports about itself goes to stderr, and a
+// double-clicked app has no stderr — launchd sends it nowhere a person can
+// read. That is the whole diagnostic surface of the recorder disappearing at
+// exactly the point it stops being launched from a terminal, which is what
+// packaging is for. Every notification-delivery line, every child spawn
+// failure and every pipeline error is in there.
+//
+// Only when packaged. A terminal run already shows this, and writing a file
+// nobody asked for would be a change to how development works.
+const LOG_PATH = path.join(SUPPORT_DIR, 'recorder.log');
+if (BUILD_INFO) {
+    const toStderr = console.error.bind(console);
+    console.error = (...args) => {
+        toStderr(...args);
+        try {
+            fs.mkdirSync(SUPPORT_DIR, { recursive: true });
+            fs.appendFileSync(
+                LOG_PATH,
+                `${new Date().toISOString()} ${args.map(a => String(a)).join(' ')}\n`,
+            );
+        } catch {
+            // A log that cannot be written is not worth losing a capture over.
+        }
+    };
+    console.error(
+        `[clipwise-recorder] launched from bundle — built ${BUILD_INFO.built_at} ` +
+        `commit ${BUILD_INFO.commit}${BUILD_INFO.dirty ? '+dirty' : ''}`);
+}
 const TSX_BIN = path.join(SERVER_DIR, 'node_modules', '.bin', 'tsx');
 const PIPELINE_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'cli.ts');
 
@@ -618,6 +680,12 @@ function notify(title, body) {
     try {
         const n = new Notification({ title, body });
         n.once('failed', (_event, err) => notifyFallback(title, body, String(err)));
+        // The positive half of the same rule. No 'failed' line in the log is
+        // absence of evidence — it reads identically to a notify() that was
+        // never reached. 'show' is the event that says delivered, and once
+        // this runs from a bundle the log is the only place anyone can see
+        // either of them.
+        n.once('show', () => console.error(`notify: delivered — ${title}`));
         n.show();
     } catch (err) {
         notifyFallback(title, body, String(err));
