@@ -26,9 +26,9 @@ Clipwise inverts that:
 ┌────────────────────────────┐         ┌──────────────────────────────┐
 │  Mac Desktop Recorder      │         │  Self-Hosted Server          │
 │  ────────────────────────  │         │  ──────────────────────────  │
-│  • Shell: Electron         │  HTTPS  │  • Recording + transcript    │
+│  • Shell: Electron         │ spawns  │  • Recording + transcript    │
 │  • Core Audio Taps         │────────▶│    storage                   │
-│    (native macOS capture)  │         │  • Clip extraction           │
+│    (native macOS capture)  │         │  • Moment extraction         │
 │  • Local Whisper           │         │  • Moment DB (Postgres +     │
 │    transcription           │         │    vector index)             │
 │                            │         │  • MCP server interface      │
@@ -46,9 +46,9 @@ Clipwise inverts that:
 
 ### Components
 
-1. **Mac desktop recorder** — an Electron menu bar app that spawns and manages the capture subprocesses. Capture is Clipwise's own Swift binary using Core Audio Taps (macOS 14.2+) to record system audio and mic natively — no Recall.ai, no meeting-bot SDK, no third-party dependency in the capture path. Transcription is a separate on-device step, run via whisper.cpp as a CLI — not invoked by the recorder.
-2. **Self-hosted server** — A long-running Node/TypeScript container that stores raw recordings, transcripts, extracted clips, and the moments database, and exposes a REST API consumed by the recorder and the MCP. It's a single Docker artifact from day one: the hosted deployment (Fly.io / Railway / Render) and any user-run self-hosted deployment run the same image. Persistence is standard Postgres (with `pgvector`); Neon is the currently-used managed provider, but the connection is plain `pg` so any Postgres works.
-3. **Clipwise MCP** — The bridge that lets Claude query your meeting history: search transcripts, pull clips, ask questions across every meeting.
+1. **Mac desktop recorder** — an Electron menu bar app that spawns and manages the capture subprocesses. Capture is Clipwise's own Swift binaries using Core Audio Taps (macOS 14.2+) for system audio and Core Audio directly for the mic, recording both natively — no Recall.ai, no meeting-bot SDK, no third-party dependency in the capture path. Stopping a capture starts the rest on its own: the recorder spawns the capture→moments pipeline, which transcribes on-device through whisper.cpp, ingests, and extracts moments without anyone driving it.
+2. **Self-hosted server** — A long-running Node/TypeScript container that stores raw recordings, transcripts, and the moments database, and exposes a REST API consumed by the MCP. It's a single Docker artifact from day one: the hosted deployment (Fly.io / Railway / Render) and any user-run self-hosted deployment run the same image. Persistence is standard Postgres (with `pgvector`); Neon is the currently-used managed provider, but the connection is plain `pg` so any Postgres works. The recorder does not go through the REST API: it spawns this server's pipeline against the checkout it was built from, and that writes to Postgres directly.
+3. **Clipwise MCP** — The bridge that lets Claude query your meeting history. Two tools today: `search_moments`, which searches the extracted-moments database by text, by meaning, by moment kind, by recording, or by who was on the call; and `get_transcript`, which returns one recording's transcript with per-segment timestamps and speaker labels.
 
 ## What makes it different
 
@@ -66,11 +66,9 @@ If you want your meeting intelligence to live on infrastructure you control rath
 
 ## Status
 
-- ✅ Landing page live at [clipwiseapp.com](https://clipwiseapp.com)
-- ✅ Waitlist open
-- 🚧 Mac recorder (Electron shell around Swift Core Audio Taps capture + local whisper.cpp CLI)
-- ✅ Self-hosted server + moments database (Neon, live)
-- 🚧 Clipwise MCP for Claude
+Tracked in Linear, not here. What is built, what is being built and why each
+call was made lives on the issues; a list in this file is a second copy that
+goes stale the moment the first one moves.
 
 ## Recorder setup
 
@@ -80,7 +78,9 @@ Covers the Mac recorder only; the server and MCP have their own setup.
 
 - macOS 14.2+ (Core Audio Taps floor)
 - Swift and Node toolchains
-- `ffmpeg` on `PATH` — `brew install ffmpeg`. Required for mic capture, not optional.
+- `ffmpeg` on `PATH` — `brew install ffmpeg`. Not optional, but not for capture: `transcribe.py` uses it
+  to downsample both tracks to the 16 kHz whisper.cpp wants. The mic is captured by Clipwise's own
+  `miccap` binary, which replaced the ffmpeg mic path.
 
 **Build the Swift binaries.** All three are gitignored build outputs, so a fresh
 clone has none of them.
@@ -142,7 +142,9 @@ formats milliseconds later; `sample_rate_source` on each track names that
 provenance, so a manifest recovered from a capture's own artifacts is
 distinguishable from one written live.
 
-**Transcription** — only needed for `transcribe.py`, not for recording.
+**Transcription** — needed by anyone who records, not only by anyone calling
+`transcribe.py` by hand: stopping a capture spawns the pipeline, and its first
+step is transcription.
 
 - `brew install whisper-cpp` for the `whisper-cli` binary
 - The GGML model — `transcribe.py` prints the download command in its error message.

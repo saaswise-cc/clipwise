@@ -9,11 +9,17 @@
 //   { inputs, downsampled, model, labels, segments: [...] }
 // Each segment has { track: "me"|"them", start_ms, end_ms, text }.
 //
-// Writes rows shaped to match Fathom-imported recordings (nulls where
-// the existing rows leave nulls, so downstream queries see one convention
-// rather than two). Speakers are `me` and `them`, derived purely from the
-// segment's `track` field. Extraction is a separate step (server extract
-// CLI) — this module does not run it.
+// Writes recording, transcript, speaker and segment rows shaped to match
+// Fathom-imported recordings (nulls where the existing rows leave nulls, so
+// downstream queries see one convention rather than two). Attendee rows are
+// the deliberate exception: they carry null email, domain_kind and person_id
+// where the imported rows carry values, for the reasons in ingest/identity.ts.
+//
+// Speaker labels are `me` and `them`, derived purely from the segment's
+// `track` field. Where the identity answer names both tracks of a 1:1,
+// display_name carries the person's name alongside that label and extraction
+// reads the name in preference to it. Extraction is a separate step (server
+// extract CLI) — this module does not run it.
 //
 // transcripts.text is written as NULL (schema.ts:110 declares the column
 // nullable — no .notNull() — and information_schema confirms it in the
