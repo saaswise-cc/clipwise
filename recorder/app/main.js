@@ -16,7 +16,9 @@ const zlib = require('zlib');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { parseNames, buildAnswerDoc, writeAnswer } = require('./identity-answer.js');
+const {
+    IDENTITY_WINDOW, contentHeightFor, parseNames, buildAnswerDoc, writeAnswer,
+} = require('./identity-answer.js');
 
 // --- constants ------------------------------------------------------------
 // All measurements come from 5-second captures on 2026-08-09. A long
@@ -165,6 +167,10 @@ const APPLY_IDENTITY_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'apply-ide
 // what the OS knows and not what a person would type. Guessing it would put a
 // name nobody chose on every recording.
 const IDENTITY_HTML = path.join(__dirname, 'identity.html');
+// How long the prompt waits for the page to report its height before showing
+// itself anyway. Short enough not to be noticed after a capture, long enough
+// for a local file: the measurement is sent from the page's first script run.
+const IDENTITY_REVEAL_GRACE_MS = 400;
 const SELF_PATH = path.join(SUPPORT_DIR, 'identity-self.json');
 
 // A GUI-launched Electron inherits a minimal PATH with no Homebrew on it, and
@@ -946,8 +952,13 @@ function pumpIdentityQueue() {
     let win;
     try {
         win = new BrowserWindow({
-            width: 460,
-            height: 320,
+            // Content box, not frame: the page measures its own content and
+            // asks for a height (identity:resize), and a frame-sized window
+            // would apply that measurement to the wrong box and clip by the
+            // height of the title bar.
+            useContentSize: true,
+            width: IDENTITY_WINDOW.width,
+            height: IDENTITY_WINDOW.minHeight,
             show: false,
             resizable: false,
             minimizable: false,
@@ -964,14 +975,22 @@ function pumpIdentityQueue() {
         identityQueue.shift();
         return;
     }
-    identityWindow = { win, capture };
-    win.once('ready-to-show', () => {
+    identityWindow = { win, capture, shown: false };
+    // Shown once, by whichever comes first: the page's own height message, or
+    // a deadline. The deadline is what stops a broken measurement from leaving
+    // the prompt invisible — a window nobody can see is worse than one sized
+    // to the minimum, and the layout keeps the buttons reachable either way.
+    const reveal = () => {
+        if (!identityWindow || identityWindow.win !== win || identityWindow.shown) return;
+        identityWindow.shown = true;
         win.show();
         // An accessory app's window opens behind whatever is in front. The
         // question is about the call that just ended, so it is asked now or
         // not at all.
         try { app.focus({ steal: true }); } catch {}
-    });
+    };
+    identityWindow.reveal = reveal;
+    win.once('ready-to-show', () => setTimeout(reveal, IDENTITY_REVEAL_GRACE_MS));
     win.once('closed', () => {
         identityWindow = null;
         pumpIdentityQueue();
@@ -1000,6 +1019,22 @@ function claimIdentityPrompt(token) {
 }
 
 function registerIdentityIpc() {
+    // The page reporting how tall it needs to be. Sized before it is shown, so
+    // the prompt never appears at one height and jumps to another.
+    ipcMain.on('identity:resize', (_event, payload) => {
+        if (!identityWindow || !payload || identityWindow.capture.token !== payload.token) return;
+        const height = contentHeightFor(payload.height);
+        try {
+            identityWindow.win.setContentSize(IDENTITY_WINDOW.width, height);
+        } catch (err) {
+            console.error(`identity: could not size the prompt: ${String(err)}`);
+        }
+        console.error(
+            `[clipwise-recorder] identity ${identityWindow.capture.stem}: ` +
+            `prompt content ${IDENTITY_WINDOW.width}x${height} (page asked for ${payload.height})`);
+        identityWindow.reveal();
+    });
+
     ipcMain.on('identity:submit', (_event, payload) => {
         const capture = claimIdentityPrompt(payload && payload.token);
         if (!capture) return;

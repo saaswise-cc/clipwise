@@ -14,6 +14,24 @@ const path = require('path');
 
 const IDENTITY_VERSION = 1;
 
+// The prompt window's content box. Height is not a constant: the page measures
+// itself and asks to be resized, because a fixed height is a bet that the copy
+// will never change and 7dae4a9 lost that bet — a hint added to the names
+// field pushed Save and Skip below the bottom edge of a 460×320 window with no
+// way to scroll to them.
+//
+// The clamp is what keeps a measurement bug from producing a 3-pixel or a
+// full-screen prompt. Between the two bounds the window fits its content; past
+// the upper one the page scrolls internally and the buttons stay pinned, so
+// they are reachable at every height either way.
+const IDENTITY_WINDOW = { width: 460, minHeight: 220, maxHeight: 560 };
+
+function contentHeightFor(measured) {
+    const h = Math.ceil(Number(measured));
+    if (!Number.isFinite(h)) return IDENTITY_WINDOW.minHeight;
+    return Math.min(IDENTITY_WINDOW.maxHeight, Math.max(IDENTITY_WINDOW.minHeight, h));
+}
+
 // Newlines and commas both separate, because both are what people type.
 // Duplicates are dropped case-insensitively; the first spelling wins.
 function parseNames(raw) {
@@ -70,4 +88,11 @@ function writeAnswer(dir, doc) {
     return finalPath;
 }
 
-module.exports = { IDENTITY_VERSION, parseNames, buildAnswerDoc, writeAnswer };
+module.exports = {
+    IDENTITY_VERSION,
+    IDENTITY_WINDOW,
+    contentHeightFor,
+    parseNames,
+    buildAnswerDoc,
+    writeAnswer,
+};

@@ -42,6 +42,7 @@
     }
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0;
     padding: 18px 20px 16px;
@@ -49,7 +50,16 @@
     color: var(--fg);
     background: var(--bg);
     user-select: none;
+    /* Column with a scrolling middle and a pinned button row. The window is
+       sized to fit this page, but the layout does not depend on that having
+       worked: at any height the buttons keep their place at the bottom and the
+       fields give up the space instead. */
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
+  #fields { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+  #actions { flex: 0 0 auto; }
   h1 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
   .capture { color: var(--muted); font-size: 11px; margin: 0 0 12px; }
   label { display: block; font-size: 11px; color: var(--muted); margin: 0 0 4px; }
@@ -67,7 +77,7 @@
   textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .field { margin-bottom: 10px; }
   .hint { color: var(--muted); font-size: 11px; margin: 4px 0 0; }
-  .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+  .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
   button {
     font: inherit;
     padding: 5px 14px;
@@ -84,6 +94,7 @@
   <h1>Who was on this call?</h1>
   <p class="capture" id="capture"></p>
 
+  <div id="fields">
   <div class="field">
     <label for="names">Full names — one per line, or separated by commas</label>
     <textarea id="names" autofocus spellcheck="false" placeholder="Grace Hopper"></textarea>
@@ -97,7 +108,9 @@
     <input id="self" spellcheck="false" placeholder="Ada Lovelace — asked once, remembered after">
   </div>
 
-  <div class="row">
+  </div>
+
+  <div id="actions" class="row">
     <button id="skip">Skip</button>
     <button id="save" class="primary">Save</button>
   </div>
@@ -108,6 +121,38 @@
 
   document.getElementById('capture').textContent = params.get('stem') || '';
   document.getElementById('self').value = params.get('self') || '';
+
+  // Tell the main process how tall this page actually is, so the window is
+  // sized to the copy rather than the copy trimmed to fit the window. Measured
+  // rather than declared because the two drift: the height that fit before
+  // 7dae4a9 cut the buttons off after it.
+  //
+  // Measured with the layout's own constraints lifted. The column is capped at
+  // the viewport by design, so asking it how tall it is while it is capped
+  // returns the window height back — the first attempt at this reported 280px
+  // for a page that needs more, and clipped the host field instead of the
+  // buttons. Unconstrain, read the body's border box, put it back: the page is
+  // never painted in the loosened state because this runs before the window is
+  // shown.
+  function measuredHeight() {
+    const body = document.body;
+    const fields = document.getElementById('fields');
+    const prev = {
+      height: body.style.height,
+      overflow: fields.style.overflow,
+      flex: fields.style.flex,
+    };
+    body.style.height = 'auto';
+    fields.style.overflow = 'visible';
+    fields.style.flex = '0 0 auto';
+    const h = Math.ceil(body.getBoundingClientRect().height);
+    body.style.height = prev.height;
+    fields.style.overflow = prev.overflow;
+    fields.style.flex = prev.flex;
+    return h;
+  }
+  window.measuredHeight = measuredHeight;
+  ipcRenderer.send('identity:resize', { token: params.get('token'), height: measuredHeight() });
 
   function save() {
     ipcRenderer.send('identity:submit', {
