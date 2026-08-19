@@ -34,6 +34,7 @@ export class ClipwiseClient {
     semanticQ?: string;
     recordingId?: string;
     kind?: string;
+    attendee?: string;
     limit?: number;
   }): Promise<{ moments: MomentSummary[] }> {
     return this.get(`/accounts/${this.config.accountId}/moments`, {
@@ -41,6 +42,7 @@ export class ClipwiseClient {
       semantic_q: params.semanticQ,
       recordingId: params.recordingId,
       kind: params.kind,
+      attendee: params.attendee,
       limit: params.limit?.toString(),
     });
   }

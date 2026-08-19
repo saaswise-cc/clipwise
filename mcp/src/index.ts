@@ -24,6 +24,8 @@ const DESC = {
     "Semantic search. Free-text question or description; results are ranked by cosine similarity against moment embeddings. Best for interpretation-heavy queries (what did we decide about X, who pushed back on Y). Returns up to `limit` results with a per-result `similarity` score in [-1,1]. Results always fill up to the limit regardless of relevance because there is no distance floor — you MUST read the similarity score to judge whether a low-ranked result is actually a match, otherwise you will treat unrelated moments as answers. Mutually exclusive with `query` — pass one or the other, not both.",
   recordingId: "Restrict to a single recording (UUID).",
   kind: 'Restrict to a specific moment kind (e.g. "decision", "objection").',
+  attendee:
+    "Restrict to recordings this person was on. Case-insensitive substring match against the attendee's name — who was in the meeting, not who the moment talks about, so a call where they never came up still matches and a call where they were only mentioned does not. Composes with `query` or `semanticQuery` (both filters apply) and works on its own. Only recordings whose attendee list was captured can match; one with no attendee rows is invisible to this filter rather than an error.",
   limit: "Max results. Defaults to 50.",
   getTranscriptTool:
     "Fetch the full transcript for a recording, with per-segment timestamps and speaker labels.",
@@ -35,6 +37,7 @@ const searchMomentsInput = z.object({
   semanticQuery: z.string().optional().describe(DESC.semanticQuery),
   recordingId: z.string().uuid().optional().describe(DESC.recordingId),
   kind: z.string().optional().describe(DESC.kind),
+  attendee: z.string().min(1).max(256).optional().describe(DESC.attendee),
   limit: z.number().int().min(1).max(200).optional().describe(DESC.limit),
 });
 
@@ -61,6 +64,7 @@ async function main(): Promise<void> {
             semanticQuery: { type: "string", description: DESC.semanticQuery },
             recordingId: { type: "string", description: DESC.recordingId },
             kind: { type: "string", description: DESC.kind },
+            attendee: { type: "string", description: DESC.attendee },
             limit: { type: "number", description: DESC.limit },
           },
         },
@@ -92,6 +96,7 @@ async function main(): Promise<void> {
           semanticQ: input.semanticQuery,
           recordingId: input.recordingId,
           kind: input.kind,
+          attendee: input.attendee,
           limit: input.limit,
         });
         return {

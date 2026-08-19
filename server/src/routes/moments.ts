@@ -1,5 +1,15 @@
 import { Router } from "express";
-import { and, asc, desc, eq, ilike, isNotNull, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  exists,
+  ilike,
+  isNotNull,
+  or,
+  sql,
+} from "drizzle-orm";
 import { cosineDistance } from "drizzle-orm/sql/functions/vector";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
@@ -26,6 +36,11 @@ const searchMomentsQuerySchema = z.object({
   semantic_q: z.string().max(2048).optional(),
   recordingId: z.string().uuid().optional(),
   kind: z.string().max(64).optional(),
+  // Attendee name (SAA-127). Keyed on the name rather than person_id or
+  // email because the caller is the capture prompt, which supplies a
+  // free-typed name and nothing else — an id-keyed filter has no way to
+  // be fed from that side.
+  attendee: z.string().min(1).max(256).optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
@@ -114,6 +129,44 @@ momentsRouter.get(
     }
     if (query.kind) {
       conditions.push(eq(schema.moments.kind, query.kind));
+    }
+    // Attendee filter (SAA-127) — the person→call hop. Correlated EXISTS
+    // on the moment's recording rather than a join, so a recording with
+    // several matching attendee rows still yields each moment once and
+    // the row count is unchanged by the filter's presence.
+    //
+    // Matched against both attendees.name and the linked people.name: an
+    // attendee row can carry a null name while still pointing at a person
+    // who has one, and the caller cannot know which side holds it. Neither
+    // table is written to here, and neither gained a column — AD #10.
+    //
+    // Substring, case-insensitive, same shape as `q` above: the name comes
+    // from a human typing it into the capture prompt, so "tyler" and
+    // "Tyler Lang" both have to reach the same calls. The cost is that a
+    // short string matches broadly — "an" would sweep in Lang — which is
+    // the same bargain `q` already makes.
+    if (query.attendee) {
+      const attendeeLike = `%${query.attendee}%`;
+      conditions.push(
+        exists(
+          db
+            .select({ one: sql`1` })
+            .from(schema.attendees)
+            .leftJoin(
+              schema.people,
+              eq(schema.people.id, schema.attendees.personId),
+            )
+            .where(
+              and(
+                eq(schema.attendees.recordingId, schema.moments.recordingId),
+                or(
+                  ilike(schema.attendees.name, attendeeLike),
+                  ilike(schema.people.name, attendeeLike),
+                ),
+              ),
+            ),
+        ),
+      );
     }
     if (query.q) {
       const like = `%${query.q}%`;
