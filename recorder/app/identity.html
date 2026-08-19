@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- The identity prompt (SAA-114). Shown after a capture stops, asking who was
+     on the call; the answer becomes attendee rows.
+
+     Loaded from file:// with nodeIntegration on. That is a deliberate,
+     bounded choice: this page is shipped inside the bundle, loads no remote
+     content, and the only thing it sends is the text typed into it. A preload
+     bridge would be the same two calls behind one more file. Nothing here ever
+     puts a typed name into the DOM as markup — the name goes to the main
+     process and no further.
+
+     Dismissing this window is a real answer with a real consequence: the
+     recording stays unidentified. It is never the capture that is lost. -->
+<title>Who was on this call?</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1d1d1f;
+    --muted: #6e6e73;
+    --bg: #ececee;
+    --field-bg: #ffffff;
+    --field-border: #c6c6c8;
+    --accent: #0a68d8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #f5f5f7;
+      --muted: #98989d;
+      --bg: #2a2a2c;
+      --field-bg: #1e1e20;
+      --field-border: #48484a;
+      --accent: #4a9dff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 18px 20px 16px;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    user-select: none;
+  }
+  h1 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+  .capture { color: var(--muted); font-size: 11px; margin: 0 0 12px; }
+  label { display: block; font-size: 11px; color: var(--muted); margin: 0 0 4px; }
+  textarea, input {
+    width: 100%;
+    font: inherit;
+    color: var(--fg);
+    background: var(--field-bg);
+    border: 1px solid var(--field-border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    user-select: text;
+  }
+  textarea { height: 62px; resize: none; }
+  textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .field { margin-bottom: 10px; }
+  .hint { color: var(--muted); font-size: 11px; margin: 4px 0 0; }
+  .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+  button {
+    font: inherit;
+    padding: 5px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--field-border);
+    background: var(--field-bg);
+    color: var(--fg);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+  <h1>Who was on this call?</h1>
+  <p class="capture" id="capture"></p>
+
+  <div class="field">
+    <label for="names">Names — one per line, or separated by commas</label>
+    <textarea id="names" autofocus spellcheck="false"></textarea>
+    <p class="hint">Leave empty if it was just you.</p>
+  </div>
+
+  <div class="field">
+    <label for="self">You (host)</label>
+    <input id="self" spellcheck="false" placeholder="Your name — asked once, remembered after">
+  </div>
+
+  <div class="row">
+    <button id="skip">Skip</button>
+    <button id="save" class="primary">Save</button>
+  </div>
+
+<script>
+  const { ipcRenderer } = require('electron');
+  const params = new URLSearchParams(window.location.search);
+
+  document.getElementById('capture').textContent = params.get('stem') || '';
+  document.getElementById('self').value = params.get('self') || '';
+
+  function save() {
+    ipcRenderer.send('identity:submit', {
+      token: params.get('token'),
+      names: document.getElementById('names').value,
+      self: document.getElementById('self').value,
+    });
+  }
+  function skip() {
+    ipcRenderer.send('identity:skip', { token: params.get('token') });
+  }
+
+  document.getElementById('save').addEventListener('click', save);
+  document.getElementById('skip').addEventListener('click', skip);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') skip();
+    // Enter submits from either field; Shift+Enter keeps its meaning in the
+    // textarea, which is where a second name goes.
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
+  });
+</script>
+</body>
+</html>

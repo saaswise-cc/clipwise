@@ -96,6 +96,10 @@ rm -f "$C/Resources/electron.icns"
 
 mkdir -p "$C/Resources/app" "$C/Resources/bin"
 cp "$APP_SRC/main.js" "$C/Resources/app/main.js"
+# The identity prompt's page (SAA-114). main.js loads it by path relative to
+# itself, so a bundle without it has a stop that silently identifies nothing.
+cp "$APP_SRC/identity.html" "$C/Resources/app/identity.html"
+cp "$APP_SRC/identity-answer.js" "$C/Resources/app/identity-answer.js"
 install -m 755 "$SYSTEMTAP_BIN" "$C/Resources/bin/systemtap"
 install -m 755 "$MICCAP_BIN"    "$C/Resources/bin/miccap"
 install -m 755 "$AUDIODEVS_BIN" "$C/Resources/bin/audiodevs"

@@ -9,13 +9,14 @@
 // is a human. The recorder is the trigger; the manifest it wrote at capture
 // start is the record the pipeline keys on.
 
-const { app, Tray, Menu, Notification, globalShortcut, nativeImage, shell } = require('electron');
+const { app, BrowserWindow, Tray, Menu, Notification, globalShortcut, ipcMain, nativeImage, shell } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const { randomUUID } = require('crypto');
 const zlib = require('zlib');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { parseNames, buildAnswerDoc, writeAnswer } = require('./identity-answer.js');
 
 // --- constants ------------------------------------------------------------
 // All measurements come from 5-second captures on 2026-08-09. A long
@@ -154,6 +155,17 @@ if (BUILD_INFO) {
 }
 const TSX_BIN = path.join(SERVER_DIR, 'node_modules', '.bin', 'tsx');
 const PIPELINE_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'cli.ts');
+// Applies an identity answer to a capture that has already been ingested. The
+// ordinary case never needs it — see startApplyIdentity.
+const APPLY_IDENTITY_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'apply-identity.ts');
+
+// The identity prompt's page, and the file that remembers what the person
+// answering is called. The name is asked for once and reused; it is never
+// derived from the account — `id -F` on this machine answers "JD", which is
+// what the OS knows and not what a person would type. Guessing it would put a
+// name nobody chose on every recording.
+const IDENTITY_HTML = path.join(__dirname, 'identity.html');
+const SELF_PATH = path.join(SUPPORT_DIR, 'identity-self.json');
 
 // A GUI-launched Electron inherits a minimal PATH with no Homebrew on it, and
 // the pipeline shells out to python3, ffmpeg and whisper-cli. Launched from a
@@ -190,6 +202,13 @@ let hotkeys = [];
 
 // Last time a recording↔stalled transition was allowed to notify.
 let lastFlapNotifyMs = 0;
+
+// Identity prompts waiting to be shown, and the one on screen (SAA-114).
+// A queue rather than a single slot: two captures can stop before either is
+// answered, and replacing the open window would silently drop the first
+// answer. { stem, recordingId, token }
+const identityQueue = [];
+let identityWindow = null;
 
 const LABEL = {
     stopped:   'Stopped',
@@ -821,6 +840,192 @@ function dismissPipelineFailure() {
     renderTray();
 }
 
+// --- identity (SAA-114) ---------------------------------------------------
+//
+// The prompt is strictly downstream of the audio. It is created from
+// teardown's completion callback, after the children are gone, after the
+// manifest has been finalised and after the pipeline has been spawned — so
+// there is no path by which answering it, ignoring it, or failing to draw it
+// can stop, delay, shorten or discard a capture. Dismissed or ignored, the
+// recording is unidentified and otherwise intact.
+//
+// The trigger is the capture stopping, whatever stopped it: the tray item, the
+// hotkey, a child dying, the start deadline expiring. All four already funnel
+// through stopRecording, and nothing here detects anything on its own.
+//
+// Quit is the one stop that cannot prompt — the process is on its way out and
+// a window cannot outlive it. That capture is unidentified, which is the
+// tolerated outcome rather than a special case worth blocking a quit over.
+
+// Writing the answer is identity-answer.js's job — see the note there on why
+// the file is where it is and why a rename is what puts it in place. This is
+// the reporting half: what was written, for the log a packaged app leaves
+// behind.
+function writeIdentityAnswer(capture, answer) {
+    const doc = buildAnswerDoc({
+        stem: capture.stem,
+        recordingId: capture.recordingId,
+        names: answer.names,
+        selfName: answer.selfName,
+    });
+    const finalPath = writeAnswer(OUTDIR, doc);
+    console.error(
+        `[clipwise-recorder] identity ${capture.stem}: ` +
+        `self=${JSON.stringify(answer.selfName)} guests=${JSON.stringify(answer.names)} -> ${finalPath}`);
+    return finalPath;
+}
+
+// Spawned on every answer, not only on late ones. Ingest reads the same file
+// itself, so the two overlap by design: this process cannot know whether the
+// detached pipeline has already passed ingest, and an answer that arrives
+// after it would otherwise sit on disk unread. The step no-ops when the
+// recording row does not exist yet and inserts only names it does not already
+// have, so running it always is the cheap half of the choice.
+function startApplyIdentity(stem) {
+    const logPath = path.join(OUTDIR, `identity-${stem}.log`);
+    let fd;
+    try {
+        fd = fs.openSync(logPath, 'a');
+        fs.writeSync(fd, `\n[clipwise-recorder] ${new Date().toISOString()} apply-identity stem=${stem}\n`);
+    } catch (err) {
+        console.error(`identity log ${logPath}: ${String(err)}`);
+        return;
+    }
+    try {
+        const proc = spawn(TSX_BIN, [APPLY_IDENTITY_ENTRY, OUTDIR, '--stem', stem], {
+            cwd: SERVER_DIR,
+            env: { ...process.env, PATH: PIPELINE_PATH },
+            stdio: ['ignore', fd, fd],
+            detached: true,
+        });
+        proc.unref();
+        proc.once('error', (err) => {
+            try {
+                fs.appendFileSync(logPath, `[clipwise-recorder] spawn failed: ${String(err)}\n`);
+            } catch {}
+        });
+    } catch (err) {
+        console.error(`identity: apply spawn failed: ${String(err)}`);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+// Asked once, then reused. Kept beside the recordings rather than in the
+// capture directory: it is a fact about the person, not about one capture.
+function readSelfName() {
+    try {
+        const doc = JSON.parse(fs.readFileSync(SELF_PATH, 'utf8'));
+        return typeof doc.name === 'string' && doc.name.trim() ? doc.name.trim() : null;
+    } catch {
+        return null;
+    }
+}
+
+function writeSelfName(name) {
+    if (!name) return;
+    try {
+        fs.mkdirSync(SUPPORT_DIR, { recursive: true });
+        fs.writeFileSync(
+            SELF_PATH,
+            JSON.stringify({ name, set_at: new Date().toISOString() }, null, 2) + '\n');
+    } catch (err) {
+        console.error(`identity: could not remember your name: ${String(err)}`);
+    }
+}
+
+function promptForIdentity(capture) {
+    if (!capture || !capture.stem) return;
+    identityQueue.push({ ...capture, token: randomUUID() });
+    pumpIdentityQueue();
+}
+
+function pumpIdentityQueue() {
+    if (identityWindow || identityQueue.length === 0) return;
+    const capture = identityQueue[0];
+    let win;
+    try {
+        win = new BrowserWindow({
+            width: 460,
+            height: 320,
+            show: false,
+            resizable: false,
+            minimizable: false,
+            maximizable: false,
+            fullscreenable: false,
+            alwaysOnTop: true,
+            title: 'Who was on this call?',
+            webPreferences: { nodeIntegration: true, contextIsolation: false },
+        });
+    } catch (err) {
+        // A prompt that cannot be drawn leaves the recording unidentified. The
+        // capture is already on disk and already in the pipeline.
+        console.error(`identity: could not open the prompt: ${String(err)}`);
+        identityQueue.shift();
+        return;
+    }
+    identityWindow = { win, capture };
+    win.once('ready-to-show', () => {
+        win.show();
+        // An accessory app's window opens behind whatever is in front. The
+        // question is about the call that just ended, so it is asked now or
+        // not at all.
+        try { app.focus({ steal: true }); } catch {}
+    });
+    win.once('closed', () => {
+        identityWindow = null;
+        pumpIdentityQueue();
+    });
+    win.loadFile(IDENTITY_HTML, {
+        query: {
+            token: capture.token,
+            stem: capture.stem,
+            self: readSelfName() || '',
+        },
+    }).catch((err) => {
+        console.error(`identity: prompt failed to load: ${String(err)}`);
+        try { win.close(); } catch {}
+    });
+}
+
+// Closes the window for `token` if it is the one on screen, and takes that
+// capture off the queue. Returns the capture, or null when the message came
+// from a window that has already been dealt with.
+function claimIdentityPrompt(token) {
+    if (!identityWindow || identityWindow.capture.token !== token) return null;
+    const capture = identityWindow.capture;
+    identityQueue.shift();
+    try { identityWindow.win.close(); } catch {}
+    return capture;
+}
+
+function registerIdentityIpc() {
+    ipcMain.on('identity:submit', (_event, payload) => {
+        const capture = claimIdentityPrompt(payload && payload.token);
+        if (!capture) return;
+        const names = parseNames(payload.names);
+        const selfName = String(payload.self || '').trim() || null;
+        writeSelfName(selfName);
+        try {
+            writeIdentityAnswer(capture, { names, selfName });
+        } catch (err) {
+            // The answer is lost; the capture is not. Say so where it can be
+            // read rather than pretending it was written.
+            console.error(`identity: could not write the answer for ${capture.stem}: ${String(err)}`);
+            notify('Clipwise: identity not saved',
+                `Who was on ${capture.stem} could not be written — the recording is unidentified.`);
+            return;
+        }
+        startApplyIdentity(capture.stem);
+    });
+
+    ipcMain.on('identity:skip', (_event, payload) => {
+        const capture = claimIdentityPrompt(payload && payload.token);
+        if (!capture) return;
+        console.error(`[clipwise-recorder] identity ${capture.stem}: skipped — recording is unidentified`);
+    });
+}
+
 // --- lifecycle ------------------------------------------------------------
 
 function startRecording() {
@@ -1044,20 +1249,36 @@ function stopRecording() {
     // Tray flips to Stopped up to KILL_GRACE_MS before children actually
     // exit. Accepted: Stop is user-initiated and nobody is watching the
     // gap. Record the gap here so it isn't rediscovered as a bug later.
-    const stem = session && session.reachedRecording ? session.stem : null;
+    const capture = session && session.reachedRecording
+        ? { stem: session.stem, recordingId: session.recordingId }
+        : null;
+    const stem = capture ? capture.stem : null;
     setState('stopped');
     // The pipeline starts from teardown's completion callback, never from
     // this click. miccap patches the WAV header when it handles SIGINT, so a
     // transcribe kicked off before it exits reads a file whose RIFF and data
     // sizes are still zero — and teardown is also where the manifest gets its
     // mic format, which the pipeline reads.
-    teardown(() => startPipeline(stem));
+    //
+    // The identity prompt goes last, after the audio is finalised and the
+    // pipeline is already running. Everything a capture needs has happened by
+    // the time the question is asked, which is what makes the answer optional.
+    teardown(() => {
+        startPipeline(stem);
+        promptForIdentity(capture);
+    });
 }
 
 function quitApp() {
     // A capture that already happened should still become moments, so quitting
     // mid-recording hands off rather than discards. The child is detached, so
     // it outlives this process.
+    //
+    // No identity prompt on this path: the window would be destroyed with the
+    // process before anyone could type into it, and holding the quit open
+    // until it was answered would make the prompt something a person has to
+    // get past. That capture is unidentified — the same outcome as dismissing
+    // the prompt, and correctable the same way.
     const stem = session && session.reachedRecording ? session.stem : null;
     if (state !== 'stopped') setState('stopped');
     globalShortcut.unregisterAll();
@@ -1191,6 +1412,7 @@ app.whenReady().then(() => {
     tray = new Tray(iconFor('stopped'));
     setState('stopped');
     registerHotkeys();
+    registerIdentityIpc();
 });
 
 // quitApp calls app.exit, which skips will-quit — so the unregister is done in

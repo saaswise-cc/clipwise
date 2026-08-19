@@ -27,10 +27,16 @@
 // records on the Fathom side. Do not synthesize, do not null.
 
 import { readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, dirname } from "node:path";
 import { and, count, eq, sql } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { slugify } from "../lib/slug.js";
+import {
+  applyIdentity,
+  describeRows,
+  readIdentityAnswer,
+  type IdentityAnswer,
+} from "./identity.js";
 
 type Segment = {
   track: "me" | "them";
@@ -168,6 +174,16 @@ export async function ingestTranscript(
   const startedAtIso = capture?.startedAt ?? (stamp ? stampToIso(stamp) : null);
   const startedAt = startedAtIso ? new Date(startedAtIso) : undefined;
 
+  // Who was on the call (SAA-114), read from the capture directory as late as
+  // possible: the prompt is answered after the capture stops and this runs
+  // after transcription, so reading it here rather than at the top of the
+  // pipeline is what lets an answer given during transcription still land.
+  // Read only when there is a manifest — a transcript ingested on its own has
+  // no capture directory to look in.
+  const identity: IdentityAnswer | null = capture
+    ? readIdentityAnswer(dirname(capture.manifestFile), capture.stem)
+    : null;
+
   const accounts = await db.select().from(schema.accounts);
   if (accounts.length !== 1) {
     throw new Error(
@@ -244,6 +260,17 @@ export async function ingestTranscript(
     process.stdout.write(
       `ingest: recording already exists for source_id=${sourceId} → reusing ${existing.id} (no insert)\n`,
     );
+    // Applied on the reuse path too. A capture whose prompt was answered after
+    // the first ingest gets its attendee rows from the next run — a tray
+    // retry, or the apply step the recorder spawns when an answer arrives
+    // late — rather than needing the row to be inserted fresh.
+    if (identity) {
+      const applied = await applyIdentity(db, existing.id, identity);
+      process.stdout.write(
+        `ingest: identity (existing row) inserted=${describeRows(applied.inserted)} ` +
+          `already_present=${describeRows(applied.skipped)}\n`,
+      );
+    }
     return {
       recordingId: existing.id,
       transcriptId: transcript?.id ?? "",
@@ -316,6 +343,13 @@ export async function ingestTranscript(
                 tracks: capture.tracks ?? null,
               }
             : null,
+          // The identity answer as it was given (SAA-114). The attendee rows
+          // are the queryable form of it; this is the provenance those rows
+          // have nowhere to carry, since `attendees` has no metadata column
+          // and AD #10 says stop rather than add one. Null here and no
+          // attendee rows means the prompt went unanswered, which is a state
+          // the design accepts.
+          identity: identity ?? null,
         },
       })
       .returning();
@@ -361,11 +395,19 @@ export async function ingestTranscript(
       .values(segmentRows)
       .returning({ id: schema.segments.id });
 
+    // Attendee rows in the same transaction as the recording they describe:
+    // a recording that exists with the answer already on disk should never be
+    // visible without it.
+    const appliedIdentity = identity
+      ? await applyIdentity(tx, recording.id, identity)
+      : null;
+
     return {
       recording,
       transcript,
       segmentCount: inserted.length,
       speakerIds: Object.fromEntries(speakerByLabel),
+      appliedIdentity,
     };
   });
 
@@ -382,6 +424,17 @@ export async function ingestTranscript(
     })
     .from(schema.segments)
     .where(eq(schema.segments.recordingId, result.recording.id));
+
+  if (result.appliedIdentity) {
+    process.stdout.write(
+      `ingest: identity inserted=${describeRows(result.appliedIdentity.inserted)} ` +
+        `already_present=${describeRows(result.appliedIdentity.skipped)}\n`,
+    );
+  } else {
+    process.stdout.write(
+      "ingest: no identity answer on disk — recording is unidentified\n",
+    );
+  }
 
   process.stdout.write("\n=== recording row (post-insert readback) ===\n");
   for (const [k, v] of Object.entries(dbRecording)) {
