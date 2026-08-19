@@ -28,6 +28,8 @@ import { db, pool, schema } from "../db/index.js";
 import { CLIPWISE_SOURCE } from "../ingest/clipwise.js";
 import {
   applyIdentity,
+  applySpeakerNames,
+  describeMapping,
   describeRows,
   findRecordingForCapture,
   readIdentityAnswer,
@@ -107,6 +109,15 @@ async function main(): Promise<void> {
     `apply-identity: recording=${recordingId} inserted=${describeRows(applied.inserted)} ` +
       `already_present=${describeRows(applied.skipped)}\n`,
   );
+
+  // The same mapping ingest does in-transaction (SAA-129). Wired into both
+  // paths deliberately: the 2026-08-19 dry run on SAA-114 showed a 30-second
+  // capture ingests twenty seconds before the prompt is answered, so short
+  // captures reach the speakers from here and long ones from ingest. A
+  // mapping in only one place would look correct in every test and miss every
+  // real call, or the reverse.
+  const mapping = await applySpeakerNames(db, recordingId, answer);
+  process.stdout.write(`apply-identity: speaker names ${describeMapping(mapping)}\n`);
 }
 
 main()

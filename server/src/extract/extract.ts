@@ -67,7 +67,11 @@ async function loadSegments(recordingId: string): Promise<Segment[]> {
       startSec: schema.segments.startSec,
       endSec: schema.segments.endSec,
       text: schema.segments.text,
-      speakerLabel: schema.speakers.label,
+      // The name when the identity answer supplied one (SAA-129), the raw
+      // track label otherwise. This is the line that decides whether a moment
+      // reads "Jon Dwyer argues…" or "Me argues…": the model is given the
+      // rendered transcript and nothing else about who spoke.
+      speakerLabel: sql<string | null>`coalesce(${schema.speakers.displayName}, ${schema.speakers.label})`,
     })
     .from(schema.segments)
     .leftJoin(schema.speakers, eq(schema.segments.speakerId, schema.speakers.id))

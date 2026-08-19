@@ -13,7 +13,13 @@
      process and no further.
 
      Dismissing this window is a real answer with a real consequence: the
-     recording stays unidentified. It is never the capture that is lost. -->
+     recording stays unidentified. It is never the capture that is lost.
+
+     Both fields ask for full names, and say so, because the filter that reads
+     them back is a case-insensitive substring match (SAA-127): a stored "Mike"
+     is unreachable by a search for "Michael Lynch", while a stored full name
+     answers both. The imported rows already spell names in full, so a short
+     form here would also make the two sources disagree. -->
 <title>Who was on this call?</title>
 <style>
   :root {
@@ -79,14 +85,16 @@
   <p class="capture" id="capture"></p>
 
   <div class="field">
-    <label for="names">Names — one per line, or separated by commas</label>
-    <textarea id="names" autofocus spellcheck="false"></textarea>
-    <p class="hint">Leave empty if it was just you.</p>
+    <label for="names">Full names — one per line, or separated by commas</label>
+    <textarea id="names" autofocus spellcheck="false" placeholder="Grace Hopper"></textarea>
+    <p class="hint">Full names, as they would be written elsewhere. Searching is
+      substring-based, so "Grace" is not found by a search for "Grace Hopper".
+      Leave empty if it was just you.</p>
   </div>
 
   <div class="field">
-    <label for="self">You (host)</label>
-    <input id="self" spellcheck="false" placeholder="Your name — asked once, remembered after">
+    <label for="self">You (host) — your full name</label>
+    <input id="self" spellcheck="false" placeholder="Ada Lovelace — asked once, remembered after">
   </div>
 
   <div class="row">

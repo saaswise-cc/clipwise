@@ -33,6 +33,8 @@ import { db, schema } from "../db/index.js";
 import { slugify } from "../lib/slug.js";
 import {
   applyIdentity,
+  applySpeakerNames,
+  describeMapping,
   describeRows,
   readIdentityAnswer,
   type IdentityAnswer,
@@ -266,9 +268,13 @@ export async function ingestTranscript(
     // late — rather than needing the row to be inserted fresh.
     if (identity) {
       const applied = await applyIdentity(db, existing.id, identity);
+      const mapping = await applySpeakerNames(db, existing.id, identity);
       process.stdout.write(
         `ingest: identity (existing row) inserted=${describeRows(applied.inserted)} ` +
           `already_present=${describeRows(applied.skipped)}\n`,
+      );
+      process.stdout.write(
+        `ingest: speaker names (existing row) ${describeMapping(mapping)}\n`,
       );
     }
     return {
@@ -402,12 +408,21 @@ export async function ingestTranscript(
       ? await applyIdentity(tx, recording.id, identity)
       : null;
 
+    // And the tracks the answer can name (SAA-129), in the same transaction as
+    // the speakers it renames. Extraction runs after ingest and reads these,
+    // so a capture ingested with the answer already on disk produces moments
+    // that carry names from the start.
+    const speakerMapping = identity
+      ? await applySpeakerNames(tx, recording.id, identity)
+      : null;
+
     return {
       recording,
       transcript,
       segmentCount: inserted.length,
       speakerIds: Object.fromEntries(speakerByLabel),
       appliedIdentity,
+      speakerMapping,
     };
   });
 
@@ -430,6 +445,11 @@ export async function ingestTranscript(
       `ingest: identity inserted=${describeRows(result.appliedIdentity.inserted)} ` +
         `already_present=${describeRows(result.appliedIdentity.skipped)}\n`,
     );
+    if (result.speakerMapping) {
+      process.stdout.write(
+        `ingest: speaker names ${describeMapping(result.speakerMapping)}\n`,
+      );
+    }
   } else {
     process.stdout.write(
       "ingest: no identity answer on disk — recording is unidentified\n",

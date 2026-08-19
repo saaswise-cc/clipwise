@@ -201,6 +201,119 @@ export async function findRecordingForCapture(
   return row?.id ?? null;
 }
 
+// --- track → name (SAA-129) -----------------------------------------------
+//
+// A Clipwise capture has two tracks and no diarization, so its speakers are
+// `me` and `them` and every moment extracted from it reads "Me argues that…".
+// The identity answer makes the mapping arithmetic rather than inference: in a
+// 1:1 the host is `me` and the one guest is `them`.
+//
+// **Only with exactly one named guest.** Two or more and `them` is a mixed
+// track — several people sharing one channel — and no assignment to it is
+// correct. That is SAA-94's territory and it stays parked; this declines and
+// says so rather than picking the first name. The decline covers `me` as well:
+// half a mapping, where one track is named and the other is still `them`, is a
+// worse artifact than an honest pair of labels.
+//
+// **display_name, not person_id.** `speakers.person_id` exists and stays null,
+// because nothing here can produce a person to point it at safely. Creating
+// one is what the SAA-114 note warns about: `people_account_email_idx` is
+// UNIQUE(account_id, email) with no NULLS NOT DISTINCT, verified against the
+// live index definition, so a name-only person row is unique every time and
+// the same human forks into a row per meeting. Matching an existing person by
+// name instead is not a safer version of that — `people` has no uniqueness on
+// name, two people can share one, and the only rows in it came from the
+// backfill whose fabricated emails SAA-109 records. A typed name is a label
+// for one recording until something supplies a real key; a calendar address
+// (SAA-115) is that key, and person_id can be filled from it later without
+// redoing this.
+export type SpeakerMapping = {
+  applied: Array<{ label: string; displayName: string }>;
+  // Named but not written, with the reason — an already-named speaker, or a
+  // label the recording does not have.
+  skipped: Array<{ label: string; reason: string }>;
+  // Set when the whole mapping was refused. Null when it ran.
+  declined: string | null;
+};
+
+const HOST_LABEL = "me";
+const GUEST_LABEL = "them";
+
+export async function applySpeakerNames(
+  executor: typeof db | Tx,
+  recordingId: string,
+  answer: IdentityAnswer,
+): Promise<SpeakerMapping> {
+  const mapping: SpeakerMapping = { applied: [], skipped: [], declined: null };
+  const rows = attendeeRowsFrom(answer);
+  const guests = rows.filter((r) => !r.isHost && r.name);
+  const host = rows.find((r) => r.isHost && r.name) ?? null;
+
+  if (guests.length !== 1) {
+    mapping.declined =
+      guests.length === 0
+        ? "the answer names no guest — nothing to map `them` to"
+        : `the answer names ${guests.length} guests — \`them\` is a mixed track and no assignment to it is correct (SAA-94). Labels left as ${HOST_LABEL}/${GUEST_LABEL}.`;
+    return mapping;
+  }
+
+  const wanted = new Map<string, string | null>([
+    [HOST_LABEL, host?.name ?? null],
+    [GUEST_LABEL, guests[0].name],
+  ]);
+
+  const speakers = await executor
+    .select({
+      id: schema.speakers.id,
+      label: schema.speakers.label,
+      displayName: schema.speakers.displayName,
+    })
+    .from(schema.speakers)
+    .where(eq(schema.speakers.recordingId, recordingId));
+
+  for (const [label, name] of wanted) {
+    const speaker = speakers.find((s) => s.label === label);
+    if (!speaker) {
+      // A capture where one track carried no audio has no speaker row for it
+      // — see the label filter in ingest. Not an error.
+      mapping.skipped.push({ label, reason: "the recording has no such speaker row" });
+      continue;
+    }
+    if (!name) {
+      mapping.skipped.push({ label, reason: "the answer supplies no name for this track" });
+      continue;
+    }
+    if (speaker.displayName) {
+      // Something already named this speaker — a hand correction through the
+      // PATCH route, or an earlier run. Not overwritten: a later answer is not
+      // automatically a better one, and clobbering a correction silently is
+      // the failure this is meant to prevent.
+      mapping.skipped.push({
+        label,
+        reason: `already named ${JSON.stringify(speaker.displayName)}`,
+      });
+      continue;
+    }
+    await executor
+      .update(schema.speakers)
+      .set({ displayName: name })
+      .where(eq(schema.speakers.id, speaker.id));
+    mapping.applied.push({ label, displayName: name });
+  }
+  return mapping;
+}
+
+export function describeMapping(mapping: SpeakerMapping): string {
+  if (mapping.declined) return `declined — ${mapping.declined}`;
+  const applied = mapping.applied.length
+    ? mapping.applied.map((a) => `${a.label}→${a.displayName}`).join(", ")
+    : "none";
+  const skipped = mapping.skipped.length
+    ? ` skipped=${mapping.skipped.map((s) => `${s.label} (${s.reason})`).join(", ")}`
+    : "";
+  return `applied=${applied}${skipped}`;
+}
+
 export function describeRows(rows: AttendeeRow[]): string {
   if (rows.length === 0) return "none";
   return rows
