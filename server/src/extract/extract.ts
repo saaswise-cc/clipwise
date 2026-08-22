@@ -331,6 +331,21 @@ export type ExtractionResult = {
   elapsedMs: number;
 };
 
+// The capture's measured length, read out of the manifest block that ingest
+// denormalises onto the recording row at metadata.capture.tracks[].duration_s.
+// Evaluated against the row being updated, so it costs no extra round trip.
+//
+// Defined once because the promotion uses it twice — for duration_sec and for
+// ended_at — and two copies of this expression would be two things to keep in
+// step. Yields NULL when there is no capture block (Fathom imports) or no
+// tracks, which both consumers coalesce away.
+const CAPTURE_DURATION_SEC = sql`(
+  SELECT max((t->>'duration_s')::double precision)
+  FROM jsonb_array_elements(
+    coalesce(${schema.recordings.metadata}->'capture'->'tracks', '[]'::jsonb)
+  ) AS t
+)`;
+
 export async function runExtraction(
   recordingId: string,
   options: { applyCollapse?: boolean } = {},
@@ -538,14 +553,54 @@ export async function runExtraction(
   // Merge into existing metadata rather than replacing it — recordings
   // may carry other keys (transcript source paths, capture stamps, etc.)
   // that this update must not clobber.
+  //
+  // status/ended_at/duration_sec ride along on this same statement (SAA-134).
+  // They belong to the same fact the promotion already asserts — the capture
+  // finished processing — and until now nothing on the capture path wrote
+  // them at all, so every row read `pending` with both timestamps null
+  // whether it succeeded or died. Widening this `.set()` rather than adding
+  // a second write keeps "this run succeeded" a single statement: there is
+  // no window in which a row claims a terminal status without a current run,
+  // or the reverse.
+  //
+  // Deliberately NOT idempotent-guarded with coalesce on status: a re-extract
+  // that reaches here succeeded, and saying so again is correct. duration_sec
+  // and ended_at do coalesce, because a value already measured should not be
+  // replaced by a null when the source metadata is absent.
   await db
     .update(schema.recordings)
     .set({
+      // Terminal status. "ready" matches the vocabulary transcripts already
+      // use (schema.ts:112, set at ingest) and reads as what promotion means:
+      // this recording's moments are now the ones search returns.
+      status: "ready",
+      // The measured capture length, read back from the manifest the ingest
+      // step already denormalised onto this row (ingest/clipwise.ts:352-360),
+      // not re-derived from segments. Segments stop at the last utterance;
+      // the tracks run to the end of the capture, and it is the capture this
+      // column describes. max() across tracks because the tap and mic stop a
+      // fraction of a second apart and the capture is not over until both are.
+      //
+      // Null for rows with no capture block — Fathom imports have no manifest
+      // and nothing measured a duration for them. Leaving it null is honest;
+      // inventing one from segment bounds would not be.
+      durationSec: sql`coalesce(${CAPTURE_DURATION_SEC}, ${schema.recordings.durationSec})`,
+      // Wall-clock end of the recording, not of the processing run: started_at
+      // came from the manifest, so started_at + measured duration is the same
+      // clock. A row whose duration is unknown keeps a null ended_at rather
+      // than borrowing "now", which would silently mean something else.
+      endedAt: sql`coalesce(
+        ${schema.recordings.startedAt} + make_interval(secs => ${CAPTURE_DURATION_SEC}),
+        ${schema.recordings.endedAt}
+      )`,
       metadata: sql`coalesce(${schema.recordings.metadata}, '{}'::jsonb) || jsonb_build_object('current_extraction_run', ${runUuid}::text)`,
     })
     .where(eq(schema.recordings.id, recordingId));
   console.log(
     `extract: promoted current_extraction_run = ${runUuid} on recording ${recordingId}`,
+  );
+  console.log(
+    `extract: marked recording ${recordingId} status=ready (ended_at and duration_sec from capture manifest)`,
   );
 
   return {
