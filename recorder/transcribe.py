@@ -24,10 +24,24 @@ Verified on this ffmpeg build (+1.01/+1.5/+2.0 all → 32767; symmetric
 for negatives). No compressor is inserted in the pipeline — a dynamics
 filter would alter the RMS/peak numbers the sample-content check reports.
 
+Voice activity detection gates the audio before Whisper sees it (SAA-91).
+Without it Whisper emits words over silence — filler aligned to its 30-second
+processing window, indistinguishable in the output from real backchannel, and
+worst on whichever track carries the most silence. That is the far side of
+every 1:1 measured. Gating removes the silence rather than filtering the text
+afterwards, because the discriminator is the audio under a segment and not the
+segment's wording.
+
 Environment:
-    WHISPER_MODEL   Path to a whisper.cpp GGML model. Default:
-                    ~/Library/Application Support/whisper.cpp/models/ggml-small.en.bin
-    WHISPER_CLI     whisper-cli binary. Default: whisper-cli on PATH.
+    WHISPER_MODEL       Path to a whisper.cpp GGML model. Default:
+                        ~/Library/Application Support/whisper.cpp/models/ggml-small.en.bin
+    WHISPER_CLI         whisper-cli binary. Default: whisper-cli on PATH.
+    WHISPER_VAD_MODEL   Path to the Silero VAD model. Default alongside the
+                        transcription model as ggml-silero-v5.1.2.bin.
+    CLIPWISE_ALLOW_NO_VAD=1
+                        Transcribe without gating when the VAD model is
+                        missing. Off by default and deliberately awkward — see
+                        the note on run_whisper.
 """
 
 from __future__ import annotations
@@ -55,6 +69,25 @@ DEFAULT_MODEL = str(
     Path.home()
     / "Library/Application Support/whisper.cpp/models/ggml-small.en.bin"
 )
+
+DEFAULT_VAD_MODEL = str(
+    Path.home()
+    / "Library/Application Support/whisper.cpp/models/ggml-silero-v5.1.2.bin"
+)
+
+VAD_MODEL_URL = (
+    "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
+)
+
+# whisper.cpp VAD defaults, named here so the transcript can record what
+# produced it and so changing one is a visible edit rather than a flag buried
+# in an argv list. Left at the shipped defaults: the 30 ms speech padding is
+# what keeps a gated onset from clipping the first phoneme, and nothing in the
+# corpus measurement suggested a different threshold.
+VAD_THRESHOLD = "0.50"
+VAD_MIN_SPEECH_MS = "250"
+VAD_MIN_SILENCE_MS = "100"
+VAD_SPEECH_PAD_MS = "30"
 
 
 def die(msg: str) -> None:
@@ -242,7 +275,12 @@ def sample_content_check(wav_path: Path) -> dict:
     }
 
 
-def run_whisper(wav_path: Path, model_path: Path, whisper_cli: str) -> list[dict]:
+def run_whisper(
+    wav_path: Path,
+    model_path: Path,
+    whisper_cli: str,
+    vad_model: Path | None,
+) -> list[dict]:
     """Invoke whisper-cli with -oj; parse the resulting JSON.
 
     Uses whisper.cpp's `offsets.to` verbatim as the segment end. In this
@@ -250,6 +288,16 @@ def run_whisper(wav_path: Path, model_path: Path, whisper_cli: str) -> list[dict
     i+1 on every adjacent pair observed so far — meaning "real end" and
     "next start" are indistinguishable at the JSON level. Recorded in
     the verification output; not worked around here.
+
+    With `vad_model`, Silero gates the audio before Whisper decodes it. The
+    offsets that come back are positions in the ORIGINAL audio, not in the
+    silence-removed stream — measured 2026-08-22 on a 2468.9 s track that is
+    80% silence, where the gated run's last segment ends at 2462.4 s. Had it
+    been reporting compressed-stream positions the track would have ended near
+    490 s. This is the property the two-track merge depends on: `me` and `them`
+    are transcribed independently and interleaved on a shared timeline with no
+    offset applied, so a compressed clock on one track would silently reorder
+    the conversation.
     """
     # whisper-cli appends ".json" to the -of value verbatim. Build the
     # prefix by trimming the trailing ".wav" so the output is <name>.json,
@@ -265,6 +313,15 @@ def run_whisper(wav_path: Path, model_path: Path, whisper_cli: str) -> list[dict
         "-oj",
         "-of", prefix_str,
     ]
+    if vad_model is not None:
+        cmd += [
+            "--vad",
+            "-vm", str(vad_model),
+            "-vt", VAD_THRESHOLD,
+            "-vspd", VAD_MIN_SPEECH_MS,
+            "-vsd", VAD_MIN_SILENCE_MS,
+            "-vp", VAD_SPEECH_PAD_MS,
+        ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=sys.stderr)
     json_path = Path(prefix_str + ".json")
     if not json_path.exists():
@@ -309,10 +366,48 @@ def main() -> int:
             "Install: brew install whisper-cpp"
         )
 
+    # Checked here, before any audio is touched, because `--vad` with an
+    # unreadable model does not return an error: whisper.cpp attempts to load
+    # from the empty path and dies on a Metal assertion during teardown,
+    # SIGABRT / exit 134. Nothing downstream can catch that or report what
+    # went wrong, and the recovery loop (SAA-136) would spend all three of a
+    # capture's attempts on it and then abandon the recording.
+    #
+    # Refusing outright rather than quietly transcribing without gating, which
+    # is the tempting fallback and the wrong one. A capture that fails here
+    # keeps its audio and is re-transcribed the moment the model is present —
+    # the recovery loop re-runs the transcribe stage, demonstrated 2026-08-22.
+    # A capture that silently skips gating gets a transcript that is up to 40%
+    # text over silence, is ingested, is extracted, and reaches the terminal
+    # status — after which nothing revisits it, because the loop will not
+    # re-run a recording that reads ready. The recoverable failure is the safer
+    # one, so it is the default.
+    vad_model_path = Path(os.environ.get("WHISPER_VAD_MODEL", DEFAULT_VAD_MODEL))
+    allow_no_vad = os.environ.get("CLIPWISE_ALLOW_NO_VAD") == "1"
+    vad_model = vad_model_path
+    if not vad_model_path.is_file():
+        if not allow_no_vad:
+            die(
+                f"VAD model not found at {vad_model_path}.\n"
+                "  Whisper emits words over silence without it (SAA-91), so this refuses\n"
+                "  rather than produce a transcript that looks fine and is partly invented.\n"
+                "  The capture's audio is kept and re-transcribes cleanly once this exists.\n"
+                "  Download with:\n"
+                f'    curl -L --fail -o "{vad_model_path}" \\\n'
+                f"      {VAD_MODEL_URL}\n"
+                "  Or set WHISPER_VAD_MODEL, or CLIPWISE_ALLOW_NO_VAD=1 to accept ungated output."
+            )
+        sys.stderr.write(
+            "transcribe: WARNING - CLIPWISE_ALLOW_NO_VAD=1 and no VAD model; "
+            "transcribing ungated. Expect phantom speech over silence (SAA-91).\n"
+        )
+        vad_model = None
+
     print(f"tap  src: {tap_src}")
     print(f"mic  src: {mic_src}")
     print(f"model:    {model_path}")
     print(f"whisper:  {shutil.which(whisper_cli)}")
+    print(f"vad:      {vad_model if vad_model else 'DISABLED (CLIPWISE_ALLOW_NO_VAD=1)'}")
 
     tap_bytes = tap_src.stat().st_size
     tap_frames = tap_bytes // (TAP_SAMPLE_BYTES * TAP_CH)
@@ -360,11 +455,11 @@ def main() -> int:
     )
 
     print("transcribing tap track ...")
-    tap_segs = run_whisper(tap_16k, model_path, whisper_cli)
+    tap_segs = run_whisper(tap_16k, model_path, whisper_cli, vad_model)
     print(f"tap segments: {len(tap_segs)}")
 
     print("transcribing mic track ...")
-    mic_segs = run_whisper(mic_16k, model_path, whisper_cli)
+    mic_segs = run_whisper(mic_16k, model_path, whisper_cli, vad_model)
     print(f"mic segments: {len(mic_segs)}")
 
     merged = []
@@ -419,17 +514,25 @@ def main() -> int:
     print(f"tap adjacency: {tap_match} pairs match, {tap_diff} differ. sample diffs: {tap_samp}")
     print(f"mic adjacency: {mic_match} pairs match, {mic_diff} differ. sample diffs: {mic_samp}")
 
-    if tap_segs:
-        print("--- verbatim tap transcript (pink noise, expected: nothing) ---")
-        for s in tap_segs:
-            print(f"  [{s['start_ms']:>7} → {s['end_ms']:>7}] {s['text']!r}")
-        print("--- end tap transcript ---")
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "inputs": {"tap": str(tap_src), "mic": str(mic_src)},
         "downsampled": {"tap_16k": str(tap_16k), "mic_16k": str(mic_16k)},
         "model": str(model_path),
+        # How the audio was gated, so a transcript carries the reason it looks
+        # the way it does. A file written before SAA-91 has no `vad` key at
+        # all, which is how an ungated one is told apart from a gated one.
+        "vad": (
+            {
+                "model": str(vad_model),
+                "threshold": float(VAD_THRESHOLD),
+                "min_speech_ms": int(VAD_MIN_SPEECH_MS),
+                "min_silence_ms": int(VAD_MIN_SILENCE_MS),
+                "speech_pad_ms": int(VAD_SPEECH_PAD_MS),
+            }
+            if vad_model is not None
+            else None
+        ),
         "labels": labels,
         # Per-track sample statistics, measured above on the 16k copies that
         # Whisper actually reads. Persisted rather than only printed because
