@@ -157,6 +157,10 @@ if (BUILD_INFO) {
 }
 const TSX_BIN = path.join(SERVER_DIR, 'node_modules', '.bin', 'tsx');
 const PIPELINE_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'cli.ts');
+// Finds captures whose processing never finished and finishes them (SAA-136).
+// Spawned on launch and after a pipeline run fails. It decides what is
+// outstanding from the database, not from the sidecars in OUTDIR.
+const RECOVER_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'recover.ts');
 // Applies an identity answer to a capture that has already been ingested. The
 // ordinary case never needs it — see startApplyIdentity.
 const APPLY_IDENTITY_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'apply-identity.ts');
@@ -828,8 +832,76 @@ function startPipeline(stem, opts = {}) {
                 );
             } catch {}
             pipeline = { stem, state: 'failed', proc: null };
+            // The unattended retry (SAA-136). The tray still shows the failure
+            // and still offers Retry, but neither is now the only way back:
+            // this capture is outstanding as far as the database is concerned,
+            // so the recovery pass will pick it up and finish it. Bounded at
+            // three attempts per capture with a cooldown between them, so a
+            // capture that fails for a reason retrying cannot fix stops on its
+            // own rather than spinning.
+            startRecovery(`pipeline failed stem=${stem}`);
         }
         renderTray();
+    });
+}
+
+// --- recovery (SAA-136) ---------------------------------------------------
+//
+// The unattended half of processing. Runs on launch and after a pipeline run
+// fails, works out what is outstanding by asking the database, and finishes
+// it. Nothing here touches the tray: the point is that a capture whose
+// processing died gets finished without the user learning it ever happened.
+//
+// Detached and unref'd for the same reason the pipeline is — a recovery that
+// started should not be killed by the user quitting a minute later. No exit
+// listener: nothing in the UI depends on the outcome, and the pass reports
+// itself into recovery.log.
+//
+// Deliberately never spawned from the recovery pass's own result. It runs the
+// pipeline in-process rather than through startPipeline, so a failure inside
+// it cannot re-enter here; the only triggers are launch and a foreground
+// pipeline run failing.
+let recoveryProc = null;
+
+function startRecovery(reason) {
+    // One at a time. The pass is sequential and can take minutes on a backlog;
+    // a second one would race it for the same captures and the same API quota.
+    if (recoveryProc) {
+        console.error(`[clipwise-recorder] recovery already running — skipping trigger (${reason})`);
+        return;
+    }
+    const logPath = path.join(OUTDIR, 'recovery.log');
+    let fd;
+    try {
+        fd = fs.openSync(logPath, 'a');
+        fs.writeSync(fd, `\n[clipwise-recorder] ${new Date().toISOString()} recovery start (${reason})\n`);
+    } catch (err) {
+        console.error(`recovery log ${logPath}: ${String(err)}`);
+        return;
+    }
+    const proc = spawn(TSX_BIN, [RECOVER_ENTRY, OUTDIR], {
+        cwd: SERVER_DIR,
+        env: { ...process.env, PATH: PIPELINE_PATH },
+        stdio: ['ignore', fd, fd],
+        detached: true,
+    });
+    fs.closeSync(fd);
+    proc.unref();
+    recoveryProc = proc;
+    proc.once('error', (err) => {
+        try {
+            fs.appendFileSync(logPath, `[clipwise-recorder] recovery spawn failed: ${String(err)}\n`);
+        } catch {}
+        if (recoveryProc === proc) recoveryProc = null;
+    });
+    proc.once('exit', (code, signal) => {
+        try {
+            fs.appendFileSync(
+                logPath,
+                `[clipwise-recorder] recovery exited code=${code} signal=${signal}\n`,
+            );
+        } catch {}
+        if (recoveryProc === proc) recoveryProc = null;
     });
 }
 
@@ -1448,6 +1520,11 @@ app.whenReady().then(() => {
     setState('stopped');
     registerHotkeys();
     registerIdentityIpc();
+    // Last, and after the tray exists: a launch that has to recover a backlog
+    // should still show a working menu bar immediately. Spawning is cheap —
+    // the pass itself runs in another process — but ordering it here means a
+    // throw from it can never cost the user their tray icon.
+    startRecovery('app launch');
 });
 
 // quitApp calls app.exit, which skips will-quit — so the unregister is done in

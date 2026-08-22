@@ -23,7 +23,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { ingestTranscript, type CaptureIdentity } from "../ingest/clipwise.js";
-import { runExtraction } from "../extract/extract.js";
+import { readExtractionCompletion, runExtraction } from "../extract/extract.js";
 import {
   classifyCapture,
   type CaptureClassification,
@@ -62,6 +62,14 @@ export type Sidecar = {
   capture_dir: string;
   db_recording_id: string | null;
   updated_at: string;
+  // PID of the process that last wrote this file. Liveness only — it says
+  // nothing about whether anything succeeded. A step left in `running` is
+  // ambiguous on its own: the pipeline may still be working, or it may have
+  // been killed mid-step, which is precisely the failure the recovery pass
+  // exists to clean up (SAA-136). Without a PID to test, recovery has to
+  // assume the optimistic reading and wait out a timeout before touching the
+  // one case it most needs to fix.
+  pid: number | null;
   steps: Record<StepName, StepRecord>;
 };
 
@@ -177,6 +185,7 @@ function loadSidecar(dir: string, stem: string, recordingId: string): Sidecar {
     capture_dir: dir,
     db_recording_id: null,
     updated_at: new Date().toISOString(),
+    pid: null,
     steps: {
       transcribe: emptyStep(),
       ingest: emptyStep(),
@@ -187,6 +196,7 @@ function loadSidecar(dir: string, stem: string, recordingId: string): Sidecar {
 
 function writeSidecar(dir: string, sidecar: Sidecar): void {
   sidecar.updated_at = new Date().toISOString();
+  sidecar.pid = process.pid;
   writeFileSync(sidecarPathFor(dir, sidecar.stem), JSON.stringify(sidecar, null, 2) + "\n");
 }
 
@@ -339,26 +349,46 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
   }
 
   // --- extract ---
-  const prior = sidecar.steps.extract;
-  // A recorded completion refers to the recording row that existed when it
-  // ran. If ingest just inserted a fresh row, that row is gone — deleted, or
-  // the database rebuilt — and its moments went with it, so the sidecar's
-  // memory of success is about something that no longer exists. Trusting it
-  // would leave the capture ingested with nothing extracted, silently. The
-  // sidecar is a cache of what happened; the database is what is true.
-  if (prior.state === "ok" && !reused) {
+  //
+  // Completion is read from the recording row, never from the sidecar
+  // (SAA-136). The sidecar is a per-machine cache of what was last attempted
+  // and it has been wrong in both directions: it claimed `ok` for a recording
+  // row that no longer existed (stem 2026-08-11T17-25-28Z still does), and on
+  // 2026-08-20 it recorded `failed_partial` for a run that died in pass 1
+  // having written nothing — which is what left the tray's Retry button unable
+  // to ever succeed (SAA-132). It stays as the log of what each step did; it
+  // simply no longer gets to decide whether there is work to do.
+  //
+  // The question asked here is narrow on purpose. It is NOT "did a previous
+  // run leave rows behind" — a partial run genuinely can, that is SAA-82, and
+  // re-running over one is verified safe: promoting the new run evicts the old
+  // visible set in the same statement that admits the new one, hand-curated
+  // moments are untouched, and nothing duplicates. Refusing on leftover rows
+  // is what SAA-132 was filed about.
+  //
+  // It is "has this recording already finished", because re-extracting a
+  // healthy recording is the one genuinely destructive thing this path can do.
+  // The same transcript does not reproduce: on the 2026-08-22 check the same
+  // recording and model yielded 54 moments and then 41, and the 54 were
+  // evicted. So a completed recording is refused unless someone explicitly
+  // asks, and everything else is simply run.
+  const completion = await readExtractionCompletion(dbRecordingId);
+  if (completion.complete && !opts.forceExtract) {
     log(
-      "extraction was recorded complete, but ingest inserted a new recording row — " +
-        "the prior run's moments belonged to a row that no longer exists. Re-extracting.",
+      `extraction already complete for this recording — status=${completion.status}, ` +
+        `current_extraction_run=${completion.currentRun}. Nothing to do.`,
     );
-    sidecar.steps.extract = emptyStep();
-    writeSidecar(dir, sidecar);
-  } else if (prior.state === "ok" && opts.forceExtract) {
-    log("extraction already complete, but --force-extract was passed — re-extracting");
-    sidecar.steps.extract = emptyStep();
-    writeSidecar(dir, sidecar);
-  } else if (prior.state === "ok") {
-    log("extraction already completed for this capture — nothing to do");
+    // Bring the sidecar back in line with the database. It is no longer read
+    // for this decision, but it drives the tray, and leaving it claiming a
+    // failure the database has since disproved is how the stuck Retry button
+    // looked to a user.
+    if (sidecar.steps.extract.state !== "ok") {
+      finish("extract", "ok", {
+        reconciled_from_db: true,
+        status: completion.status,
+        run_uuid: completion.currentRun,
+      });
+    }
     return {
       stem,
       recordingId: capture.recordingId,
@@ -368,18 +398,16 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
       extraction: null,
     };
   }
-  if ((prior.state === "failed_partial" || prior.state === "running") && !opts.forceExtract) {
-    const err = new PipelineError(
-      `extraction previously ended in state "${prior.state}" for this capture. ` +
-        `runExtraction has no transactional boundary (SAA-82), so a partial run may have ` +
-        `written moments already and re-running blind would double-extract. ` +
-        `Re-run with --force-extract to proceed anyway.`,
-      "extract",
+  if (completion.complete && opts.forceExtract) {
+    log("extraction already complete, but --force-extract was passed — re-extracting");
+  } else {
+    log(
+      `extraction not complete for this recording — status=${completion.status ?? "(no row)"}, ` +
+        `current_extraction_run=${completion.currentRun ?? "none"}. Extracting.`,
     );
-    // Leave the prior state intact — overwriting it would erase the evidence
-    // that a partial run happened.
-    throw err;
   }
+  sidecar.steps.extract = emptyStep();
+  writeSidecar(dir, sidecar);
 
   // Checked before the step is marked running. runExtraction throws on a
   // missing key before it touches the database, so treating that as a partial

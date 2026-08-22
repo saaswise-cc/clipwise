@@ -331,6 +331,49 @@ export type ExtractionResult = {
   elapsedMs: number;
 };
 
+// The status a recording carries once a run has been promoted onto it. The
+// promotion below is the only thing that writes it on the capture path, and
+// both the recovery loop and the double-extract guard (SAA-136) read it to
+// decide what still needs running — so it is named once here rather than
+// spelled out as a literal at each site.
+export const TERMINAL_STATUS = "ready";
+
+// Has this recording already finished a run? The inverse of what the promotion
+// writes, and the only completion signal anything should consult: the pipeline
+// sidecar is a per-machine cache of what was last attempted and has been wrong
+// in both directions — claiming success for a recording row that no longer
+// existed, and recording `failed_partial` for a run that died in pass 1 having
+// written nothing.
+//
+// Requires both halves. A terminal status without a promoted run would be a
+// row that claims to be done while search returns nothing for it; treating
+// that as incomplete is the safe reading.
+export type ExtractionCompletion = {
+  exists: boolean;
+  status: string | null;
+  currentRun: string | null;
+  complete: boolean;
+};
+
+export async function readExtractionCompletion(
+  recordingId: string,
+): Promise<ExtractionCompletion> {
+  const [row] = await db
+    .select({
+      status: schema.recordings.status,
+      currentRun: sql<string | null>`${schema.recordings.metadata}->>'current_extraction_run'`,
+    })
+    .from(schema.recordings)
+    .where(eq(schema.recordings.id, recordingId));
+  if (!row) return { exists: false, status: null, currentRun: null, complete: false };
+  return {
+    exists: true,
+    status: row.status,
+    currentRun: row.currentRun,
+    complete: row.status === TERMINAL_STATUS && row.currentRun !== null,
+  };
+}
+
 // The capture's measured length, read out of the manifest block that ingest
 // denormalises onto the recording row at metadata.capture.tracks[].duration_s.
 // Evaluated against the row being updated, so it costs no extra round trip.
@@ -339,7 +382,7 @@ export type ExtractionResult = {
 // ended_at — and two copies of this expression would be two things to keep in
 // step. Yields NULL when there is no capture block (Fathom imports) or no
 // tracks, which both consumers coalesce away.
-const CAPTURE_DURATION_SEC = sql`(
+export const CAPTURE_DURATION_SEC = sql`(
   SELECT max((t->>'duration_s')::double precision)
   FROM jsonb_array_elements(
     coalesce(${schema.recordings.metadata}->'capture'->'tracks', '[]'::jsonb)
@@ -573,7 +616,7 @@ export async function runExtraction(
       // Terminal status. "ready" matches the vocabulary transcripts already
       // use (schema.ts:112, set at ingest) and reads as what promotion means:
       // this recording's moments are now the ones search returns.
-      status: "ready",
+      status: TERMINAL_STATUS,
       // The measured capture length, read back from the manifest the ingest
       // step already denormalised onto this row (ingest/clipwise.ts:352-360),
       // not re-derived from segments. Segments stop at the last utterance;
