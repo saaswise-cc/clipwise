@@ -32,6 +32,14 @@ every 1:1 measured. Gating removes the silence rather than filtering the text
 afterwards, because the discriminator is the audio under a segment and not the
 segment's wording.
 
+Segment ends are measured from the audio, not taken from whisper (SAA-147).
+Whisper reports a start it measured and often no real ending, in which case
+`offsets.to` is the moment the next speech begins — 98.1% of consecutive pairs
+on 2026-08-25T17-30-09Z, where a four-second sentence records as 598.83 s.
+Gating made this worse rather than causing it: ungated, the error could not
+exceed whisper's own 30-second window, and skipping silence removed that cap.
+See measure_segment_ends.
+
 Environment:
     WHISPER_MODEL       Path to a whisper.cpp GGML model. Default:
                         ~/Library/Application Support/whisper.cpp/models/ggml-small.en.bin
@@ -47,11 +55,14 @@ Environment:
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import struct
 import subprocess
 import sys
+from array import array
+from operator import mul
 from pathlib import Path
 
 TAP_RATE = 48000
@@ -88,6 +99,45 @@ VAD_THRESHOLD = "0.50"
 VAD_MIN_SPEECH_MS = "250"
 VAD_MIN_SILENCE_MS = "100"
 VAD_SPEECH_PAD_MS = "30"
+
+# Segment-end measurement (SAA-147). Whisper reports a start it measured and
+# often no real ending; `offsets.to` is then the moment the NEXT speech begins.
+# These values are the ones that survived a grid search against ground truth —
+# see measure_segment_ends for how that truth was established and what each
+# rejected value did.
+SEGMENT_END_FRAME_MS = 20
+# The end is where the level drops this far below the loudest speech in the
+# segment. Relative, not absolute: the mic noise floor on this corpus runs as
+# high as -33 dBFS against speech at -10, and a fixed threshold that separates
+# them on one capture marks 93% of another as speech.
+SEGMENT_END_DROP_DB = 25.0
+# A silence shorter than this is a pause inside the utterance, not its end.
+# Bounded from both sides by measurement, and centred between them:
+#
+#   above  the longest real intra-utterance pause seen, 1.60 s, in "So this is
+#          what I, I just want to show you really quick." At 1500 ms that
+#          segment ends at the pause and loses two thirds of its words — the
+#          failure the dense-capture half of SAA-147's verification exists to
+#          catch, since it passes the sparse half looking correct.
+#   below  the shortest silence seen between a real ending and the next sound
+#          on the track, 2.86 s, after "I got some funny stories...". At
+#          3000 ms that segment runs on to far-side voice leaking into the mic
+#          and reports 8.08 s instead of 1.80 s; at 4000 ms, 493.78 s.
+#
+# Erring high costs span accuracy, erring low costs words, and words are not
+# recoverable — but the window either side of this value is under a second, so
+# a capture with slower speech or a closer-following speaker could land outside
+# it. The two numbers above are what to re-measure if that shows up.
+SEGMENT_END_HANG_MS = 2200
+# Trailing room for a final consonant the level test cuts fine.
+SEGMENT_END_PAD_MS = 80
+# The speech reference is seeded from the opening of the segment, where SAA-91
+# established the start is a real measured onset, then raised as louder speech
+# appears. Seeding from the whole window instead lets a later burst of
+# cross-talk set the reference and silence the real speech under it.
+SEGMENT_END_LEAD_MS = 500
+# Frame level assigned to digital silence, so log(0) never arises.
+SEGMENT_END_FLOOR_DB = -90.0
 
 
 def die(msg: str) -> None:
@@ -192,11 +242,12 @@ def ffmpeg_downsample_wav(src: Path, dst: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
-def sample_content_check(wav_path: Path) -> dict:
-    """Report nonzero fraction, RMS, peak of a 16-bit mono WAV.
+def read_s16_mono(wav_path: Path) -> tuple[array, int]:
+    """Return (samples, rate) for a 16-bit mono WAV.
 
-    Reads samples directly; ffmpeg's clean exit does not prove the file
-    survived the downsample.
+    Split out of sample_content_check so the sample pass is paid once: the
+    content statistics and the segment-end frame levels (SAA-147) both read
+    the same 16k copy, and on a 40-minute capture that file is ~70 MB.
     """
     with open(wav_path, "rb") as f:
         riff = f.read(12)
@@ -227,8 +278,20 @@ def sample_content_check(wav_path: Path) -> dict:
     if data is None or bits != 16 or block_align != 2:
         die(f"{wav_path}: expected s16 mono, got bits={bits} block={block_align}")
 
-    n = len(data) // 2
-    samples = struct.unpack("<" + "h" * n, data)
+    samples = array("h")
+    samples.frombytes(data)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples, rate
+
+
+def sample_content_check(samples: array, rate: int) -> dict:
+    """Report nonzero fraction, RMS, peak of the samples read above.
+
+    Reads samples directly; ffmpeg's clean exit does not prove the file
+    survived the downsample.
+    """
+    n = len(samples)
 
     # Windowed as well as whole-file. A whole-file average cannot locate a
     # transient gap — a track that carried speech and then dropped to the noise
@@ -273,6 +336,99 @@ def sample_content_check(wav_path: Path) -> dict:
         "windows_rms": w_rms,
         "windows_peak": w_peak,
     }
+
+
+def frame_levels_db(samples: array, rate: int, frame_ms: int) -> list[float]:
+    """Per-frame RMS in dBFS.
+
+    Same measurement as `windows_rms` in the content block, at 20 ms instead
+    of one second. The content series stays at one second — it is what SAA-89's
+    classifier reads, and an hour at 20 ms is 180k values per track, which
+    would be several times the size of the transcript it rides on. This series
+    is derived, used, and dropped.
+    """
+    n = int(rate * frame_ms / 1000)
+    out: list[float] = []
+    for i in range(0, len(samples), n):
+        chunk = samples[i : i + n]
+        m = len(chunk)
+        if m == 0:
+            break
+        rms = ((sum(map(mul, chunk, chunk)) / m) ** 0.5) / 32768.0
+        out.append(
+            SEGMENT_END_FLOOR_DB
+            if rms <= 0
+            else max(SEGMENT_END_FLOOR_DB, 20 * math.log10(rms))
+        )
+    return out
+
+
+def measure_segment_ends(segs: list[dict], levels: list[float]) -> int:
+    """Replace each segment's end with the point where its speech stops.
+
+    Whisper gives a real start and, often, no real ending — `offsets.to` is
+    then the moment the next speech begins (SAA-147). Ungated that error was
+    capped at whisper's own 30-second window; SAA-91's VAD gating removed the
+    cap, because the next speech region can be arbitrarily far away. On
+    2026-08-25T17-30-09Z a four-second sentence is recorded as 598.83 s.
+
+    The end is measured from the audio rather than estimated from the text,
+    and the search window is [start, reported_end]. That window is the whole
+    reason this is tractable: whatever else it contains, it does not contain
+    the next utterance, because the reported end is where that utterance
+    begins. So the only thing to find inside it is where this speech stopped.
+
+    Scan forward from the start, tracking the loudest speech seen. Speech has
+    stopped at the last frame above (loudest - SEGMENT_END_DROP_DB) before
+    either a silence of SEGMENT_END_HANG_MS or the end of the window. Ends
+    only ever move earlier, never later: `offsets.to` is either the true end
+    or the next start, and is never before the true end, so it is a ceiling.
+
+    Two rejected alternatives, both measured on this corpus:
+
+      * Last frame above the threshold anywhere in the window. Correct on
+        every dense segment and catastrophic on the sparse ones — the 598 s
+        segment carries far-side voice leaking into the mic at -22 dBFS, well
+        above threshold, and the "end" lands 597 s late.
+      * Duration of the segment in whisper's VAD-compressed timeline, taken
+        from `-ojf` token offsets. Tighter on average (median +0.21 s) but
+        wrong in the unsafe direction: a segment holding an internal pause has
+        that pause removed from the compressed stream, so the end lands before
+        the real one and words are cut. One of 22 sampled segments lost its
+        last two words.
+
+    Returns the number of segments whose end moved. Mutates `segs`, keeping
+    the original value as `end_ms_reported` so the change stays auditable.
+    """
+    fm = SEGMENT_END_FRAME_MS
+    hang = max(1, SEGMENT_END_HANG_MS // fm)
+    lead = max(1, SEGMENT_END_LEAD_MS // fm)
+    moved = 0
+    for s in segs:
+        start_ms, rep_end_ms = s["start_ms"], s["end_ms"]
+        i0 = start_ms // fm
+        i1 = min(len(levels), -(-rep_end_ms // fm))
+        s["end_ms_reported"] = rep_end_ms
+        if i1 <= i0:
+            continue
+        peak = max(levels[i0 : min(i0 + lead, i1)])
+        run = 0
+        last = i0
+        for i in range(i0, i1):
+            if levels[i] > peak:
+                peak = levels[i]
+            if levels[i] >= peak - SEGMENT_END_DROP_DB:
+                run = 0
+                last = i
+            else:
+                run += 1
+                if run >= hang:
+                    break
+        end_ms = min(rep_end_ms, (last + 1) * fm + SEGMENT_END_PAD_MS)
+        if end_ms != rep_end_ms:
+            s["end_ms"] = end_ms
+            moved += 1
+    return moved
 
 
 def run_whisper(
@@ -439,8 +595,12 @@ def main() -> int:
     print(f"downsampling mic → {mic_16k}")
     ffmpeg_downsample_wav(mic_src, mic_16k)
 
-    tap_stats = sample_content_check(tap_16k)
-    mic_stats = sample_content_check(mic_16k)
+    tap_samples, tap_rate = read_s16_mono(tap_16k)
+    mic_samples, mic_rate = read_s16_mono(mic_16k)
+    tap_stats = sample_content_check(tap_samples, tap_rate)
+    mic_stats = sample_content_check(mic_samples, mic_rate)
+    tap_levels = frame_levels_db(tap_samples, tap_rate, SEGMENT_END_FRAME_MS)
+    mic_levels = frame_levels_db(mic_samples, mic_rate, SEGMENT_END_FRAME_MS)
     print(
         f"tap  16k content: samples={tap_stats['samples']} "
         f"duration={tap_stats['duration_s']:.3f}s "
@@ -462,12 +622,24 @@ def main() -> int:
     mic_segs = run_whisper(mic_16k, model_path, whisper_cli, vad_model)
     print(f"mic segments: {len(mic_segs)}")
 
+    # Before the merge, so both tracks are on measured ends by the time they
+    # share a timeline, and before anything is written, so the database and
+    # the moments extracted from it inherit the corrected value rather than
+    # needing a backfill (SAA-147).
+    tap_moved = measure_segment_ends(tap_segs, tap_levels)
+    mic_moved = measure_segment_ends(mic_segs, mic_levels)
+    print(f"tap segment ends measured from audio: {tap_moved}/{len(tap_segs)} moved")
+    print(f"mic segment ends measured from audio: {mic_moved}/{len(mic_segs)} moved")
+
     merged = []
     for s in tap_segs:
         merged.append({
             "track": "them",
             "start_ms": s["start_ms"],
             "end_ms": s["end_ms"],
+            # Whisper's own value, kept so the correction is auditable and so
+            # a consumer can tell a measured end from an unmeasured one.
+            "end_ms_reported": s["end_ms_reported"],
             "text": s["text"],
         })
     for s in mic_segs:
@@ -475,6 +647,7 @@ def main() -> int:
             "track": "me",
             "start_ms": s["start_ms"],
             "end_ms": s["end_ms"],
+            "end_ms_reported": s["end_ms_reported"],
             "text": s["text"],
         })
     merged.sort(key=lambda x: (x["start_ms"], x["track"]))
@@ -495,11 +668,20 @@ def main() -> int:
     print(f"tap first: {tap_first}  tap last: {tap_last}")
     print(f"mic first: {mic_first}  mic last: {mic_last}")
 
-    def adjacency(segs: list[dict]):
+    def adjacency(segs: list[dict], key: str):
+        """Count pairs where one segment's end is the next one's start.
+
+        Reported against both the measured end and whisper's raw value: the
+        raw count is the defect SAA-147 records (98.1% on the worked example),
+        and the measured count is what is left after it. It does not go to
+        zero and should not — where one utterance runs into the next with no
+        silence between them, the end IS the next start, and that is the
+        correct value rather than the bug.
+        """
         m = d = 0
         samples = []
         for i in range(len(segs) - 1):
-            a = segs[i]["end_ms"]
+            a = segs[i][key]
             b = segs[i + 1]["start_ms"]
             if a == b:
                 m += 1
@@ -509,10 +691,14 @@ def main() -> int:
                     samples.append((i, a, b))
         return m, d, samples
 
-    tap_match, tap_diff, tap_samp = adjacency(tap_segs)
-    mic_match, mic_diff, mic_samp = adjacency(mic_segs)
-    print(f"tap adjacency: {tap_match} pairs match, {tap_diff} differ. sample diffs: {tap_samp}")
-    print(f"mic adjacency: {mic_match} pairs match, {mic_diff} differ. sample diffs: {mic_samp}")
+    for name, segs in (("tap", tap_segs), ("mic", mic_segs)):
+        raw_match, _, _ = adjacency(segs, "end_ms_reported")
+        match, diff, samp = adjacency(segs, "end_ms")
+        pairs = max(1, len(segs) - 1)
+        print(
+            f"{name} adjacency: {match} pairs match, {diff} differ "
+            f"(whisper's raw ends: {raw_match}/{pairs}). sample diffs: {samp}"
+        )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -533,6 +719,19 @@ def main() -> int:
             if vad_model is not None
             else None
         ),
+        # How segment ends were arrived at, on the same principle as `vad`
+        # above: a file says how it was made. A transcript written before
+        # SAA-147 has no `segment_end` key, and its `end_ms` values are
+        # whisper's `offsets.to` verbatim — which is the next speaker's start
+        # time wherever the utterance had no measured ending.
+        "segment_end": {
+            "method": "audio_level_decay",
+            "frame_ms": SEGMENT_END_FRAME_MS,
+            "drop_db": SEGMENT_END_DROP_DB,
+            "hang_ms": SEGMENT_END_HANG_MS,
+            "pad_ms": SEGMENT_END_PAD_MS,
+            "lead_ms": SEGMENT_END_LEAD_MS,
+        },
         "labels": labels,
         # Per-track sample statistics, measured above on the 16k copies that
         # Whisper actually reads. Persisted rather than only printed because
