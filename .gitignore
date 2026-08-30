@@ -3,3 +3,4 @@ recorder/systemtap/.build/
 recorder/miccap/.build/
 recorder/app/node_modules/
 recorder/app/dist/
+recorder/diagnostics/audioinuse
