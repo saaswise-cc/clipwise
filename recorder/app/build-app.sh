@@ -42,18 +42,20 @@ APP="$OUT_DIR/$APP_NAME.app"
 step() { printf '\n=== %s\n' "$*"; }
 
 # --- 1. helper binaries ---------------------------------------------------
-# All three are gitignored build outputs, so a fresh clone has none of them.
+# All four are gitignored build outputs, so a fresh clone has none of them.
 
 step "building helper binaries"
 (cd "$RECORDER_DIR" && swiftc -O audiodevs.swift -o audiodevs)
+(cd "$RECORDER_DIR" && swiftc -O micwatch.swift -o micwatch)
 swift build -c release --package-path "$RECORDER_DIR/systemtap"
 swift build -c release --package-path "$RECORDER_DIR/miccap"
 
 SYSTEMTAP_BIN="$RECORDER_DIR/systemtap/.build/release/systemtap"
 MICCAP_BIN="$RECORDER_DIR/miccap/.build/release/miccap"
 AUDIODEVS_BIN="$RECORDER_DIR/audiodevs"
+MICWATCH_BIN="$RECORDER_DIR/micwatch"
 
-for b in "$SYSTEMTAP_BIN" "$MICCAP_BIN" "$AUDIODEVS_BIN"; do
+for b in "$SYSTEMTAP_BIN" "$MICCAP_BIN" "$AUDIODEVS_BIN" "$MICWATCH_BIN"; do
     [ -x "$b" ] || { echo "build-app: missing $b after build" >&2; exit 1; }
 done
 
@@ -103,6 +105,9 @@ cp "$APP_SRC/identity-answer.js" "$C/Resources/app/identity-answer.js"
 install -m 755 "$SYSTEMTAP_BIN" "$C/Resources/bin/systemtap"
 install -m 755 "$MICCAP_BIN"    "$C/Resources/bin/miccap"
 install -m 755 "$AUDIODEVS_BIN" "$C/Resources/bin/audiodevs"
+# Call detection (SAA-113). A bundle without it still records on the hotkey;
+# main.js logs the absence and disables detection rather than failing to start.
+install -m 755 "$MICWATCH_BIN"  "$C/Resources/bin/micwatch"
 
 VERSION="$(/usr/bin/sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$APP_SRC/package.json" | head -1)"
 ELECTRON_VERSION="$(cat "$APP_SRC/node_modules/electron/dist/version")"

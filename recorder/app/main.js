@@ -75,6 +75,26 @@ const HOTKEY_STATUS = 'Control+Alt+Command+S';
 // time. The tray label still flips immediately; only the notification is held.
 const FLAP_NOTIFY_MIN_MS = 30000;
 
+// How long a detection prompt stays answerable (SAA-113). A prompt that is
+// never answered expires to "not now", which writes nothing — so this is the
+// window in which a durable answer can be given, not a deadline on the call.
+// Generous because the prompt arrives exactly when someone is joining a call
+// and has other things to do for the first minute of it.
+const DETECT_PROMPT_TTL_MS = 180000;
+
+// Minimum gap between prompts for the same application. Without it an app
+// that opens and closes the microphone repeatedly — a browser tab being
+// reloaded — would queue a prompt each time. A declined app going quiet and
+// noisy again inside this window is the same episode, not a new one.
+const DETECT_REPROMPT_MS = 120000;
+
+// Executable names belonging to Clipwise's own capture. miccap holds the
+// microphone for the whole of a recording, so without this the detector sees
+// its own capture and offers to record it — observed on the SAA-113 probe run
+// as exactly what Fathom does when it auto-starts on a call. Matched on the
+// executable name because these are bare SPM binaries with no bundle ID.
+const DETECT_SELF_EXES = new Set(['miccap', 'systemtap', 'audiodevs', 'micwatch']);
+
 // The tap is created with isMono=true, so its stream is one channel whatever
 // the output device carries. Recorded here because the tap track is headerless
 // PCM: a consumer cannot recover channel count from the file.
@@ -113,9 +133,19 @@ const MICCAP_BIN = BUILD_INFO
 const AUDIODEVS_BIN = BUILD_INFO
     ? path.join(BUNDLED_BIN, 'audiodevs')
     : path.join(RECORDER_DIR, 'audiodevs');
+const MICWATCH_BIN = BUILD_INFO
+    ? path.join(BUNDLED_BIN, 'micwatch')
+    : path.join(RECORDER_DIR, 'micwatch');
 
 const SUPPORT_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'clipwise');
 const OUTDIR = path.join(SUPPORT_DIR, 'recordings');
+
+// Which applications may start a capture, learned one answer at a time
+// (SAA-113). No list ships: this file does not exist until the first durable
+// answer is given. It lives beside the recordings rather than in the bundle
+// so it survives both an app restart and a rebuild — build-app.sh writes only
+// recorder/app/dist, and never touches this directory.
+const DETECT_STORE_PATH = path.join(SUPPORT_DIR, 'detected-apps.json');
 
 // The capture→moments pipeline. Run through the server's own tsx so the seam
 // always executes current source — a built dist would silently run whatever
@@ -190,6 +220,9 @@ const PIPELINE_PATH = [
 // --- state ----------------------------------------------------------------
 
 let tray = null;
+// Set once quitApp has started tearing down, so anything that restarts
+// itself on death — the detector — knows not to.
+let isQuitting = false;
 // 'stopped' | 'starting' | 'recording' | 'stalled'
 let state = 'stopped';
 let session = null;
@@ -212,6 +245,19 @@ let hotkeys = [];
 
 // Last time a recording↔stalled transition was allowed to notify.
 let lastFlapNotifyMs = 0;
+
+// Call detection (SAA-113). `detectApps` is the learned list, mirrored from
+// DETECT_STORE_PATH; `detectProc` is the micwatch subprocess; `detectPending`
+// is the prompt currently awaiting an answer, if any; `detectLastPrompt` maps
+// a bundle ID to when it was last asked about, for DETECT_REPROMPT_MS.
+//
+// detectPending is deliberately in memory only. It is the whole of the
+// "not now" answer: if this process dies, or the prompt is never answered, it
+// disappears and nothing was written. { key, name, pid, at, timer }
+let detectApps = null;
+let detectProc = null;
+let detectPending = null;
+const detectLastPrompt = new Map();
 
 // Identity prompts waiting to be shown, and the one on screen (SAA-114).
 // A queue rather than a single slot: two captures can stop before either is
@@ -600,6 +646,46 @@ function iconFor(s) {
 
 // --- tray -----------------------------------------------------------------
 
+// The learned list, and the way back from any answer given to it. This is what
+// makes "never ask" reversible rather than a trap, so it is not optional
+// decoration — a durable decline with no visible way to undo it would be the
+// worst outcome of the whole design.
+//
+// A control surface only: which applications may start a capture, and nothing
+// about meetings, recordings or transcripts. That is the line the milestone
+// guardrail draws, and it is the reason this is allowed to exist at all.
+function detectedAppsMenu() {
+    if (!detectApps) detectApps = loadDetectApps();
+    const keys = Object.keys(detectApps).sort((a, b) =>
+        (detectApps[a].name || a).localeCompare(detectApps[b].name || b));
+    if (keys.length === 0) {
+        return {
+            label: 'Detected applications',
+            submenu: [{ label: 'None yet — Clipwise asks the first time', enabled: false }],
+        };
+    }
+    return {
+        label: 'Detected applications',
+        submenu: keys.map(key => {
+            const entry = detectApps[key];
+            const label = entry.decision === 'record' ? 'Always record' : 'Never ask';
+            return {
+                label: `${entry.name || key} — ${label}`,
+                submenu: [
+                    { label: 'Always record', type: 'radio', checked: entry.decision === 'record',
+                      click: () => setAppDecision(key, 'record', entry.name) },
+                    { label: 'Never ask', type: 'radio', checked: entry.decision === 'never',
+                      click: () => setAppDecision(key, 'never', entry.name) },
+                    { type: 'separator' },
+                    // Back to unknown: the next time it uses the microphone
+                    // Clipwise asks again, as if it had never been answered.
+                    { label: 'Forget this app', click: () => setAppDecision(key, null) },
+                ],
+            };
+        }),
+    };
+}
+
 function renderTray() {
     const label = LABEL[state];
     const pipelineNote = pipeline ? PIPELINE_NOTE[pipeline.state] : null;
@@ -612,6 +698,9 @@ function renderTray() {
     const title = [
         state === 'stopped' ? '' : 'Rec',
         pipeline && pipeline.state === 'running' ? '⚙' : '',
+        // A live detection prompt is visible in the menu bar itself, so a
+        // notification that never appeared is still recoverable (Decision #17).
+        detectPending ? '?' : '',
         attention ? '⚠' : '',
     ].filter(Boolean).join(' ');
     tray.setImage(iconFor(state));
@@ -623,11 +712,24 @@ function renderTray() {
     ];
     if (pipelineNote) items.push({ label: pipelineNote, enabled: false });
     if (permNote) items.push({ label: permNote, enabled: false });
+    // The live prompt, carried here as well as in the notification. These are
+    // the same three answers; only the last one writes anything durable.
+    if (detectPending) {
+        const { key, name } = detectPending;
+        items.push(
+            { type: 'separator' },
+            { label: `${name} is using the microphone`, enabled: false },
+            { label: 'Record this call', click: () => answerDetectPrompt(key, 'record') },
+            { label: 'Not now', click: () => answerDetectPrompt(key, 'not_now') },
+            { label: `Never ask about ${name}`, click: () => answerDetectPrompt(key, 'never') },
+        );
+    }
     items.push(
         { type: 'separator' },
         { label: 'Start', enabled: !active, click: startRecording },
         { label: 'Stop',  enabled:  active, click: stopRecording },
     );
+    items.push({ type: 'separator' }, detectedAppsMenu());
     if (permissionIssue) {
         items.push({ type: 'separator' });
         for (const svc of permissionIssue.denied) {
@@ -774,6 +876,276 @@ function setState(next) {
     state = next;
     renderTray();
     if (prev !== next) notifyStateChange(prev, next);
+}
+
+// --- call detection (SAA-113) ---------------------------------------------
+//
+// A process starts using the microphone; if it is an application we have been
+// told to record, a capture starts; if we have never seen it, we ask. The
+// signal comes from micwatch, which holds no policy — everything below is the
+// policy, and all of it lives here rather than in the detector so that a
+// change to it does not mean rebuilding a Swift binary.
+//
+// The sequence is detect -> ask -> capture -> ask who was on it at stop. It is
+// deliberately not auto-record: a false positive costs a dismissable prompt
+// rather than a wrong recording, which is what makes a bundle-ID filter
+// adequate. Chrome cannot be distinguished from Chrome, so a browser voice
+// message looks exactly like a Meet call and always will.
+
+// A bundle ID where there is one, and the executable name where there is not.
+// miccap and the other bare binaries have no bundle ID, and two different
+// unbundled tools must not collapse onto the same empty key.
+function detectKey(ev) {
+    return ev.bundle ? ev.bundle : (ev.exe ? `exe:${ev.exe}` : null);
+}
+
+function detectName(ev) {
+    return ev.exe || ev.bundle || 'Unknown application';
+}
+
+function loadDetectApps() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(DETECT_STORE_PATH, 'utf8'));
+        if (raw && typeof raw === 'object' && raw.apps && typeof raw.apps === 'object') {
+            return raw.apps;
+        }
+        console.error('detect: store has no apps object — starting empty');
+    } catch (err) {
+        // ENOENT is the normal first-run state: no list ships, so the file
+        // does not exist until the first durable answer.
+        if (err.code !== 'ENOENT') console.error(`detect: store unreadable (${String(err)}) — starting empty`);
+    }
+    return {};
+}
+
+// Written whole and only on a deliberate answer. Nothing on this path is
+// reachable from a dismissed, ignored or expired prompt.
+function saveDetectApps() {
+    try {
+        fs.mkdirSync(SUPPORT_DIR, { recursive: true });
+        fs.writeFileSync(DETECT_STORE_PATH,
+            JSON.stringify({ version: 1, apps: detectApps }, null, 2) + '\n');
+        return true;
+    } catch (err) {
+        console.error(`detect: could not write store: ${String(err)}`);
+        return false;
+    }
+}
+
+function setAppDecision(key, decision, name) {
+    if (!detectApps) detectApps = loadDetectApps();
+    if (decision === null) delete detectApps[key];
+    else detectApps[key] = { decision, name: name || (detectApps[key] && detectApps[key].name) || key,
+                             updated_at: new Date().toISOString() };
+    saveDetectApps();
+    console.error(`detect: ${key} -> ${decision === null ? 'forgotten' : decision}`);
+    renderTray();
+}
+
+function appDecision(key) {
+    if (!detectApps) detectApps = loadDetectApps();
+    const e = detectApps[key];
+    return e ? e.decision : null;
+}
+
+// Clipwise's own capture, which holds the microphone for the whole recording.
+// Checked by executable name and by the PIDs of the children this process
+// spawned — the name alone would miss a renamed build, and the PIDs alone
+// would miss a capture left running by a previous instance.
+function isSelfCapture(ev) {
+    if (ev.exe && DETECT_SELF_EXES.has(ev.exe)) return true;
+    if (ev.pid === process.pid) return true;
+    if (session) {
+        for (const k of ['tap', 'mic', 'poller']) {
+            const child = session[k];
+            if (child && child.pid === ev.pid) return true;
+        }
+    }
+    return false;
+}
+
+// The prompt. Two surfaces on purpose.
+//
+// Architecture Decision #17 records that notification delivery is not reliably
+// observable: show() returning is not evidence anything appeared, and two
+// notifications during SAA-112 logged neither delivered nor failed. This
+// prompt is the only thing standing between a detected call and no recording,
+// so it cannot be the only surface.
+//
+// So the tray carries the same three choices for as long as the prompt is
+// live, and the tray title shows a marker. If the notification never appears,
+// the prompt is still there in the menu bar. If neither is noticed, the prompt
+// expires to "not now" — which writes nothing, so the next call asks again.
+// A missed prompt and a declined one are different states and only one of them
+// is durable.
+function promptForApp(ev, key) {
+    const name = detectName(ev);
+    detectLastPrompt.set(key, Date.now());
+    detectPending = {
+        key, name, pid: ev.pid, at: Date.now(),
+        timer: setTimeout(() => {
+            if (detectPending && detectPending.key === key) {
+                console.error(`detect: prompt for ${key} expired — treated as "not now", nothing written`);
+                detectPending = null;
+                renderTray();
+            }
+        }, DETECT_PROMPT_TTL_MS),
+    };
+    renderTray();
+    console.error(`detect: prompting for ${key} (pid ${ev.pid})`);
+
+    const title = 'Clipwise: record this call?';
+    const body = `${name} started using the microphone.`;
+    if (!Notification.isSupported()) {
+        notifyFallback(title, `${body} Choose from the Clipwise menu bar icon.`,
+            'Notification.isSupported() is false');
+        return;
+    }
+    try {
+        const n = new Notification({
+            title, body,
+            // macOS shows the first action as the button and the rest on the
+            // expanded alert. "Never" is last deliberately: it is the only
+            // durable decline and must not be the easy thing to hit.
+            actions: [
+                { type: 'button', text: 'Record' },
+                { type: 'button', text: 'Never ask about this app' },
+            ],
+            closeButtonText: 'Not now',
+        });
+        n.once('failed', (_e, err) => notifyFallback(title,
+            `${body} Choose from the Clipwise menu bar icon.`, String(err)));
+        n.once('show', () => console.error(`notify: delivered — ${title}`));
+        n.on('action', (_e, index) => {
+            if (index === 0) answerDetectPrompt(key, 'record');
+            else if (index === 1) answerDetectPrompt(key, 'never');
+        });
+        // Closing, ignoring or letting it time out are all the same answer,
+        // and that answer writes nothing. There is no 'close' handler here on
+        // purpose: there is nothing to do.
+        n.show();
+    } catch (err) {
+        notifyFallback(title, `${body} Choose from the Clipwise menu bar icon.`, String(err));
+    }
+}
+
+// The only path that writes durable state, and it is only ever reached from a
+// notification button or a tray click.
+function answerDetectPrompt(key, choice) {
+    if (!detectPending || detectPending.key !== key) {
+        console.error(`detect: answer "${choice}" for ${key} arrived with no live prompt — ignored`);
+        return;
+    }
+    const { name, timer } = detectPending;
+    clearTimeout(timer);
+    detectPending = null;
+
+    if (choice === 'not_now') {
+        console.error(`detect: "not now" for ${key} — nothing written`);
+        renderTray();
+        return;
+    }
+    if (choice === 'never') {
+        setAppDecision(key, 'never', name);
+        // The one line of explanation the design allows, and it belongs here
+        // rather than in the prompt: the prompt fires as a call is starting,
+        // which is the worst moment to ask anyone to read anything.
+        notify('Clipwise: will not ask about this app',
+            `${name} will no longer offer to record. Turn it back on from the Clipwise menu bar.`);
+        return;
+    }
+    if (choice === 'record') {
+        setAppDecision(key, 'record', name);
+        startRecording();
+    }
+}
+
+function handleDetectEvent(ev) {
+    if (ev.event === 'ready') {
+        console.error(`detect: micwatch ready (poll ${ev.poll_ms}ms)`);
+        return;
+    }
+    if (ev.event !== 'in_start') return;
+    if (isSelfCapture(ev)) {
+        console.error(`detect: ignoring own capture — ${ev.exe || ev.bundle} pid ${ev.pid}`);
+        return;
+    }
+    const key = detectKey(ev);
+    if (!key) return;
+
+    const decision = appDecision(key);
+    if (decision === 'never') {
+        console.error(`detect: ${key} is set to never ask — ignored`);
+        return;
+    }
+    // A capture already running is the answer to "should we record this".
+    if (state !== 'stopped' || session) {
+        console.error(`detect: ${key} started input while already ${state} — no action`);
+        return;
+    }
+    if (decision === 'record') {
+        console.error(`detect: ${key} is allowed — starting capture`);
+        notify('Clipwise: call detected', `${detectName(ev)} — starting a capture.`);
+        startRecording();
+        return;
+    }
+    if (detectPending) {
+        console.error(`detect: ${key} seen while a prompt for ${detectPending.key} is live — skipped`);
+        return;
+    }
+    const last = detectLastPrompt.get(key);
+    if (last && Date.now() - last < DETECT_REPROMPT_MS) {
+        console.error(`detect: ${key} asked about ${Math.round((Date.now() - last) / 1000)}s ago — not re-asking`);
+        return;
+    }
+    promptForApp(ev, key);
+}
+
+// Long-lived, and restarted if it dies: a detector that quietly stopped is the
+// same silent failure as an unregistered hotkey. Its death never touches a
+// capture in progress.
+let detectRestartTimer = null;
+function startDetector() {
+    if (detectProc || detectRestartTimer) return;
+    if (!fs.existsSync(MICWATCH_BIN)) {
+        console.error(`detect: ${MICWATCH_BIN} missing — call detection disabled`);
+        return;
+    }
+    let proc;
+    try {
+        proc = spawn(MICWATCH_BIN, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+        console.error(`detect: could not spawn micwatch: ${String(err)}`);
+        return;
+    }
+    detectProc = proc;
+    console.error(`detect: micwatch spawned pid=${proc.pid}`);
+    let buf = '';
+    proc.stdout.on('data', chunk => {
+        buf += chunk.toString('utf8');
+        let nl;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue;
+            let ev;
+            try { ev = JSON.parse(line); } catch { console.error(`detect: unparsed line ${line}`); continue; }
+            try { handleDetectEvent(ev); } catch (err) { console.error(`detect: handler threw ${String(err)}`); }
+        }
+    });
+    proc.stderr.on('data', d => console.error(`micwatch: ${d.toString('utf8').trim()}`));
+    proc.once('error', err => console.error(`detect: micwatch error ${String(err)}`));
+    proc.once('exit', (code, signal) => {
+        console.error(`detect: micwatch exited code=${code} signal=${signal}`);
+        if (detectProc === proc) detectProc = null;
+        if (isQuitting) return;
+        detectRestartTimer = setTimeout(() => { detectRestartTimer = null; startDetector(); }, 3000);
+    });
+}
+
+function stopDetector() {
+    if (detectRestartTimer) { clearTimeout(detectRestartTimer); detectRestartTimer = null; }
+    if (detectProc) { try { detectProc.kill('SIGTERM'); } catch {} detectProc = null; }
 }
 
 // --- pipeline -------------------------------------------------------------
@@ -1386,6 +1758,8 @@ function quitApp() {
     // until it was answered would make the prompt something a person has to
     // get past. That capture is unidentified — the same outcome as dismissing
     // the prompt, and correctable the same way.
+    isQuitting = true;
+    stopDetector();
     const stem = session && session.reachedRecording ? session.stem : null;
     if (state !== 'stopped') setState('stopped');
     globalShortcut.unregisterAll();
@@ -1525,11 +1899,15 @@ app.whenReady().then(() => {
     // the pass itself runs in another process — but ordering it here means a
     // throw from it can never cost the user their tray icon.
     startRecovery('app launch');
+    // After the tray, for the same reason: call detection must never be able
+    // to cost someone their menu bar icon. A missing or crashing micwatch
+    // disables detection and changes nothing else.
+    startDetector();
 });
 
 // quitApp calls app.exit, which skips will-quit — so the unregister is done in
 // both places. macOS drops them on process death anyway; this is for the case
 // where it does not get that far.
-app.on('will-quit', () => { globalShortcut.unregisterAll(); });
+app.on('will-quit', () => { isQuitting = true; stopDetector(); globalShortcut.unregisterAll(); });
 
 app.on('window-all-closed', (e) => { e.preventDefault?.(); });
