@@ -136,6 +136,29 @@ SEGMENT_END_PAD_MS = 80
 # appears. Seeding from the whole window instead lets a later burst of
 # cross-talk set the reference and silence the real speech under it.
 SEGMENT_END_LEAD_MS = 500
+# How far above the track's own noise floor the drop threshold is allowed to
+# sink (SAA-149). `peak - SEGMENT_END_DROP_DB` is relative to the speech in the
+# segment, and on a quiet onset it lands *under* the room tone: every frame
+# then counts as speech, no silence run can begin, and the hang is never
+# reached — 73.11 s recorded for a 0.39 s utterance. Clamping the threshold to
+# `floor + this` puts a bound under the relative rule.
+#
+# Bounded from both sides by measurement over 2201 segments on two captures,
+# scoring each end against the speech-stop measured independently at -35 dBFS,
+# and centred between them:
+#
+#   below  18 dB. Ends still run past the speech-stop: eight of SAA-149's nine
+#          long spans land, the ninth is +1.24 s out, and at 15 dB one segment
+#          is cut 4.94 s short.
+#   above  20 dB. The threshold reaches into speech: 11 segments end early,
+#          worst 1.56 s, rising to 31 at 21 dB. Erring high costs span
+#          accuracy, erring low costs words, and words are not recoverable.
+#
+# At 19 all nine land at exactly +0.08 s — one SEGMENT_END_PAD_MS past the
+# measured speech-stop — and nothing on either capture is cut. The window
+# either side is 1 dB, narrower than the hang's, so these are the two numbers
+# to re-measure on a microphone whose room tone sits closer to its speech.
+SEGMENT_END_FLOOR_MARGIN_DB = 19.0
 # Frame level assigned to digital silence, so log(0) never arises.
 SEGMENT_END_FLOOR_DB = -90.0
 
@@ -363,6 +386,42 @@ def frame_levels_db(samples: array, rate: int, frame_ms: int) -> list[float]:
     return out
 
 
+def track_noise_floor(levels: list[float]) -> float:
+    """The modal 20 ms level of a track's room tone, in dBFS.
+
+    A percentile cannot do this job. The fraction of a call spent speaking
+    swings from 18% to 46% across the two captures SAA-149 was measured on,
+    so any fixed quantile slides between room tone and speech with it — the
+    same defect SAA-137 records in `floorRms`, where a threshold derived from
+    the track's own content tracks how much the person talked. The level
+    histogram is bimodal on every track measured here (room tone at -63 and
+    -54 dBFS on the two microphones, -85 and -87 on the two taps), and the
+    position of the quiet mode does not move with how often the loud one is
+    occupied.
+
+    The search is restricted to frames at or below the median so a track that
+    is mostly speech cannot return the speech mode. Digital silence is
+    excluded: it is the absence of a signal, not the level of one, and on a
+    tap track it is 20% of frames and would drag the estimate to the sentinel.
+    """
+    room = [v for v in levels if v > SEGMENT_END_FLOOR_DB]
+    if not room:
+        return SEGMENT_END_FLOOR_DB
+    ordered = sorted(room)
+    mid = len(ordered) // 2
+    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+    hist: dict[int, int] = {}
+    for v in room:
+        if v <= median:
+            b = int(round(v))
+            hist[b] = hist.get(b, 0) + 1
+    if not hist:
+        return SEGMENT_END_FLOOR_DB
+    # Ties to the quieter bin: a floor estimated low leaves the relative rule
+    # in charge, which is the behaviour that shipped.
+    return float(max(hist.items(), key=lambda kv: (kv[1], -kv[0]))[0])
+
+
 def measure_segment_ends(segs: list[dict], levels: list[float]) -> int:
     """Replace each segment's end with the point where its speech stops.
 
@@ -403,6 +462,7 @@ def measure_segment_ends(segs: list[dict], levels: list[float]) -> int:
     fm = SEGMENT_END_FRAME_MS
     hang = max(1, SEGMENT_END_HANG_MS // fm)
     lead = max(1, SEGMENT_END_LEAD_MS // fm)
+    threshold_floor = track_noise_floor(levels) + SEGMENT_END_FLOOR_MARGIN_DB
     moved = 0
     for s in segs:
         start_ms, rep_end_ms = s["start_ms"], s["end_ms"]
@@ -414,16 +474,37 @@ def measure_segment_ends(segs: list[dict], levels: list[float]) -> int:
         peak = max(levels[i0 : min(i0 + lead, i1)])
         run = 0
         last = i0
+        started = False
         for i in range(i0, i1):
             if levels[i] > peak:
                 peak = levels[i]
-            if levels[i] >= peak - SEGMENT_END_DROP_DB:
+            if levels[i] >= max(peak - SEGMENT_END_DROP_DB, threshold_floor):
+                started = True
                 run = 0
                 last = i
-            else:
+            elif started:
+                # Silence only counts once speech has been found. Without this
+                # the clamp is destructive on the case it was built to fix: a
+                # segment that opens with more silence than the hang has its
+                # run complete before `last` ever advances, and the whole
+                # utterance collapses to start + one frame + the pad. Two
+                # segments across the two captures open that way, by 11.72 s
+                # and 2.84 s, and the first is the 13.83 s span that is the
+                # longest on the capture SAA-149 records as already correct —
+                # it would have been cut to 0.10 s. Seeding `peak` low masked
+                # this, because a threshold under the room tone can never
+                # accumulate silence — the same accident that produced the
+                # 73-second span.
                 run += 1
                 if run >= hang:
                     break
+        if not started:
+            # Nothing in the window rose above the floor, so this segment has
+            # no measurable speech to end. Keep whisper's value rather than
+            # invent one: it is what the scan already returned here by running
+            # to the window end, and a floor estimated too high must not be
+            # able to erase an utterance.
+            continue
         end_ms = min(rep_end_ms, (last + 1) * fm + SEGMENT_END_PAD_MS)
         if end_ms != rep_end_ms:
             s["end_ms"] = end_ms
@@ -731,6 +812,11 @@ def main() -> int:
             "hang_ms": SEGMENT_END_HANG_MS,
             "pad_ms": SEGMENT_END_PAD_MS,
             "lead_ms": SEGMENT_END_LEAD_MS,
+            "floor_margin_db": SEGMENT_END_FLOOR_MARGIN_DB,
+            "floor_db": {
+                "tap": track_noise_floor(tap_levels),
+                "mic": track_noise_floor(mic_levels),
+            },
         },
         "labels": labels,
         # Per-track sample statistics, measured above on the 16k copies that
