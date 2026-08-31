@@ -23,8 +23,12 @@
 // reader can split on newlines without a parser for partial input.
 //
 //   {"event":"ready","poll_ms":1000}
-//   {"event":"in_start","t":"…","pid":982,"bundle":"com.google.Chrome.helper","exe":"Google Chrome Helper"}
-//   {"event":"in_stop","t":"…","pid":982,"bundle":"…","exe":"…"}
+//   {"event":"in_start","t":"…","pid":982,"bundle":"com.google.Chrome.helper","exe":"Google Chrome Helper","path":"/Applications/Google Chrome.app/…/Google Chrome Helper"}
+//   {"event":"in_stop","t":"…","pid":982,"bundle":"…","exe":"…","path":"…"}
+//
+// `path` is the full executable path. It is reported because the bundle ID and
+// the executable name of a helper process both name the helper — the parent
+// application is only recoverable from the path.
 //
 // in_stop is also emitted when a process that was using the microphone exits,
 // since its process object simply disappears from the list.
@@ -79,10 +83,14 @@ func bundleOf(_ obj: AudioObjectID) -> String {
     return st == noErr ? (v as String) : ""
 }
 
-func execOf(_ pid: pid_t) -> String {
+func pathOf(_ pid: pid_t) -> String {
     var buf = [CChar](repeating: 0, count: 4096)
     guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return "" }
-    return (String(cString: buf) as NSString).lastPathComponent
+    return String(cString: buf)
+}
+
+func execOf(_ pid: pid_t) -> String {
+    (pathOf(pid) as NSString).lastPathComponent
 }
 
 func jsonString(_ s: String) -> String {
@@ -106,7 +114,7 @@ func emit(_ fields: [(String, String)]) {
     print("{" + fields.map { "\(jsonString($0.0)):\($0.1)" }.joined(separator: ",") + "}")
 }
 
-struct Proc { let pid: pid_t; let bundle: String; let exe: String }
+struct Proc { let pid: pid_t; let bundle: String; let exe: String; let path: String }
 
 setvbuf(stdout, nil, _IOLBF, 0)
 
@@ -115,7 +123,8 @@ if CommandLine.arguments.dropFirst().first == "--once" {
     for o in processObjects() where isRunningInput(o) {
         guard let p = pidOf(o) else { continue }
         emit([("event", jsonString("in_now")), ("pid", "\(p)"),
-              ("bundle", jsonString(bundleOf(o))), ("exe", jsonString(execOf(p)))])
+              ("bundle", jsonString(bundleOf(o))), ("exe", jsonString(execOf(p))),
+              ("path", jsonString(pathOf(p)))])
     }
     exit(0)
 }
@@ -142,13 +151,16 @@ func tick() {
         let running = isRunningInput(o)
         if running && active[o] == nil {
             guard let p = pidOf(o) else { continue }
-            let pr = Proc(pid: p, bundle: bundleOf(o), exe: execOf(p))
+            let full = pathOf(p)
+            let pr = Proc(pid: p, bundle: bundleOf(o), exe: (full as NSString).lastPathComponent, path: full)
             active[o] = pr
             emit([("event", jsonString("in_start")), ("t", jsonString(now)), ("pid", "\(pr.pid)"),
-                  ("bundle", jsonString(pr.bundle)), ("exe", jsonString(pr.exe))])
+                  ("bundle", jsonString(pr.bundle)), ("exe", jsonString(pr.exe)),
+                  ("path", jsonString(pr.path))])
         } else if !running, let pr = active.removeValue(forKey: o) {
             emit([("event", jsonString("in_stop")), ("t", jsonString(now)), ("pid", "\(pr.pid)"),
-                  ("bundle", jsonString(pr.bundle)), ("exe", jsonString(pr.exe))])
+                  ("bundle", jsonString(pr.bundle)), ("exe", jsonString(pr.exe)),
+                  ("path", jsonString(pr.path))])
         }
     }
     // A process that exited while using the microphone loses its process
@@ -156,7 +168,8 @@ func tick() {
     for (o, pr) in active where !seen.contains(o) {
         active.removeValue(forKey: o)
         emit([("event", jsonString("in_stop")), ("t", jsonString(now)), ("pid", "\(pr.pid)"),
-              ("bundle", jsonString(pr.bundle)), ("exe", jsonString(pr.exe))])
+              ("bundle", jsonString(pr.bundle)), ("exe", jsonString(pr.exe)),
+              ("path", jsonString(pr.path))])
     }
 }
 

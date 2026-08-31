@@ -259,6 +259,11 @@ let detectProc = null;
 let detectPending = null;
 const detectLastPrompt = new Map();
 
+// Which application keys are using the microphone right now, maintained from
+// micwatch's in_start/in_stop pairs. Only needed to answer one question: when
+// an answer arrives after its prompt has lapsed, is the call still going?
+const detectActive = new Map();
+
 // Identity prompts waiting to be shown, and the one on screen (SAA-114).
 // A queue rather than a single slot: two captures can stop before either is
 // answered, and replacing the open window would silently drop the first
@@ -719,7 +724,7 @@ function renderTray() {
         items.push(
             { type: 'separator' },
             { label: `${name} is using the microphone`, enabled: false },
-            { label: 'Record this call', click: () => answerDetectPrompt(key, 'record') },
+            { label: 'Always record this app', click: () => answerDetectPrompt(key, 'record') },
             { label: 'Not now', click: () => answerDetectPrompt(key, 'not_now') },
             { label: `Never ask about ${name}`, click: () => answerDetectPrompt(key, 'never') },
         );
@@ -899,7 +904,25 @@ function detectKey(ev) {
     return ev.bundle ? ev.bundle : (ev.exe ? `exe:${ev.exe}` : null);
 }
 
+// The name a person would recognise, derived from the executable path rather
+// than guessed from a table. Audio runs in helper processes, so both the
+// bundle ID and the executable name describe the helper: Chrome's microphone
+// is "Google Chrome Helper" / com.google.Chrome.helper, and Fathom's is
+// "Fathom Helper". The parent application is the FIRST .app component of the
+// path, which is exactly what those two nest inside:
+//
+//   /Applications/Google Chrome.app/Contents/Frameworks/…/Google Chrome Helper.app/…
+//   /Applications/Fathom.app/Contents/Frameworks/Fathom Helper.app/…
+//
+// A process in no bundle at all — ffmpeg from Homebrew — has no .app in its
+// path and keeps its own name, which is the honest answer for it. Only the
+// displayed name changes; the bundle ID remains the matching key, so nothing
+// about which process matched is affected by this.
 function detectName(ev) {
+    const full = ev.path || '';
+    for (const part of full.split('/')) {
+        if (part.endsWith('.app')) return part.slice(0, -4);
+    }
     return ev.exe || ev.bundle || 'Unknown application';
 }
 
@@ -964,6 +987,22 @@ function isSelfCapture(ev) {
     return false;
 }
 
+// Take the notification off the screen. An alert-style notification stays up
+// until it is acted on, so without this an expired prompt leaves a clickable
+// thing on screen whose backing state is gone — observed: prompted 15:34:22,
+// expired 15:37:22, "record" clicked 15:40:02 and silently discarded.
+//
+// close() is the first line of defence and not the only one, for the same
+// reason notify() has a fallback: nothing here can prove the notification
+// actually went away. answerDetectPrompt therefore also handles an answer
+// that arrives with no live prompt, rather than assuming this worked.
+function withdrawPrompt(p) {
+    if (!p || !p.notification) return;
+    try { p.notification.close(); } catch (err) {
+        console.error(`detect: could not withdraw notification: ${String(err)}`);
+    }
+}
+
 // The prompt. Two surfaces on purpose.
 //
 // Architecture Decision #17 records that notification delivery is not reliably
@@ -986,6 +1025,7 @@ function promptForApp(ev, key) {
         timer: setTimeout(() => {
             if (detectPending && detectPending.key === key) {
                 console.error(`detect: prompt for ${key} expired — treated as "not now", nothing written`);
+                withdrawPrompt(detectPending);
                 detectPending = null;
                 renderTray();
             }
@@ -994,8 +1034,13 @@ function promptForApp(ev, key) {
     renderTray();
     console.error(`detect: prompting for ${key} (pid ${ev.pid})`);
 
-    const title = 'Clipwise: record this call?';
-    const body = `${name} started using the microphone.`;
+    // The buttons say what they do. Both write a durable rule for the
+    // application, so neither is labelled as being about this one call —
+    // "Record" over a rule that means "always record" is the same mismatch
+    // as a decline that silently becomes permanent. Recording a single call
+    // without deciding anything is what "Not now" plus the hotkey is for.
+    const title = `Clipwise: ${name} is using the microphone`;
+    const body = 'Record calls from this app?';
     if (!Notification.isSupported()) {
         notifyFallback(title, `${body} Choose from the Clipwise menu bar icon.`,
             'Notification.isSupported() is false');
@@ -1008,7 +1053,7 @@ function promptForApp(ev, key) {
             // expanded alert. "Never" is last deliberately: it is the only
             // durable decline and must not be the easy thing to hit.
             actions: [
-                { type: 'button', text: 'Record' },
+                { type: 'button', text: 'Always record' },
                 { type: 'button', text: 'Never ask about this app' },
             ],
             closeButtonText: 'Not now',
@@ -1024,6 +1069,8 @@ function promptForApp(ev, key) {
         // and that answer writes nothing. There is no 'close' handler here on
         // purpose: there is nothing to do.
         n.show();
+        // Kept so the prompt can be taken down again when it lapses.
+        if (detectPending && detectPending.key === key) detectPending.notification = n;
     } catch (err) {
         notifyFallback(title, `${body} Choose from the Clipwise menu bar icon.`, String(err));
     }
@@ -1031,14 +1078,35 @@ function promptForApp(ev, key) {
 
 // The only path that writes durable state, and it is only ever reached from a
 // notification button or a tray click.
+//
+// An answer can arrive after its prompt has lapsed, because withdrawPrompt
+// cannot prove the notification left the screen. Discarding it silently is
+// what lost a capture: a person clicked a visible button and nothing
+// happened, with no way to tell that from a recording that had started.
+//
+// So a late answer is honoured rather than dropped. Both durable answers are
+// about the application rather than about one call, so neither is made wrong
+// by arriving three minutes later — "never ask about this app" means the same
+// thing whenever it is clicked. What lateness changes is only whether there is
+// still a call to record, and that is checked rather than assumed.
+//
+// This does not alter what the expiry itself does. Expiry is still "not now"
+// and still writes nothing; it is a subsequent deliberate click that writes,
+// exactly as it would have inside the window.
 function answerDetectPrompt(key, choice) {
-    if (!detectPending || detectPending.key !== key) {
-        console.error(`detect: answer "${choice}" for ${key} arrived with no live prompt — ignored`);
-        return;
+    const live = !!(detectPending && detectPending.key === key);
+    let name;
+    if (live) {
+        name = detectPending.name;
+        clearTimeout(detectPending.timer);
+        withdrawPrompt(detectPending);
+        detectPending = null;
+    } else {
+        const known = detectApps && detectApps[key];
+        const active = detectActive.get(key);
+        name = (active && active.name) || (known && known.name) || key;
+        console.error(`detect: answer "${choice}" for ${key} arrived after its prompt lapsed`);
     }
-    const { name, timer } = detectPending;
-    clearTimeout(timer);
-    detectPending = null;
 
     if (choice === 'not_now') {
         console.error(`detect: "not now" for ${key} — nothing written`);
@@ -1056,13 +1124,39 @@ function answerDetectPrompt(key, choice) {
     }
     if (choice === 'record') {
         setAppDecision(key, 'record', name);
-        startRecording();
+        if (live) {
+            startRecording();
+            return;
+        }
+        // Late. If the application is still holding the microphone the call is
+        // still going, so the click means what it said and the capture starts.
+        if (detectActive.has(key)) {
+            notify('Clipwise: starting now',
+                `That prompt had lapsed, but ${name} is still using the microphone — recording now.`);
+            startRecording();
+            return;
+        }
+        // The call is genuinely over, which is the case the expiry exists for.
+        // Nothing is recorded — there is nothing left to record — and the one
+        // thing that must not happen is silence about it.
+        notify('Clipwise: that prompt had lapsed',
+            `${name} is no longer using the microphone, so nothing was recorded. `
+            + 'Clipwise will record it automatically from now on.');
     }
 }
 
 function handleDetectEvent(ev) {
     if (ev.event === 'ready') {
+        // A restarted detector has no memory of what was running, and neither
+        // should this: anything still holding the microphone reports again on
+        // its first poll.
+        detectActive.clear();
         console.error(`detect: micwatch ready (poll ${ev.poll_ms}ms)`);
+        return;
+    }
+    if (ev.event === 'in_stop') {
+        const stopKey = detectKey(ev);
+        if (stopKey) detectActive.delete(stopKey);
         return;
     }
     if (ev.event !== 'in_start') return;
@@ -1072,8 +1166,22 @@ function handleDetectEvent(ev) {
     }
     const key = detectKey(ev);
     if (!key) return;
+    const name = detectName(ev);
+    detectActive.set(key, { pid: ev.pid, name });
 
     const decision = appDecision(key);
+    // Refresh a stored display name once a better one can be derived. Entries
+    // written before the name came from the bundle path still read "Google
+    // Chrome Helper", and the tray would go on showing that forever because an
+    // application that is not running offers no path to derive from. Display
+    // only: the key, the decision and everything matched on are untouched.
+    const known = detectApps && detectApps[key];
+    if (known && known.name !== name) {
+        console.error(`detect: display name for ${key} refreshed "${known.name}" -> "${name}"`);
+        known.name = name;
+        saveDetectApps();
+        renderTray();
+    }
     if (decision === 'never') {
         console.error(`detect: ${key} is set to never ask — ignored`);
         return;
