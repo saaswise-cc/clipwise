@@ -164,10 +164,23 @@ set_key CFBundleExecutable      string "$APP_NAME"
 set_key CFBundleIdentifier      string "$BUNDLE_ID"
 set_key CFBundleShortVersionString string "$VERSION"
 set_key CFBundleVersion         string "$VERSION"
-# Menu bar only. main.js already calls app.dock.hide(), but that runs after the
-# app is up: without this key a login launch flashes a Dock icon and steals
-# focus from whatever the user is doing.
-set_key LSUIElement             bool   true
+# SAA-105 EXPERIMENT, 2026-09-01 — temporarily false. Revert to restore.
+#
+# Normally true: menu bar only. The paired app.dock.hide() in main.js runs
+# after the app is up, so without this key a login launch flashes a Dock icon
+# and steals focus from whatever the user is doing. That cost is real and is
+# being paid deliberately for the duration of this experiment.
+#
+# Clipwise is evicted from a full menu bar; Granola and Fathom are not. Both
+# are Electron, both use a plain Tray, and none of the three carries a
+# persisted status item position — so agent status is the only structural
+# difference left between us and them. This flips that one variable.
+#
+# This key and main.js's app.dock.hide() are two halves of one setting. Moving
+# only this one changes nothing: the runtime call would put the app straight
+# back into accessory policy and the experiment would read as a clean negative
+# having never run.
+set_key LSUIElement             bool   false
 # Core Audio Taps floor, not Electron's 12.0.
 set_key LSMinimumSystemVersion  string "14.2"
 # The text macOS puts in the permission prompt. The capture runs in spawned

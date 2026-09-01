@@ -2054,7 +2054,15 @@ function registerHotkeys() {
 // --- app boot -------------------------------------------------------------
 
 app.whenReady().then(() => {
-    if (app.dock) app.dock.hide();
+    // SAA-105 EXPERIMENT, 2026-09-01 — the paired half of LSUIElement in
+    // build-app.sh. Normally this line is `if (app.dock) app.dock.hide();`
+    // and Clipwise is an agent app. Revert to restore it.
+    //
+    // Removed rather than left in place because it sets the activation policy
+    // at runtime: with it here the app returns to accessory whatever the plist
+    // declares, and the experiment would report a clean negative without ever
+    // having tested anything. The plist decides what the app launches as; this
+    // decides what it is a moment later. They only mean something together.
     tray = new Tray(iconFor('stopped'));
     setState('stopped');
     registerHotkeys();
