@@ -113,20 +113,46 @@ func assertGeometry() {
             + "resizing a bar")
     }
 
-    // (2) the tray mark's bar count now tracks the logo's, rather than
-    // simplifying it. If the logo changes count, this fires.
+    // (2) the SHIPPED tray mark's bar count still tracks the logo's. It is a
+    // redrawn approximation, so its count is an independent number that can
+    // drift; this is what catches that.
     let barCount = svg.components(separatedBy: "<rect").count - 1 - 1  // minus the tile
     if barCount != LOGO_BAR_COUNT {
         problems.append(
-            "the tray mark draws \(TRAY_BAR_COUNT) bars to match a \(LOGO_BAR_COUNT)-bar logo, "
-            + "but the logo now has \(barCount). Redraw the tray mark to match rather than "
-            + "letting the two marks diverge again")
+            "the shipped tray mark draws \(TRAY_BAR_COUNT) bars to match a \(LOGO_BAR_COUNT)-bar "
+            + "logo, but the logo now has \(barCount). Redraw it to match rather than letting "
+            + "the two marks diverge again")
     }
     if TRAY_BAR_COUNT != LOGO_BAR_COUNT {
         problems.append(
-            "the tray mark draws \(TRAY_BAR_COUNT) bars where the logo has \(LOGO_BAR_COUNT). "
-            + "They appear side by side in the notification and the menu bar; the counts match "
-            + "on purpose")
+            "the shipped tray mark draws \(TRAY_BAR_COUNT) bars where the logo has "
+            + "\(LOGO_BAR_COUNT). They appear side by side in the notification and the menu "
+            + "bar; the counts match on purpose")
+    }
+
+    // (2b) the PROPOSED tray mark does not need a count check, because it has
+    // no count of its own: drawLogoTrayMark iterates SVG_BARS directly, so a
+    // fifth bar in the SVG becomes a fifth bar in the tray with no edit here.
+    // What it does need is for the box it scales into to be the mark rather
+    // than the tile — the whole meaning of "minus the tile" — and for the dot
+    // to be inside that box rather than clipped by it.
+    if MARK_X0 != 10 || MARK_X1 != 38 || MARK_Y0 != 5 || MARK_Y1 != 30 {
+        problems.append(
+            "the proposed tray mark scales the box x\(fmt(MARK_X0))..\(fmt(MARK_X1)), "
+            + "y\(fmt(MARK_Y0))..\(fmt(MARK_Y1)) into the menu bar slot. That was the union of "
+            + "the bars and the dot when this was written; if the mark moved, re-read it rather "
+            + "than trusting these bounds")
+    }
+    if MARK_X0 == 0 || MARK_Y0 == 0 || MARK_X1 == SVG_SIDE || MARK_Y1 == SVG_SIDE {
+        problems.append(
+            "the proposed tray mark's box touches the tile edge, which means it is scaling the "
+            + "TILE and not the mark. Dropping the tile is the point")
+    }
+    // The dot is the distinctive half and it must survive the crop in every
+    // state, stopped included.
+    if SVG_DOT.cx + SVG_DOT.r > MARK_X1 || SVG_DOT.cy - SVG_DOT.r < MARK_Y0 {
+        problems.append("the proposed tray mark would clip the dot, which is the half of the "
+                        + "logo that makes it Clipwise rather than a signal meter")
     }
 
     // (3) what the tray keeps, and must keep.
@@ -146,7 +172,9 @@ func assertGeometry() {
     }
     print("  geometry check: app icon matches the SVG exactly, bar for bar; "
           + "tallest bar equidistant (\(fmt(above)) above, \(fmt(below)) below); "
-          + "tray mark matches the logo at \(TRAY_BAR_COUNT) bars")
+          + "shipped tray mark matches the logo at \(TRAY_BAR_COUNT) bars; "
+          + "proposed tray mark derives from the SVG (box "
+          + "\(fmt(MARK_W))x\(fmt(MARK_H)) units, \(SVG_BARS.count) bars + dot, tile dropped)")
 }
 
 func fmt(_ v: CGFloat) -> String {
@@ -269,6 +297,11 @@ enum TrayState: String, CaseIterable {
         case .recording, .stalled: return .filled
         }
     }
+    /// The SVG-derived mark keeps the dot in EVERY state, stopped included. It
+    /// is the distinctive half of the logo, and a resting icon without it reads
+    /// as a generic signal meter rather than as Clipwise. State therefore lives
+    /// in the dot's fill rather than in its presence.
+    var logoDot: DotKind { self == .starting ? .ring : .filled }
     /// The colour-variant dot, matching main.js's existing DOT table.
     var dotHex: (Double, Double, Double) {
         switch self {
@@ -369,6 +402,123 @@ func writeTrayMark(state: TrayState, scale: Int, mono: Bool, path: String) {
     let ctx = newContext(16 * scale, 16 * scale)
     drawTrayMark(ctx, state: state, scale: scale, mono: mono)
     writePNG(ctx, path)
+}
+
+// --- 2b. the PROPOSED tray mark: the logo's own geometry, minus the tile ----
+//
+// Everything above this line is a redrawn approximation of the mark: bars
+// invented at 2px on a 3px pitch so every edge lands on a whole pixel. This is
+// the alternative — the mark exactly as it sits inside the app icon, tile
+// dropped, scaled to fill the 16pt slot. Nothing is reinterpreted: every number
+// below is read out of SVG_BARS and SVG_DOT, so the tray mark and the app icon
+// are the same drawing at two sizes.
+//
+// Not wired in. These render into tray-proposed/ and nothing loads them; the
+// shipped tray/ marks are untouched.
+//
+// The mark's bounding box is the union of the bars and the dot — NOT the 40x40
+// tile, which is exactly what "minus the tile" means. Bars span x10..30, the
+// dot x30..38; bars span y10..30, the dot y5..13. So 28 wide by 25 tall, which
+// is wider than it is tall: fitting that into a square slot is width-bound, and
+// the mark sits vertically centred with the spare height as air.
+let MARK_X0: CGFloat = min(SVG_BARS.map { $0.x }.min()!, SVG_DOT.cx - SVG_DOT.r)
+let MARK_X1: CGFloat = max(SVG_BARS.map { $0.x + $0.w }.max()!, SVG_DOT.cx + SVG_DOT.r)
+let MARK_Y0: CGFloat = min(SVG_BARS.map { $0.y }.min()!, SVG_DOT.cy - SVG_DOT.r)
+let MARK_Y1: CGFloat = max(SVG_BARS.map { $0.y + $0.h }.max()!, SVG_DOT.cy + SVG_DOT.r)
+let MARK_W = MARK_X1 - MARK_X0
+let MARK_H = MARK_Y1 - MARK_Y0
+
+/// `flatAlpha` drops the logo's per-bar opacities (0.6/0.8/1.0/0.7) and draws
+/// every bar solid. Off by default because the opacities are part of the same
+/// drawing; exposed because at 16pt they are the difference between a mark and
+/// a smudge, and that is a judgement for whoever picks between these.
+func drawLogoTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool,
+                      flatAlpha: Bool = false, geometryOnly: Bool = false) {
+    let S = CGFloat(16 * scale)
+    let k = min(S / MARK_W, S / MARK_H)   // width-bound at 16/28
+    let offX = (S - MARK_W * k) / 2
+    let offY = (S - MARK_H * k) / 2
+    ctx.saveGState()
+    // y-down, so every number below reads straight off the SVG.
+    ctx.translateBy(x: 0, y: S)
+    ctx.scaleBy(x: 1, y: -1)
+
+    let barRGB: (Double, Double, Double) = mono ? (0, 0, 0) : state.barColour
+    for b in SVG_BARS {
+        // geometryOnly measures edge softness: alpha is either 0 or 1, so any
+        // value between them is antialiasing and nothing else.
+        let a = (flatAlpha || geometryOnly) ? 1.0 : b.a
+        ctx.setFillColor(red: barRGB.0, green: barRGB.1, blue: barRGB.2, alpha: a)
+        roundedRect(ctx, CGRect(x: offX + (b.x - MARK_X0) * k,
+                                y: offY + (b.y - MARK_Y0) * k,
+                                width: b.w * k, height: b.h * k),
+                    (b.w / 2) * k)
+        ctx.fillPath()
+    }
+
+    let dotRGB: (Double, Double, Double) = mono ? (0, 0, 0) : state.dotHex
+    ctx.setFillColor(red: dotRGB.0, green: dotRGB.1, blue: dotRGB.2, alpha: 1)
+    ctx.setStrokeColor(red: dotRGB.0, green: dotRGB.1, blue: dotRGB.2, alpha: 1)
+    let r = SVG_DOT.r * k
+    let c = CGPoint(x: offX + (SVG_DOT.cx - MARK_X0) * k,
+                    y: offY + (SVG_DOT.cy - MARK_Y0) * k)
+    switch state.logoDot {
+    case .filled, .none:
+        ctx.fillEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
+    case .ring:
+        // Stroke width kept proportional (0.44r) rather than pinned to 1px, so
+        // the ring is the same drawing at both scales like everything else. It
+        // leaves a hole 56% of the dot's diameter at either size.
+        let lw = r * 0.44
+        ctx.setLineWidth(lw)
+        ctx.strokeEllipse(in: CGRect(x: c.x - r + lw / 2, y: c.y - r + lw / 2,
+                                     width: (r - lw / 2) * 2, height: (r - lw / 2) * 2))
+    }
+    ctx.restoreGState()
+}
+
+func writeLogoTrayMark(state: TrayState, scale: Int, mono: Bool, path: String) {
+    let ctx = newContext(16 * scale, 16 * scale)
+    drawLogoTrayMark(ctx, state: state, scale: scale, mono: mono)
+    writePNG(ctx, path)
+}
+
+// --- the softness check ----------------------------------------------------
+//
+// True proportions at 16pt put bar edges on fractional pixels. This counts how
+// many, rather than asserting it either way: with alpha forced to 0-or-1, every
+// pixel that comes back partially transparent is antialiasing and nothing else.
+func softnessReport(_ label: String, _ draw: (CGContext, Int) -> Void) {
+    for scale in [1, 2] {
+        let px = 16 * scale
+        let ctx = newContext(px, px)
+        draw(ctx, scale)
+        let img = ctx.makeImage()!
+        var buf = [UInt8](repeating: 0, count: px * px * 4)
+        let rc = CGContext(data: &buf, width: px, height: px, bitsPerComponent: 8,
+                           bytesPerRow: px * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        rc.draw(img, in: CGRect(x: 0, y: 0, width: px, height: px))
+        // Split at the dot's left edge. A circle is antialiased at any size and
+        // in any drawing, so lumping it in with the bars would blame fractional
+        // positioning for curvature. The bars are the part under question.
+        let split = Int(((SVG_DOT.cx - SVG_DOT.r - MARK_X0) / MARK_W * CGFloat(px)).rounded())
+        var solid = [0, 0], partial = [0, 0]
+        for y in 0..<px {
+            for x in 0..<px {
+                let a = Int(buf[(y * px + x) * 4 + 3])
+                let g = x < split ? 0 : 1   // 0 = bars, 1 = dot
+                if a >= 250 { solid[g] += 1 } else if a > 5 { partial[g] += 1 }
+            }
+        }
+        func pct(_ i: Int) -> Double {
+            let t = solid[i] + partial[i]
+            return t == 0 ? 0 : Double(partial[i]) * 100 / Double(t)
+        }
+        print(String(format:
+            "    %@ @%dx:  bars %d solid / %d soft (%.0f%%)   dot %d solid / %d soft (%.0f%%)",
+            label, scale, solid[0], partial[0], pct(0), solid[1], partial[1], pct(1)))
+    }
 }
 
 // --- 3. the preview sheet --------------------------------------------------
@@ -652,6 +802,155 @@ func buildPreviewSheet(path: String) {
     writePNG(ctx, path)
 }
 
+/// A proposed-mark image at true device size, with template inversion applied
+/// where the background calls for it — same treatment trayImage gives the
+/// shipped mark, so the two are comparable rather than merely adjacent.
+func logoTrayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool,
+                   flatAlpha: Bool = false) -> CGImage {
+    let px = 16 * scale
+    let mctx = newContext(px, px)
+    drawLogoTrayMark(mctx, state: state, scale: scale, mono: mono, flatAlpha: flatAlpha)
+    let img = mctx.makeImage()!
+    guard mono && dark else { return img }
+    let inv = newContext(px, px)
+    inv.clip(to: CGRect(x: 0, y: 0, width: CGFloat(px), height: CGFloat(px)), mask: img)
+    inv.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+    inv.fill(CGRect(x: 0, y: 0, width: CGFloat(px), height: CGFloat(px)))
+    return inv.makeImage()!
+}
+
+// --- 3b. the proposal sheet ------------------------------------------------
+//
+// One question: does the logo's own geometry survive 16pt? Everything here is
+// blitted 1:1 at 16 and 32 device pixels on the dark menu bar, with the same
+// drawn neighbours as the other sheet so the weight comparison is against
+// something real. The last block is the only one that scales anything, and it
+// says so — nearest-neighbour, purely to make the antialiasing visible.
+func buildProposedSheet(path: String) {
+    let W: CGFloat = 1180, H: CGFloat = 1140
+    let ctx = newContext(Int(W), Int(H))
+    ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+    ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+    var top: CGFloat = 24
+    func Y(_ t: CGFloat) -> CGFloat { H - t }
+
+    text(ctx, "Clipwise tray mark — the logo's own geometry against the current approximation — SAA-130",
+         x: 24, baseline: Y(top + 16), size: 17, dark: false, bold: true)
+    top += 25
+    text(ctx, "CURRENT is redrawn: bars invented at 2px on a 3px pitch so every edge lands on a whole pixel, and no dot at rest.  NEW is the mark exactly as it sits in the",
+         x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
+    top += 16
+    text(ctx, "app icon — four bars at their real widths, heights and spacing, plus the dot at its real size and position — tile dropped, scaled to fill the 16pt slot.",
+         x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
+    top += 16
+    text(ctx, "The mark's box is 28x25 units (bars x10..30 and the dot x30..38; bars y10..30 and the dot y5..13), so it is wider than tall and the fit is width-bound at 16/28.",
+         x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
+    top += 16
+    text(ctx, "NEW KEEPS THE DOT IN EVERY STATE, stopped included. State lives in the dot: hollow for starting, filled for the rest, colour hybrid otherwise unchanged.",
+         x: 24, baseline: Y(top + 12), size: 11.5, dark: false, bold: true)
+    top += 26
+
+    let colStart: CGFloat = 150, colStep: CGFloat = 200, gap: CGFloat = 62
+
+    func stateHeader(_ tag: (TrayState) -> String) {
+        for (i, st) in TrayState.allCases.enumerated() {
+            let x = colStart + CGFloat(i) * colStep
+            text(ctx, st.rawValue, x: x, baseline: Y(top + 10), size: 11, dark: false, bold: true)
+            text(ctx, tag(st), x: x + 62, baseline: Y(top + 10), size: 9, dark: false)
+            text(ctx, "1x", x: x, baseline: Y(top + 23), size: 9.5, dark: false)
+            text(ctx, "2x", x: x + gap, baseline: Y(top + 23), size: 9.5, dark: false)
+        }
+        text(ctx, "neighbours", x: W - 210, baseline: Y(top + 10), size: 11, dark: false, bold: true)
+        top += 29
+    }
+
+    /// One dark menu bar strip with a row of marks on it.
+    func strip(_ label: String, _ image: (TrayState, Int) -> CGImage) {
+        let stripH: CGFloat = 46
+        ctx.setFillColor(red: MENUBAR_DARK.r, green: MENUBAR_DARK.g, blue: MENUBAR_DARK.b, alpha: 1)
+        ctx.fill(CGRect(x: 24, y: Y(top + stripH), width: W - 48, height: stripH))
+        text(ctx, label, x: 34, baseline: Y(top + 27), size: 10, dark: true)
+        for (i, st) in TrayState.allCases.enumerated() {
+            for scale in [1, 2] {
+                let px = CGFloat(16 * scale)
+                let x = (colStart + CGFloat(i) * colStep + (scale == 2 ? gap : 0)).rounded()
+                let yb = (Y(top + stripH) + (stripH - px) / 2).rounded()
+                ctx.saveGState(); ctx.interpolationQuality = .none
+                ctx.draw(image(st, scale), in: CGRect(x: x, y: yb, width: px, height: px))
+                ctx.restoreGState()
+            }
+        }
+        drawNeighbours(ctx, x: W - 210,
+                       yBottom: (Y(top + stripH) + (stripH - 32) / 2).rounded(),
+                       s: 2, dark: true)
+        top += stripH + 6
+    }
+
+    // ---- block A: the hybrid, as each state would actually appear ----------
+    text(ctx, "AS IT WOULD APPEAR  —  the shipped hybrid: stopped and starting are template, recording and stalled are colour.  Dark menu bar, blitted 1:1.",
+         x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
+    top += 24
+    stateHeader { hybridIsMono($0) ? "template" : "colour" }
+    strip("current") { st, sc in
+        trayImage(state: st, scale: sc, mono: hybridIsMono(st), dark: true) }
+    strip("new") { st, sc in
+        logoTrayImage(state: st, scale: sc, mono: hybridIsMono(st), dark: true) }
+    top += 22
+
+    // ---- block B: monochrome, so the comparison is ink and nothing else ----
+    text(ctx, "MONOCHROME TEMPLATE  —  every state as alpha only, so the comparison is ink and geometry with no colour to carry it.",
+         x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
+    top += 24
+    stateHeader { _ in "template" }
+    strip("current") { st, sc in trayImage(state: st, scale: sc, mono: true, dark: true) }
+    strip("new") { st, sc in logoTrayImage(state: st, scale: sc, mono: true, dark: true) }
+    strip("new, flat alpha") { st, sc in
+        logoTrayImage(state: st, scale: sc, mono: true, dark: true, flatAlpha: true) }
+    text(ctx, "The logo gives its bars descending opacities (0.6 / 0.8 / 1.0 / 0.7). \"new\" keeps them, because they are part of the same drawing. \"new, flat alpha\" drops",
+         x: 24, baseline: Y(top + 12), size: 11, dark: false)
+    top += 15
+    text(ctx, "them and is shown only so the cost of keeping them is visible — it is not a third proposal, and nothing here picks between the two.",
+         x: 24, baseline: Y(top + 12), size: 11, dark: false)
+    top += 26
+
+    // ---- block C: the fractional-pixel question, made visible -------------
+    text(ctx, "THE FRACTIONAL-PIXEL QUESTION  —  8x and 4x nearest-neighbour blow-ups of the SAME pixels above. This is the only block that scales anything.",
+         x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
+    top += 22
+    text(ctx, "True proportions do not land on the pixel grid: a 5.5-unit bar pitch becomes 3.14px at 16pt. The current mark avoids that by construction; this is what it costs.",
+         x: 24, baseline: Y(top + 12), size: 11, dark: false)
+    top += 22
+
+    let tile: CGFloat = 128
+    var bx: CGFloat = 150
+    // stopped and starting first: in the proposed mark those two differ ONLY by
+    // whether the dot is filled or hollow, so that pair is the whole
+    // distinguishability question and it belongs where it can be seen.
+    for st in [TrayState.stopped, TrayState.starting, TrayState.recording] {
+        var col = bx
+        for (lbl, isNew, scale) in [("current 1x", false, 1), ("new 1x", true, 1),
+                                    ("current 2x", false, 2), ("new 2x", true, 2)] {
+            text(ctx, lbl, x: col, baseline: Y(top + 10), size: 9.5, dark: false,
+                 bold: isNew)
+            let img = isNew
+                ? logoTrayImage(state: st, scale: scale, mono: hybridIsMono(st), dark: true)
+                : trayImage(state: st, scale: scale, mono: hybridIsMono(st), dark: true)
+            ctx.setFillColor(red: MENUBAR_DARK.r, green: MENUBAR_DARK.g, blue: MENUBAR_DARK.b, alpha: 1)
+            ctx.fill(CGRect(x: col, y: Y(top + 16 + tile), width: tile, height: tile))
+            ctx.saveGState(); ctx.interpolationQuality = .none
+            ctx.draw(img, in: CGRect(x: col, y: Y(top + 16 + tile), width: tile, height: tile))
+            ctx.restoreGState()
+            col += tile + 14
+        }
+        text(ctx, st.rawValue, x: 24, baseline: Y(top + 16 + tile / 2), size: 11,
+             dark: false, bold: true)
+        top += tile + 30
+        bx = 150
+    }
+
+    writePNG(ctx, path)
+}
+
 // --- main ------------------------------------------------------------------
 
 assertGeometry()
@@ -690,3 +989,77 @@ print("  wrote \(count) tray marks into tray/")
 
 buildPreviewSheet(path: "preview/tray-preview.png")
 print("  wrote preview/tray-preview.png")
+
+// The proposed mark. Written to its own directory and loaded by nothing —
+// build-app.sh copies tray/, not this. Choosing between the two is a separate
+// decision, and this pass deliberately does not make it.
+try? FileManager.default.createDirectory(atPath: "tray-proposed",
+                                         withIntermediateDirectories: true)
+var proposed = 0
+for st in TrayState.allCases {
+    for scale in [1, 2] {
+        let suffix = scale == 2 ? "@2x" : ""
+        writeLogoTrayMark(state: st, scale: scale, mono: true,
+                          path: "tray-proposed/\(st.rawValue)Template\(suffix).png")
+        writeLogoTrayMark(state: st, scale: scale, mono: false,
+                          path: "tray-proposed/\(st.rawValue)\(suffix).png")
+        proposed += 2
+    }
+}
+print("  wrote \(proposed) proposed marks into tray-proposed/ (wired into nothing)")
+
+buildProposedSheet(path: "preview/tray-proposed.png")
+print("  wrote preview/tray-proposed.png")
+
+// The fractional-pixel question, answered in numbers rather than adjectives.
+// Alpha is forced to 0-or-1 so anything in between is antialiasing.
+print("  edge softness, geometry only (alpha forced to 0 or 1), bars and dot counted apart:")
+// `recording` for the current mark, because that is its only state with a
+// filled dot — comparing against a stopped mark that has no dot at all would
+// flatter it. The proposed mark has a dot in every state, which is the point.
+softnessReport("current  recording") { c, s in
+    drawTrayMark(c, state: .recording, scale: s, mono: true) }
+softnessReport("proposed recording") { c, s in
+    drawLogoTrayMark(c, state: .recording, scale: s, mono: true, geometryOnly: true) }
+softnessReport("proposed stopped  ") { c, s in
+    drawLogoTrayMark(c, state: .stopped, scale: s, mono: true, geometryOnly: true) }
+
+// Does the hollow dot still read as hollow? In the proposed mark, filled-vs-
+// hollow is the ONLY thing separating stopped from starting, so if the hole
+// closes up at 16pt those two states collapse. Measured as the alpha at the
+// dot's centre against the alpha on its rim: a real ring is a big gap, a soft
+// blob is a small one.
+print("  hollow-dot legibility — stopped (filled) against starting (ring):")
+for scale in [1, 2] {
+    let px = 16 * scale
+    func centreAlpha(_ st: TrayState) -> (Int, Int) {
+        let ctx = newContext(px, px)
+        drawLogoTrayMark(ctx, state: st, scale: scale, mono: true, geometryOnly: true)
+        var buf = [UInt8](repeating: 0, count: px * px * 4)
+        let rc = CGContext(data: &buf, width: px, height: px, bitsPerComponent: 8,
+                           bytesPerRow: px * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        rc.draw(ctx.makeImage()!, in: CGRect(x: 0, y: 0, width: px, height: px))
+        let S = CGFloat(px)
+        let k = min(S / MARK_W, S / MARK_H)
+        let offY = (S - MARK_H * k) / 2
+        let cx = Int(((SVG_DOT.cx - MARK_X0) * k).rounded())
+        // y-down in the drawing, but the buffer's row 0 is the top row too.
+        let cy = Int((offY + (SVG_DOT.cy - MARK_Y0) * k).rounded())
+        func alpha(_ x: Int, _ y: Int) -> Int {
+            guard x >= 0, y >= 0, x < px, y < px else { return 0 }
+            return Int(buf[(y * px + x) * 4 + 3])
+        }
+        // Sample the rim ON the stroke, not inside the hole: the stroke sits at
+        // radius r - lw/2 where lw = 0.44r, i.e. 0.78r.
+        let strokeR = Int((SVG_DOT.r * k * 0.78).rounded())
+        return (alpha(cx, cy), alpha(cx, max(0, cy - strokeR)))   // centre, rim
+    }
+    let f = centreAlpha(.stopped), h = centreAlpha(.starting)
+    print(String(format:
+        "    @%dx: filled — centre a=%d, rim a=%d   |   hollow — centre a=%d, rim a=%d",
+        scale, f.0, f.1, h.0, h.1))
+    print(String(format:
+        "          the ring's own ink is %d/255; its hole is %d/255 below the filled dot's centre",
+        h.1, f.0 - h.0))
+}
