@@ -646,6 +646,9 @@ function dotIcon(hex) {
     return nativeImage.createFromBuffer(png, { scaleFactor: 2 });
 }
 
+// Still here, and still the state palette — the drawn assets below use these
+// same four hex values, and dotIcon remains the fallback when an asset cannot
+// be read.
 const DOT = {
     stopped:   '#8E8E93',
     starting:  '#FF9F0A',
@@ -653,9 +656,70 @@ const DOT = {
     stalled:   '#FFD60A',
 };
 
+// --- the drawn marks (SAA-130) --------------------------------------------
+//
+// A hybrid, not a single variant, and the split is deliberate:
+//
+//   stopped    template   the resting state, and the one the icon spends
+//   starting   template   almost all its life in. Its neighbours in the menu
+//                         bar are all monochrome, so it should sit among them
+//                         quietly and follow the bar from light to dark.
+//   recording  colour     colour means "this needs you". Red while recording
+//   stalled    colour     is macOS's own idiom, and yellow says attention.
+//
+// The colour variant was measured as nearly invisible in the stopped state —
+// grey bars on a grey bar — and that is exactly the state in which finding
+// Clipwise in the menu bar is already a known problem (SAA-105).
+//
+// Mixing the two on one Tray is only possible because template-ness is a
+// property of each NativeImage rather than of the Tray. Confirmed rather than
+// assumed, on both layers: AppKit redraws the same status item's button as
+// colour -> template -> colour with no latching, and Electron preserves each
+// image's flag across four alternating setImage calls. Tray exposes no
+// template API at all, which is the structural reason there is nothing to
+// latch.
+//
+// Both full variants stay on disk. Switching to all-template or all-colour is
+// this table, and nothing else.
+const TRAY_VARIANT = {
+    stopped:   'template',
+    starting:  'template',
+    recording: 'colour',
+    stalled:   'colour',
+};
+
+const TRAY_ASSET_DIR = BUILD_INFO
+    ? path.resolve(__dirname, '..', 'tray')
+    : path.join(__dirname, 'assets', 'tray');
+
+// createFromPath picks up the @2x sibling on its own — verified, the loaded
+// image reports scaleFactors [1,2] where a file with no sibling reports [1].
+// So only the base name is ever named here.
+function loadTrayIcon(s) {
+    const template = TRAY_VARIANT[s] === 'template';
+    const file = path.join(TRAY_ASSET_DIR, `${s}${template ? 'Template' : ''}.png`);
+    let img = null;
+    try {
+        img = nativeImage.createFromPath(file);
+    } catch (err) {
+        console.error(`tray: ${file} failed to load: ${String(err)}`);
+    }
+    // createFromPath does NOT throw on a missing or unreadable file: it returns
+    // an EMPTY image, and an empty image renders as no menu bar icon at all.
+    // That is the same shape of silent failure this whole area keeps producing,
+    // so it is checked rather than trusted, and the generated dot is still here
+    // to fall back to. A plain icon beats an invisible one.
+    if (!img || img.isEmpty()) {
+        console.error(`tray: ${file} missing or empty — falling back to the generated dot`);
+        return dotIcon(DOT[s]);
+    }
+    img.setTemplateImage(template);
+    return img;
+}
+
 const ICON = {};
 function iconFor(s) {
-    if (!ICON[s]) ICON[s] = dotIcon(DOT[s]);
+    if (!ICON[s]) ICON[s] = loadTrayIcon(s);
     return ICON[s];
 }
 

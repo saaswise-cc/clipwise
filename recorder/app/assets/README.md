@@ -45,8 +45,17 @@ Wired into `build-app.sh`, which copies the `.icns` into `Resources/` and sets
   * `<state>.png` / `@2x` — fixed colour, using the same dot palette
     `main.js`'s `DOT` table already uses.
 
-The tray mark drops the tile. A 16pt orange square with four bars inside it is
-a blob, and a coloured tile cannot be a template image.
+The tray mark drops the tile and uses **three** bars, not the logo's four. A
+16pt orange square with bars inside it is a blob, and a coloured tile cannot be
+a template image at all. Four 2px bars with gaps were mostly white space and
+read at roughly half the weight of the battery and wifi glyphs beside them;
+three 3px bars in the same 11px span carry the same identity — it is
+bars-and-a-dot, and the count was never the load-bearing part — for about 30%
+more ink (`stoppedTemplate.png` went from 48 to 63 opaque pixels).
+
+This divergence from the logo is deliberate and applies only to the tray. The
+app icon keeps all four bars: it is rendered large enough for them and it should
+be the brand mark rather than an interpretation of it.
 
 State is encoded on two channels, so it survives monochrome where hue does not
 exist:
@@ -61,14 +70,63 @@ exist:
 Recording is the only state with varied bars, because recording-or-not is the
 distinction that has to be readable without comparing against anything.
 
-**Nothing in `main.js` uses these yet.** `iconFor` still generates its coloured
-dot at runtime. Choosing between the two variants is a design decision that has
-not been made, and wiring one in would make it silently.
+## The hybrid
+
+`iconFor` in `main.js` selects per state, via a single `TRAY_VARIANT` table:
+
+| state | variant | why |
+|-----------|----------|---------------------------------------------------|
+| stopped | template | the resting state; sits quietly among monochrome neighbours and follows the bar |
+| starting | template | same |
+| recording | colour | red while recording is macOS's own idiom |
+| stalled | colour | yellow says something needs attention |
+
+Colour-stopped was nearly invisible on the preview sheet — grey bars on a grey
+bar — and that is the state the icon spends almost all its life in, on a menu
+bar where finding Clipwise is already a known problem (SAA-105).
+
+Mixing variants on one `Tray` works because template-ness belongs to each
+`NativeImage`, not to the `Tray` — which exposes no template API at all.
+Confirmed on both layers rather than assumed: AppKit redraws one status item's
+button colour -> template -> colour with no latching, and Electron preserves
+each image's flag across four alternating `setImage` calls.
+
+Both full variants stay on disk. Switching to all-template or all-colour is that
+table and nothing else; no regeneration needed.
+
+`createFromPath` loads the `@2x` sibling automatically (the loaded image reports
+`scaleFactors [1,2]`), so only base names appear in the code. It returns an
+*empty* image for a missing file rather than throwing, and an empty tray image
+is no menu bar icon at all — so `loadTrayIcon` checks `isEmpty()` and falls back
+to the generated dot, which is why `dotIcon` and `DOT` are still there.
+
+`build-app.sh` copies `tray/` into `Contents/Resources/tray` and fails if all
+sixteen files do not arrive.
+
+## Unresolved: highlight
+
+macOS inverts a template image when the menu bar item is highlighted; a colour
+image is not inverted. A hybrid could therefore highlight inconsistently between
+states. **This was not established.** The status item button reports
+`cell.isHighlighted = true` when asked, but renders identical pixels through
+`cacheDisplay()`, so the highlight fill is painted outside the button's own
+drawing path and that instrument cannot see it. `screencapture` is refused
+(Screen Recording is not granted), so the menu bar could not be photographed
+with a menu open. Settle it by opening the Clipwise menu in each state and
+looking.
 
 ## Preview
 
-`preview/tray-preview.png` — every state, both variants, at true 16 and 32
-device pixels, on light and dark menu bar backgrounds, with drawn neighbour
-glyphs at the same scale for weight comparison. Nothing on the mark path is
-scaled. The neighbours are drawn rather than screenshotted so the sheet carries
-none of whatever was on the real menu bar at the time.
+`preview/tray-preview.png` — four blocks, all at true 16 and 32 device pixels on
+light and dark menu bar backgrounds, with drawn neighbour glyphs at the same
+scale:
+
+  1. **Weight** — the superseded four-bar mark beside the new three-bar one, so
+     the change is judgeable rather than asserted.
+  2. **Monochrome template**, full variant.
+  3. **Colour**, full variant.
+  4. **The hybrid as wired.**
+
+Nothing on the mark path is scaled. The neighbours are drawn rather than
+screenshotted so the sheet carries none of whatever was on the real menu bar at
+the time.

@@ -105,7 +105,17 @@ else
   exit 1
 fi
 
-mkdir -p "$C/Resources/app" "$C/Resources/bin"
+mkdir -p "$C/Resources/app" "$C/Resources/bin" "$C/Resources/tray"
+# The tray marks (SAA-130). main.js resolves these at Resources/tray when it is
+# running from a bundle, and falls back to a generated dot if one cannot be
+# read — but a bundle that ships without them is a bundle whose menu bar icon
+# silently degrades, so the copy is checked here rather than left to chance.
+cp "$APP_SRC/assets/tray/"*.png "$C/Resources/tray/"
+TRAY_COUNT=$(ls -1 "$C/Resources/tray/" | wc -l | tr -d ' ')
+if [ "$TRAY_COUNT" -ne 16 ]; then
+  echo "build-app: expected 16 tray marks (4 states x template/colour x 1x/2x), got $TRAY_COUNT" >&2
+  exit 1
+fi
 cp "$APP_SRC/main.js" "$C/Resources/app/main.js"
 # The identity prompt's page (SAA-114). main.js loads it by path relative to
 # itself, so a bundle without it has a stop that silently identifies nothing.

@@ -40,28 +40,75 @@ let SVG_BARS: [(x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, a: CGFloat)] = [
 ]
 let SVG_DOT = (cx: CGFloat(34), cy: CGFloat(7), r: CGFloat(4))
 
-// Fails loudly if someone edits the SVG without editing this file.
+// The tray mark is a SIMPLIFICATION of the logo, not a copy of it: three bars
+// where the logo has four. That divergence is deliberate — at 16pt, four 2px
+// bars separated by gaps are mostly white space and the mark read at roughly
+// half the weight of the battery and wifi glyphs beside it.
+//
+// So the check below can no longer be "the tray matches the SVG". It asserts
+// the relationship instead, in three parts:
+//
+//   1. The APP ICON still matches the SVG exactly, bar for bar. It is drawn
+//      large enough for four bars and it should be the brand mark, not an
+//      interpretation of it. Any drift there is a bug.
+//   2. The SVG still has exactly LOGO_BAR_COUNT bars. The three-bar tray mark
+//      was derived from a four-bar logo; if the logo becomes three bars or
+//      five, the simplification has to be reconsidered rather than silently
+//      inherited, so this fires.
+//   3. The invariants the tray does NOT diverge on — the orange, and the
+//      presence of a status dot — still hold. Those carry the identity that
+//      survives the simplification.
+//
+// Deleting this check because it became inconvenient would be worse than never
+// having had it, which is why it grew rather than went away.
+let LOGO_BAR_COUNT = 4
+let TRAY_BAR_COUNT = 3
+
 func assertGeometry() {
     let path = "clipwise-mark.svg"
     guard let svg = try? String(contentsOfFile: path, encoding: .utf8) else {
         FileHandle.standardError.write("render: cannot read \(path)\n".data(using: .utf8)!)
         exit(1)
     }
-    var missing: [String] = []
-    func need(_ needle: String) { if !svg.contains(needle) { missing.append(needle) } }
-    need("viewBox=\"0 0 40 40\"")
-    need("rx=\"9\"")
-    need("#F4620A")
-    need("#F5C842")
-    for b in SVG_BARS { need("x=\"\(fmt(b.x))\" y=\"\(fmt(b.y))\"") }
-    need("cx=\"34\" cy=\"7\" r=\"4\"")
-    if !missing.isEmpty {
-        FileHandle.standardError.write(
-            "render: clipwise-mark.svg no longer matches this file. Missing: \(missing)\n"
-                .data(using: .utf8)!)
+    var problems: [String] = []
+    func need(_ needle: String, _ why: String) {
+        if !svg.contains(needle) { problems.append("\(why): expected \(needle)") }
+    }
+
+    // (1) app icon fidelity — every bar, exactly.
+    need("viewBox=\"0 0 40 40\"", "app icon geometry")
+    need("rx=\"9\"", "app icon tile corner")
+    for b in SVG_BARS {
+        need("x=\"\(fmt(b.x))\" y=\"\(fmt(b.y))\"", "app icon bar")
+    }
+    need("cx=\"34\" cy=\"7\" r=\"4\"", "app icon dot")
+
+    // (2) the premise the simplification rests on.
+    let barCount = svg.components(separatedBy: "<rect").count - 1 - 1  // minus the tile
+    if barCount != LOGO_BAR_COUNT {
+        problems.append(
+            "the tray mark simplifies \(LOGO_BAR_COUNT) logo bars down to \(TRAY_BAR_COUNT), "
+            + "but the logo now has \(barCount). Re-derive the tray mark rather than assuming "
+            + "\(TRAY_BAR_COUNT) still reads as the same brand")
+    }
+
+    // (3) what the tray keeps, and must keep.
+    need("#F4620A", "shared identity: brand orange")
+    if !svg.contains("<circle") {
+        problems.append("shared identity: the logo lost its status dot, which the tray mark uses "
+                        + "to carry capture state")
+    }
+    need("#F5C842", "app icon dot colour")
+
+    if !problems.isEmpty {
+        let msg = "render: clipwise-mark.svg and render.swift have diverged in a way that is "
+            + "NOT the intended simplification.\n  - "
+            + problems.joined(separator: "\n  - ") + "\n"
+        FileHandle.standardError.write(msg.data(using: .utf8)!)
         exit(1)
     }
-    print("  geometry check: clipwise-mark.svg matches render.swift")
+    print("  geometry check: app icon matches the SVG exactly; "
+          + "tray mark is the intended \(LOGO_BAR_COUNT)->\(TRAY_BAR_COUNT) simplification")
 }
 
 func fmt(_ v: CGFloat) -> String {
@@ -149,11 +196,21 @@ func drawAppIcon(_ px: Int, _ path: String) {
 // Recording is the one state with varied bars, because recording-or-not is the
 // distinction that matters most and it should be readable without comparison.
 //
-// Bars are pixel-hinted rather than scaled: 2px wide on a 3px pitch at @1x,
+// THREE bars, not the logo's four. At 16pt four 2px bars with gaps between
+// them are mostly white space, and the mark read at roughly half the visual
+// weight of the battery and wifi glyphs it sits beside. Three bars at 3px in
+// the same 11px span carry the same identity — it is bars-and-a-dot, and the
+// count was never the load-bearing part — with half again as much ink.
+//
+// Bars are pixel-hinted rather than scaled: 3px wide on a 4px pitch at @1x,
 // doubled at @2x, so every bar edge lands on a whole pixel at both scales. A
-// proportional scale of the SVG puts 1.4px bars on half-pixel boundaries and
-// they turn to grey mush at @1x. The dot is drawn as a real circle with
-// antialiasing, because a hinted 4px circle is a plus sign.
+// proportional scale of the SVG puts fractional bars on half-pixel boundaries
+// and they turn to grey mush at @1x. The dot is drawn as a real circle with
+// antialiasing, because a hinted small circle is a plus sign.
+//
+// `legacy` reproduces the four-bar mark exactly as it stood at eeb3ad2, so the
+// preview sheet can put the two side by side. A claim that the mark got
+// heavier is worth nothing without the old one beside it.
 
 enum TrayState: String, CaseIterable {
     case stopped, starting, recording, stalled
@@ -186,7 +243,8 @@ enum DotKind { case none, ring, filled }
 
 /// Draws the mark into `ctx` at the origin, `scale` = 1 or 2.
 /// `mono` draws pure black (alpha carries the shape; AppKit inverts it).
-func drawTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool) {
+func drawTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool,
+                  legacy: Bool = false) {
     let s = CGFloat(scale)
     let side = 16 * s
     ctx.saveGState()
@@ -194,16 +252,17 @@ func drawTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool) {
     ctx.translateBy(x: 0, y: side)
     ctx.scaleBy(x: 1, y: -1)
 
-    // Bars: 4 bars, 2px wide, 1px gap, occupying x 0..10 at @1x.
-    let barW = 2 * s
-    let pitch = 3 * s
+    // Three bars, 3px wide on a 4px pitch, filling the same x 0..10 span the
+    // four-bar version used — the mark's footprint is unchanged, its ink is not.
+    let count = legacy ? 4 : TRAY_BAR_COUNT
+    let barW = (legacy ? 2 : 3) * s
+    let pitch = (legacy ? 3 : 4) * s
     let baseline = 14 * s  // bar bottoms, 1px of air beneath at @1x
-    // Heights from the SVG's ratios (10,15,20,13 of 20) mapped onto 12px max.
-    let variedH: [CGFloat] = [6, 9, 12, 7]
-    // Flat is half height, not a stub. Rendered at actual size, 3px bars were
-    // a faint smudge next to a battery glyph that fills the slot — the mark
-    // has to hold its own in the bar, and three of the four states are flat.
-    let flatH: CGFloat = 6
+    // A peak off dead centre, echoing the logo's own tallest-bar-third-of-four.
+    let variedH: [CGFloat] = legacy ? [6, 9, 12, 7] : [8, 13, 10]
+    // Flat sits below every varied height, so the silhouette differs on all
+    // three bars rather than on one of them.
+    let flatH: CGFloat = legacy ? 6 : 7
 
     if mono {
         ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)
@@ -211,7 +270,7 @@ func drawTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool) {
         let c = state.barColour
         ctx.setFillColor(red: c.0, green: c.1, blue: c.2, alpha: 1)
     }
-    for i in 0..<4 {
+    for i in 0..<count {
         let h = (state.barsVaried ? variedH[i] : flatH) * s
         let x = CGFloat(i) * pitch
         // Whole-pixel rect, no rounding: a 2px bar with a 1px radius is a
@@ -329,10 +388,11 @@ func text(_ ctx: CGContext, _ str: String, x: CGFloat, baseline: CGFloat,
 
 /// A tray mark rendered into its own bitmap at true device size, with the
 /// template inversion applied when the background calls for it.
-func trayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool) -> CGImage {
+func trayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool,
+               legacy: Bool = false) -> CGImage {
     let px = 16 * scale
     let mctx = newContext(px, px)
-    drawTrayMark(mctx, state: state, scale: scale, mono: mono)
+    drawTrayMark(mctx, state: state, scale: scale, mono: mono, legacy: legacy)
     let img = mctx.makeImage()!
     guard mono && dark else { return img }
     // What AppKit does to a template image on a dark bar: keep the alpha,
@@ -344,18 +404,27 @@ func trayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool) -> CGImage 
     return inv.makeImage()!
 }
 
+/// The shipped hybrid: which states are template and which are colour.
+/// Mirrors iconFor in main.js — if one changes the other should.
+func hybridIsMono(_ st: TrayState) -> Bool {
+    switch st {
+    case .stopped, .starting: return true    // quiet, adapts to the bar
+    case .recording, .stalled: return false  // colour means "this needs you"
+    }
+}
+
 // The sheet is composed entirely in device pixels, y-up, with no scaling
 // transform anywhere on the path a tray mark takes to the canvas. Labels are
-// drawn at 2x point sizes to stay readable; the marks are NOT — they are
-// blitted 1:1 at 16 and 32 device px, which is the only thing that makes this
-// sheet worth looking at.
+// drawn at readable point sizes; the marks are NOT — they are blitted 1:1 at
+// 16 and 32 device px, which is the only thing that makes this sheet worth
+// looking at.
 func buildPreviewSheet(path: String) {
-    let W: CGFloat = 1180, H: CGFloat = 660
+    let W: CGFloat = 1180, H: CGFloat = 940
     let ctx = newContext(Int(W), Int(H))
     ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
     ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
 
-    var top: CGFloat = 24              // grows downward; convert with H - top
+    var top: CGFloat = 24
     func Y(_ t: CGFloat) -> CGFloat { H - t }
 
     text(ctx, "Clipwise tray marks - SAA-130 - rendered at actual size",
@@ -365,60 +434,111 @@ func buildPreviewSheet(path: String) {
          x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
     top += 30
 
-    // Column x positions, shared by the strips and the headings below them.
-    let colStart: CGFloat = 150
-    let colStep: CGFloat = 190
-    let gap1to2: CGFloat = 62
+    // ---- block A: weight, old four-bar against new three-bar --------------
+    text(ctx, "WEIGHT  -  old four-bar (left of each pair) against new three-bar (right).  Monochrome, so the comparison is ink and nothing else.",
+         x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
+    top += 24
 
-    for (variantName, mono) in [
-        ("MONOCHROME TEMPLATE  -  alpha only, macOS inverts it per background", true),
-        ("COLOUR  -  fixed hue, identical pixels on both backgrounds", false),
+    let wStart: CGFloat = 160, wStep: CGFloat = 210
+    for (i, st) in TrayState.allCases.enumerated() {
+        let x = wStart + CGFloat(i) * wStep
+        text(ctx, st.rawValue, x: x, baseline: Y(top + 10), size: 11, dark: false, bold: true)
+        text(ctx, "old 1x  2x", x: x, baseline: Y(top + 23), size: 9, dark: false)
+        text(ctx, "new 1x  2x", x: x + 86, baseline: Y(top + 23), size: 9, dark: false)
+    }
+    top += 29
+
+    for (bgName, dark) in [("light menu bar", false), ("dark menu bar", true)] {
+        let stripH: CGFloat = 44
+        let bg = dark ? MENUBAR_DARK : MENUBAR_LIGHT
+        ctx.setFillColor(red: bg.r, green: bg.g, blue: bg.b, alpha: 1)
+        ctx.fill(CGRect(x: 24, y: Y(top + stripH), width: W - 48, height: stripH))
+        text(ctx, bgName, x: 34, baseline: Y(top + 26), size: 10, dark: dark)
+        for (i, st) in TrayState.allCases.enumerated() {
+            for (j, cfg) in [(true, 1), (true, 2), (false, 1), (false, 2)].enumerated() {
+                let (isLegacy, scale) = cfg
+                let px = CGFloat(16 * scale)
+                let offsets: [CGFloat] = [0, 24, 86, 110]
+                let x = (wStart + CGFloat(i) * wStep + offsets[j]).rounded()
+                let yb = (Y(top + stripH) + (stripH - px) / 2).rounded()
+                ctx.saveGState(); ctx.interpolationQuality = .none
+                ctx.draw(trayImage(state: st, scale: scale, mono: true, dark: dark,
+                                   legacy: isLegacy),
+                         in: CGRect(x: x, y: yb, width: px, height: px))
+                ctx.restoreGState()
+            }
+        }
+        drawNeighbours(ctx, x: W - 210,
+                       yBottom: (Y(top + stripH) + (stripH - 32) / 2).rounded(),
+                       s: 2, dark: dark)
+        top += stripH + 6
+    }
+    top += 22
+
+    // ---- blocks B, C, D: the two full variants, then the shipped hybrid ----
+    let colStart: CGFloat = 150, colStep: CGFloat = 190, gap1to2: CGFloat = 62
+
+    enum Mode { case allMono, allColour, hybrid }
+    for (title, mode) in [
+        ("MONOCHROME TEMPLATE  -  full variant, alpha only, macOS inverts it per background", Mode.allMono),
+        ("COLOUR  -  full variant, fixed hue, identical pixels on both backgrounds", Mode.allColour),
+        ("THE HYBRID AS WIRED  -  stopped and starting template, recording and stalled colour", Mode.hybrid),
     ] {
-        text(ctx, variantName, x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
+        text(ctx, title, x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
         top += 24
-
-        // Column headings once per variant, above its two strips.
         for (i, st) in TrayState.allCases.enumerated() {
             let x = colStart + CGFloat(i) * colStep
+            let tag: String
+            switch mode {
+            case .allMono: tag = "template"
+            case .allColour: tag = "colour"
+            case .hybrid: tag = hybridIsMono(st) ? "template" : "colour"
+            }
             text(ctx, st.rawValue, x: x, baseline: Y(top + 10), size: 11, dark: false, bold: true)
-            text(ctx, "1x", x: x, baseline: Y(top + 24), size: 9.5, dark: false)
-            text(ctx, "2x", x: x + gap1to2, baseline: Y(top + 24), size: 9.5, dark: false)
+            text(ctx, tag, x: x + 62, baseline: Y(top + 10), size: 9, dark: false)
+            text(ctx, "1x", x: x, baseline: Y(top + 23), size: 9.5, dark: false)
+            text(ctx, "2x", x: x + gap1to2, baseline: Y(top + 23), size: 9.5, dark: false)
         }
-        text(ctx, "neighbours", x: W - 230, baseline: Y(top + 10), size: 11, dark: false, bold: true)
-        top += 30
+        text(ctx, "neighbours", x: W - 210, baseline: Y(top + 10), size: 11, dark: false, bold: true)
+        top += 29
 
         for (bgName, dark) in [("light menu bar", false), ("dark menu bar", true)] {
             let stripH: CGFloat = 44
             let bg = dark ? MENUBAR_DARK : MENUBAR_LIGHT
             ctx.setFillColor(red: bg.r, green: bg.g, blue: bg.b, alpha: 1)
             ctx.fill(CGRect(x: 24, y: Y(top + stripH), width: W - 48, height: stripH))
-
             text(ctx, bgName, x: 34, baseline: Y(top + 26), size: 10, dark: dark)
-
-            // Marks sit vertically centred in the strip, on whole pixels.
             for (i, st) in TrayState.allCases.enumerated() {
+                let isMono: Bool
+                switch mode {
+                case .allMono: isMono = true
+                case .allColour: isMono = false
+                case .hybrid: isMono = hybridIsMono(st)
+                }
                 for scale in [1, 2] {
                     let px = CGFloat(16 * scale)
                     let x = (colStart + CGFloat(i) * colStep + (scale == 2 ? gap1to2 : 0)).rounded()
                     let yb = (Y(top + stripH) + (stripH - px) / 2).rounded()
-                    ctx.saveGState()
-                    ctx.interpolationQuality = .none
-                    ctx.draw(trayImage(state: st, scale: scale, mono: mono, dark: dark),
+                    ctx.saveGState(); ctx.interpolationQuality = .none
+                    ctx.draw(trayImage(state: st, scale: scale, mono: isMono, dark: dark),
                              in: CGRect(x: x, y: yb, width: px, height: px))
                     ctx.restoreGState()
                 }
             }
-            drawNeighbours(ctx, x: W - 230,
+            drawNeighbours(ctx, x: W - 210,
                            yBottom: (Y(top + stripH) + (stripH - 32) / 2).rounded(),
                            s: 2, dark: dark)
             top += stripH + 6
         }
-        top += 18
+        top += 20
     }
 
     text(ctx, "State encoding - bars flat = no audio arriving, varied = both tracks writing.  Dot absent = not capturing, ring = starting, filled = capturing.",
          x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
-    top += 20
+    top += 19
+    text(ctx, "Both full variants stay on disk in tray/. The hybrid selects between them per state; switching to either full variant needs no regeneration.",
+         x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
+    top += 19
     text(ctx, "Neighbours are drawn, not screenshotted, so this sheet carries none of what was on the real menu bar. They are at true 16pt for weight comparison.",
          x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
 
