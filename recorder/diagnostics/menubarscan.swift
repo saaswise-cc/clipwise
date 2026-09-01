@@ -9,6 +9,8 @@
 //   menubarscan screen                     -> "1512 982", the logical main screen
 //   menubarscan scan  <strip.png>          -> blankness check + every ink run
 //   menubarscan find  <strip.png> 8E8E93   -> count + x range of one colour
+//   menubarscan states <strip.png> stopped:8E8E93 recording:FF453A ...
+//                                          -> which state colour is on the bar
 //
 // The blankness check exists because the failure this harness must not have is
 // silently capturing a black rectangle. screencapture without Screen Recording
@@ -166,6 +168,73 @@ case "find":
         print("ABSENT 0 -")
     }
 
+// Match a strip against SEVERAL candidate colours and say which one is there.
+//
+// One colour is not enough. main.js paints the tray dot from a four-entry DOT
+// table, and a real meeting is spent almost entirely in `recording` (#FF453A).
+// A harness keyed only to the stopped grey would report ABSENT for the whole
+// window it exists to observe — which is not a weaker answer, it is the
+// opposite of the right one.
+//
+// Ambiguity is reported rather than resolved. Other applications put coloured
+// things in the menu bar — a recording indicator on a meeting app is plausibly
+// red too — so when more than one candidate matches above the noise floor, all
+// of them are printed and the caller can see it happened. Silently returning
+// the biggest would hide exactly the confusion this tool exists to remove.
+case "states":
+    guard args.count >= 4 else {
+        die("usage: menubarscan states <png> name:RRGGBB [name:RRGGBB ...] [--tol N] [--min N]")
+    }
+    var tol = 12
+    var minPx = 25          // below this, a "match" is antialiasing on something else
+    var candidates: [(String, (Int, Int, Int))] = []
+    var ai = 3
+    while ai < args.count {
+        let a = args[ai]
+        if a == "--tol", ai + 1 < args.count { tol = Int(args[ai + 1]) ?? tol; ai += 2; continue }
+        if a == "--min", ai + 1 < args.count { minPx = Int(args[ai + 1]) ?? minPx; ai += 2; continue }
+        let parts = a.split(separator: ":")
+        guard parts.count == 2, parts[1].count == 6, let v = Int(parts[1], radix: 16) else {
+            die("menubarscan: bad candidate \(a), expected name:RRGGBB")
+        }
+        candidates.append((String(parts[0]), ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)))
+        ai += 1
+    }
+    guard !candidates.isEmpty else { die("menubarscan: no candidates given") }
+
+    let (holder2, p2, w2, h2) = loadPixels(args[2])
+    defer { _ = holder2 }
+    let bg2 = background(p2, w2, h2)
+    if blankness(p2, w2, h2, bg2) < 0.002 {
+        print("BLANK - 0 - strip did not photograph a menu bar; result withheld")
+        exit(3)
+    }
+    var hits: [(name: String, n: Int, lo: Int, hi: Int)] = []
+    for (name, t) in candidates {
+        var n = 0, lo = w2, hi = 0
+        for y in 0..<h2 {
+            for x in 0..<w2 {
+                let c = rgb(p2, w2, x, y)
+                if abs(c.0 - t.0) <= tol && abs(c.1 - t.1) <= tol && abs(c.2 - t.2) <= tol {
+                    n += 1; lo = min(lo, x); hi = max(hi, x)
+                }
+            }
+        }
+        if n >= minPx { hits.append((name, n, lo, hi)) }
+    }
+    if hits.isEmpty {
+        print("ABSENT - 0 -")
+    } else {
+        let best = hits.max(by: { $0.n < $1.n })!
+        var line = "PRESENT \(best.name) \(best.n) \(best.lo)..\(best.hi)"
+        if hits.count > 1 {
+            let others = hits.filter { $0.name != best.name }
+                .map { "\($0.name):\($0.n)" }.joined(separator: ",")
+            line += " ambiguous=\(others)"
+        }
+        print(line)
+    }
+
 default:
-    die("usage: menubarscan screen | scan <png> | find <png> <RRGGBB> [tol]")
+    die("usage: menubarscan screen | scan <png> | find <png> <RRGGBB> [tol] | states <png> name:HEX...")
 }

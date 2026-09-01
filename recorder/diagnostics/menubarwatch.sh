@@ -58,11 +58,23 @@ ROOT="$HOME/Library/Application Support/clipwise-diagnostics/menubar"
 RUN_DIR="$ROOT/$(date +%Y-%m-%d)"
 PIDFILE="$ROOT/menubarwatch.pid"
 
-# Clipwise's stopped-state grey. The running build draws its tray icon as a
-# flat dot in this colour, and it is the only non-monochrome item on this menu
-# bar, which is what makes it findable by hex rather than by eye. If the
-# SAA-130 marks ship, add their colours here too.
-CLIPWISE_HEX="${MENUBARWATCH_HEX:-8E8E93}"
+# All four tray states, not one. These are main.js's DOT table verbatim, which
+# is what dotIcon paints the tray dot from.
+#
+# Keying this to a single colour was a real defect while it lasted: the stopped
+# grey is what the icon shows when nothing is happening, and a real meeting is
+# spent almost entirely in `recording` (#FF453A). A harness matching only the
+# grey would have reported ABSENT for the whole window it exists to observe —
+# the opposite of the right answer, delivered confidently, which is precisely
+# the failure mode this harness was built to end.
+#
+# The matched state is recorded per frame, so the index also shows what the
+# recorder believed it was doing at the moment of each capture.
+#
+# If the SAA-130 marks ship, stopped and starting become monochrome templates
+# that follow the menu bar and will NOT match a fixed colour; recording and
+# stalled stay #F4620A bars with these dots and will still match. Revisit then.
+CLIPWISE_STATES="${MENUBARWATCH_STATES:-stopped:8E8E93 starting:FF9F0A recording:FF453A stalled:FFD60A}"
 
 log() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -110,10 +122,14 @@ tick() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$stamp" "CAPTURE_FAILED" "$front" "$state" "-" >> "$dir/index.tsv"
     return 1
   fi
-  found="$("$SCAN" find "$png" "$CLIPWISE_HEX" 12 2>/dev/null | head -1)"
+  # shellcheck disable=SC2086 -- CLIPWISE_STATES is a deliberate word list
+  found="$("$SCAN" states "$png" $CLIPWISE_STATES 2>/dev/null | head -1)"
   printf '%s\t%s\t%s\t%s\t%s\n' \
     "$stamp" "$(basename "$png")" "$front" "$state" "$found" >> "$dir/index.tsv"
-  printf '  %s  %-22s %-10s clipwise=%s\n' "$stamp" "${front:0:22}" "$state" "${found%% *}"
+  # "PRESENT recording 300 2294..2313" -> verdict and state, for the console line
+  printf '  %s  %-22s %-10s clipwise=%s %s\n' \
+    "$stamp" "${front:0:22}" "$state" "$(echo "$found" | cut -d' ' -f1)" \
+    "$(echo "$found" | cut -d' ' -f2)"
   return 0
 }
 
@@ -121,7 +137,7 @@ new_index() {
   local dir="$1"
   [ -f "$dir/index.tsv" ] && return
   printf '# SAA-105 menu bar observation — started %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$dir/index.tsv"
-  printf '# interval=%ss  strip_height=%spt  clipwise_hex=%s\n' "$INTERVAL" "$MENUBAR_H" "$CLIPWISE_HEX" >> "$dir/index.tsv"
+  printf '# interval=%ss  strip_height=%spt  clipwise_states=%s\n' "$INTERVAL" "$MENUBAR_H" "$CLIPWISE_STATES" >> "$dir/index.tsv"
   printf '# stamp\tfile\tfrontmost\tcapture_state\tclipwise\n' >> "$dir/index.tsv"
 }
 
@@ -144,7 +160,9 @@ cmd_check() {
   "$SCAN" scan "$png" | sed 's/^/  /'
   local rc=$?
   log ""
-  log "  Clipwise (#$CLIPWISE_HEX): $("$SCAN" find "$png" "$CLIPWISE_HEX" 12)"
+  # shellcheck disable=SC2086
+  log "  Clipwise: $("$SCAN" states "$png" $CLIPWISE_STATES)"
+  log "  (states searched: $CLIPWISE_STATES)"
   log "  frontmost: $(frontmost)   capture: $(capture_state)"
   rm -rf "$tmp"
   return $rc
@@ -156,11 +174,22 @@ cmd_run() {
   new_index "$RUN_DIR"
   log "menubarwatch: every ${INTERVAL}s -> $RUN_DIR"
   log "menubarwatch: Ctrl-C to stop"
-  trap 'log ""; log "menubarwatch: stopped. $(ls -1 "$RUN_DIR"/strip-*.png 2>/dev/null | wc -l | tr -d " ") frame(s) in $RUN_DIR"; exit 0' INT TERM
+  # A signal sets a flag rather than exiting. Exiting immediately killed the
+  # process between screencapture writing a frame and the index line being
+  # appended for it, leaving a PNG with no frontmost app and no capture state —
+  # an observation with no metadata, in a harness whose entire purpose is a
+  # record someone can trust later. The loop finishes the tick it is in.
+  STOPPING=0
+  trap 'STOPPING=1' INT TERM
   while true; do
     tick "$RUN_DIR"
+    [ "$STOPPING" = 1 ] && break
     sleep "$INTERVAL"
+    [ "$STOPPING" = 1 ] && break
   done
+  log ""
+  log "menubarwatch: stopped. $(ls -1 "$RUN_DIR"/strip-*.png 2>/dev/null | wc -l | tr -d ' ') frame(s) in $RUN_DIR"
+  exit 0
 }
 
 cmd_start() {
@@ -192,8 +221,16 @@ cmd_stop() {
     # Only ever this harness's own pid, from its own pidfile. Nothing here
     # touches the recorder or a running capture.
     kill -TERM "$pid" 2>/dev/null
-    sleep 1
-    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    # Long enough for an in-flight tick to finish and file its index row. A
+    # tick is a screencapture plus one scan, well under two seconds.
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 5 ]; do
+      sleep 1; waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      err "menubarwatch: pid $pid did not stop in ${waited}s — killing; the last frame may lack an index row"
+      kill -KILL "$pid" 2>/dev/null
+    fi
     log "menubarwatch: stopped (pid $pid)"
   else
     log "menubarwatch: pid $pid was not running"
@@ -219,6 +256,15 @@ cmd_status() {
       blank="$(grep -cE $'\t(BLANK|CAPTURE_FAILED)' "$RUN_DIR/index.tsv" 2>/dev/null || true)"
       log "  clipwise item: PRESENT in ${present:-0} frame(s), ABSENT in ${absent:-0}"
       log "  unusable frames (BLANK / CAPTURE_FAILED): ${blank:-0}"
+    # A PNG with no index row has no frontmost app and no capture state beside
+    # it. Reported rather than left as a silent disagreement between the file
+    # count and the row count.
+    local pngs rows
+    pngs="$(ls -1 "$RUN_DIR"/strip-*.png 2>/dev/null | wc -l | tr -d ' ')"
+    rows="$(grep -vc '^#' "$RUN_DIR/index.tsv" 2>/dev/null || true)"
+    if [ "${pngs:-0}" -ne "${rows:-0}" ]; then
+      log "  WARNING: $pngs frame(s) but ${rows:-0} index row(s) — $((pngs - ${rows:-0})) frame(s) have no metadata"
+    fi
       log "  (an unusable frame counts as neither present nor absent — that is the point)"
     fi
   else
