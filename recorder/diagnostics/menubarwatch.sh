@@ -90,15 +90,31 @@ PIDFILE="$ROOT/menubarwatch.pid"
 #    a capture is probably the starting template; SUSTAINED ABSENT across many
 #    recording frames is the eviction. Read runs, not single frames.
 #
-# Presence and state are matched separately, because after SAA-130 the thing
-# carrying identity and the thing carrying state are very different sizes. The
-# #F4620A bars are 156-238px and appear nowhere else on this menu bar (verified:
-# ABSENT on a frame with only the template mark). The state dot is 25-42px,
-# down from 300px for the flat circle that preceded it — small enough that a
-# threshold tuned for the old artwork sat exactly on top of `stalled`. So the
-# bars establish that Clipwise is there and the dot names which state.
+# PRESENCE IS THE STATE DOT. It used to be the #F4620A bars, which were the
+# large distinctive block back when the tray mark was a redrawn approximation
+# with flat solid bars. That stopped being true when the mark became the logo's
+# own geometry: the logo gives its bars descending opacities (0.6/0.8/1.0/0.7),
+# so three of the four blend into the bar and no longer match the flat brand
+# orange. Presence fell from 280px to 64px, all of it the one fully-opaque bar
+# — a 1.6x margin over the old floor of 40, down from 7x.
+#
+# The dot gained exactly what the bars lost. It is now drawn in EVERY state,
+# fully opaque, and distinctly coloured in recording and stalled — which are
+# the only two states this harness can observe at all, because stopped and
+# starting ship as monochrome templates with no colour to match.
+#
+# Two colours, because "the dot is there" spans both observable states. A pixel
+# matching either is presence; the state candidates then say which one.
+# Measured on a real captured menu bar with a capture running: 52px present
+# against 0px with the item blanked out, and macOS's own orange mic indicator
+# (68px of #FF9F0A, which appears exactly when recording) matches NEITHER dot
+# colour, so it cannot manufacture a false PRESENT.
+#
+# Floors live in menubarscan and are expressed in @1x pixels, scaled by the
+# strip's own scale factor — the dot is 52px on a Retina strip and 9px on a
+# non-Retina one, and a single absolute floor could not have served both.
 CLIPWISE_STATES="${MENUBARWATCH_STATES:-stopped:8E8E93 starting:FF9F0A recording:FF453A stalled:FFD60A}"
-CLIPWISE_PRESENCE="${MENUBARWATCH_PRESENCE:-bars:F4620A}"
+CLIPWISE_PRESENCE="${MENUBARWATCH_PRESENCE:-dot:FF453A,FFD60A}"
 
 log() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }

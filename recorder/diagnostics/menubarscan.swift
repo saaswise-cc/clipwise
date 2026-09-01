@@ -183,21 +183,38 @@ case "find":
 // the biggest would hide exactly the confusion this tool exists to remove.
 case "states":
     guard args.count >= 4 else {
-        die("usage: menubarscan states <png> name:RRGGBB [name:RRGGBB ...] [--tol N] [--min N]")
+        die("usage: menubarscan states <png> name:RRGGBB [...] [--tol N] [--min N] [--presence name:RRGGBB[,RRGGBB...]] [--presence-min N] [--scale N]")
     }
     var tol = 12
-    // The state dot is SMALL. On the SAA-130 marks it is 42px for recording
-    // and 25px for stalled, against 300px for the flat circle that preceded
-    // them, so a threshold tuned for the old artwork sat exactly on top of
-    // stalled. Presence is established by the bars instead; this floor only
-    // has to be high enough to reject a stray antialiased pixel.
-    var minPx = 12
-    // The presence marker: a large, distinctive block that says "Clipwise is
-    // on the bar" without saying which state. The state dot then names the
-    // state. Splitting the two is what keeps the harness working now that the
-    // thing carrying identity and the thing carrying state are different sizes.
-    var presence: (String, (Int, Int, Int))? = nil
-    var presenceMin = 40
+    // FLOORS ARE IN @1x PIXELS and multiplied by scale-squared below, because a
+    // Retina strip has four times the area for the same artwork. A single
+    // absolute floor cannot serve both: the tray dot is 52px at @2x and 9px at
+    // @1x, so the old absolute 12 passed comfortably on Retina and rejected the
+    // very same mark on a non-Retina display. Expressing it once, at @1x,
+    // removes that trap.
+    //
+    // 3 is about a third of the @1x dot, which leaves roughly 3x of margin at
+    // either scale while still rejecting a stray antialiased pixel.
+    var minPx = 3
+    // PRESENCE IS THE STATE DOT, not the bars. It used to be the bars, keyed on
+    // the brand orange, because the bars were the large distinctive block and
+    // the dot was small and absent at rest. Both halves of that stopped being
+    // true when the tray mark became the logo's own geometry: the logo gives its
+    // bars descending opacities, so three of four blend into the bar and stop
+    // matching the flat orange, dropping presence from 280px to 64px on one
+    // fully-opaque bar. The dot meanwhile gained what the bars lost — it is now
+    // drawn in every state, fully opaque, and distinctly coloured in exactly the
+    // two states the eviction test observes.
+    //
+    // Several colours, because "the dot is there" spans recording's red and
+    // stalled's yellow. A pixel matching ANY of them is presence; the state
+    // candidates below then say which.
+    var presence: (String, [(Int, Int, Int)])? = nil
+    var presenceMin = 3
+    // Strip height decides the scale: menubarwatch grabs a 30pt strip, so 60px
+    // is Retina and 30px is not. --scale overrides it for a saved frame whose
+    // provenance is not obvious.
+    var scaleOverride: Int? = nil
     var candidates: [(String, (Int, Int, Int))] = []
     var ai = 3
     while ai < args.count {
@@ -207,12 +224,23 @@ case "states":
         if a == "--presence-min", ai + 1 < args.count {
             presenceMin = Int(args[ai + 1]) ?? presenceMin; ai += 2; continue
         }
+        if a == "--scale", ai + 1 < args.count {
+            scaleOverride = Int(args[ai + 1]); ai += 2; continue
+        }
         if a == "--presence", ai + 1 < args.count {
             let pp = args[ai + 1].split(separator: ":")
-            guard pp.count == 2, pp[1].count == 6, let pv = Int(pp[1], radix: 16) else {
-                die("menubarscan: bad --presence \(args[ai + 1]), expected name:RRGGBB")
+            guard pp.count == 2 else {
+                die("menubarscan: bad --presence \(args[ai + 1]), expected name:RRGGBB[,RRGGBB...]")
             }
-            presence = (String(pp[0]), ((pv >> 16) & 0xFF, (pv >> 8) & 0xFF, pv & 0xFF))
+            var pts: [(Int, Int, Int)] = []
+            for hx in pp[1].split(separator: ",") {
+                guard hx.count == 6, let pv = Int(hx, radix: 16) else {
+                    die("menubarscan: bad --presence colour \(hx), expected RRGGBB")
+                }
+                pts.append(((pv >> 16) & 0xFF, (pv >> 8) & 0xFF, pv & 0xFF))
+            }
+            guard !pts.isEmpty else { die("menubarscan: --presence has no colours") }
+            presence = (String(pp[0]), pts)
             ai += 2; continue
         }
         let parts = a.split(separator: ":")
@@ -244,31 +272,83 @@ case "states":
         return (n, lo, hi)
     }
 
+    // @1x floors scaled to the strip actually captured.
+    let scale = scaleOverride ?? (h2 >= 45 ? 2 : 1)
+    let stateFloor = max(1, minPx * scale * scale)
+    let presenceFloor = max(1, presenceMin * scale * scale)
+
     var hits: [(name: String, n: Int, lo: Int, hi: Int)] = []
     for (name, t) in candidates {
         let r = count(t)
-        if r.n >= minPx { hits.append((name, r.n, r.lo, r.hi)) }
+        if r.n >= stateFloor { hits.append((name, r.n, r.lo, r.hi)) }
+    }
+    // Any pixel matching ANY presence colour counts once. Summing per-colour
+    // counts would double-count a pixel that sat within tolerance of two of
+    // them, which is exactly the case near a blend between the two dots.
+    func countAny(_ ts: [(Int, Int, Int)]) -> (n: Int, lo: Int, hi: Int) {
+        var n = 0, lo = w2, hi = 0
+        for y in 0..<h2 {
+            for x in 0..<w2 {
+                let c = rgb(p2, w2, x, y)
+                if ts.contains(where: { abs(c.0 - $0.0) <= tol && abs(c.1 - $0.1) <= tol
+                                        && abs(c.2 - $0.2) <= tol }) {
+                    n += 1; lo = min(lo, x); hi = max(hi, x)
+                }
+            }
+        }
+        return (n, lo, hi)
     }
     var presenceHit: (n: Int, lo: Int, hi: Int)? = nil
-    if let (_, pt) = presence {
-        let r = count(pt)
-        if r.n >= presenceMin { presenceHit = r }
+    var presenceName = "presence"
+    if let (pname, pts) = presence {
+        presenceName = pname
+        let r = countAny(pts)
+        if r.n >= presenceFloor { presenceHit = r }
     }
 
-    if hits.isEmpty && presenceHit == nil {
+    // PRESENCE GATES THE VERDICT. A state colour matching somewhere on the bar
+    // is not evidence that Clipwise is on the bar — other applications put
+    // coloured things up there too. Without this, an evicted frame captured
+    // mid-recording still reported PRESENT, because macOS's own orange
+    // microphone indicator (which appears exactly when recording) sits within
+    // tolerance of `starting`. That is a false PRESENT in the one direction
+    // this harness exists to test, so presence, when configured, is decisive:
+    // no presence, no Clipwise, whatever else happens to be the right colour.
+    if presence != nil && presenceHit == nil {
+        print("ABSENT - 0 -")
+    } else if hits.isEmpty && presenceHit == nil {
         print("ABSENT - 0 -")
     } else if hits.isEmpty, let ph = presenceHit {
         // The mark is on the bar but no state dot matched. Reported honestly as
         // unknown rather than guessed at.
-        print("PRESENT unknown \(ph.n) \(ph.lo)..\(ph.hi) bars=\(ph.n)")
+        print("PRESENT unknown \(ph.n) \(ph.lo)..\(ph.hi) \(presenceName)=\(ph.n)")
     } else {
-        let best = hits.max(by: { $0.n < $1.n })!
+        // The state is named by a hit that OVERLAPS the presence region — the
+        // dot that established presence is the dot that names the state. A
+        // same-coloured blob elsewhere on the bar is reported as `elsewhere=`
+        // rather than allowed to rename the state, which is what used to happen
+        // whenever the macOS mic indicator outweighed the real dot.
+        var named = hits
+        var elsewhere: [(name: String, n: Int, lo: Int, hi: Int)] = []
+        if let ph = presenceHit {
+            let overlapping = hits.filter { !($0.hi < ph.lo || $0.lo > ph.hi) }
+            if !overlapping.isEmpty {
+                named = overlapping
+                elsewhere = hits.filter { $0.hi < ph.lo || $0.lo > ph.hi }
+            }
+        }
+        let best = named.max(by: { $0.n < $1.n })!
         var line = "PRESENT \(best.name) \(best.n) \(best.lo)..\(best.hi)"
-        if let ph = presenceHit { line += " bars=\(ph.n)" }
-        if hits.count > 1 {
-            let others = hits.filter { $0.name != best.name }
+        if let ph = presenceHit { line += " \(presenceName)=\(ph.n)" }
+        if named.count > 1 {
+            let others = named.filter { $0.name != best.name }
                 .map { "\($0.name):\($0.n)" }.joined(separator: ",")
             line += " ambiguous=\(others)"
+        }
+        if !elsewhere.isEmpty {
+            let e = elsewhere.map { "\($0.name):\($0.n)@\($0.lo)..\($0.hi)" }
+                .joined(separator: ",")
+            line += " elsewhere=\(e)"
         }
         print(line)
     }
