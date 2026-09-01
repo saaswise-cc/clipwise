@@ -281,9 +281,13 @@ const LABEL = {
 // Menu-item text, not title text — see renderTray. These were tray-title
 // suffixes and were the same overflow hazard as the permission suffix that
 // actually triggered it.
+// Functions rather than strings because the failed line names a file, and a
+// file name that is not built from the stem is a literal `<stem>` on screen —
+// which is what it read as, while the Retry item directly below it carried the
+// real one (SAA-150).
 const PIPELINE_NOTE = {
-    running: 'Processing capture…',
-    failed:  'Processing failed — see pipeline-<stem>.json',
+    running: () => 'Processing capture…',
+    failed:  stem => `Processing failed — see pipeline-${stem}.json`,
 };
 
 // --- helpers --------------------------------------------------------------
@@ -693,7 +697,9 @@ function detectedAppsMenu() {
 
 function renderTray() {
     const label = LABEL[state];
-    const pipelineNote = pipeline ? PIPELINE_NOTE[pipeline.state] : null;
+    const pipelineNote = pipeline && PIPELINE_NOTE[pipeline.state]
+        ? PIPELINE_NOTE[pipeline.state](pipeline.stem)
+        : null;
     const permNote = permissionIssue ? permissionIssue.note : null;
 
     // Title stays down to a few characters whatever the state vocabulary
