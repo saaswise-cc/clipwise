@@ -32,37 +32,52 @@ let ORANGE = (r: 0xF4 / 255.0, g: 0x62 / 255.0, b: 0x0A / 255.0)
 let DOT_YELLOW = (r: 0xF5 / 255.0, g: 0xC8 / 255.0, b: 0x42 / 255.0)
 
 // x, y, w, h, opacity — the four bars, in SVG units.
+//
+// The whole mark sits 2 units lower than it did before SAA-130. The tallest
+// bar used to span y8..28 — 8 units of air above it, 12 below — and the mark
+// hung high in its tile. +2 puts it at y10..30, equidistant. That was ONE
+// uniform translate of bars and dot together, not a recentring by eye, which
+// is why every y below is exactly 2 more than its predecessor and no x, width,
+// height or radius moved at all.
 let SVG_BARS: [(x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, a: CGFloat)] = [
-    (10.0, 17.0, 3.5, 10.0, 0.6),
-    (15.5, 12.0, 3.5, 15.0, 0.8),
-    (21.0, 8.0, 3.5, 20.0, 1.0),
-    (26.5, 13.0, 3.5, 13.0, 0.7),
+    (10.0, 19.0, 3.5, 10.0, 0.6),
+    (15.5, 14.0, 3.5, 15.0, 0.8),
+    (21.0, 10.0, 3.5, 20.0, 1.0),
+    (26.5, 15.0, 3.5, 13.0, 0.7),
 ]
-let SVG_DOT = (cx: CGFloat(34), cy: CGFloat(7), r: CGFloat(4))
+let SVG_DOT = (cx: CGFloat(34), cy: CGFloat(9), r: CGFloat(4))
 
-// The tray mark is a SIMPLIFICATION of the logo, not a copy of it: three bars
-// where the logo has four. That divergence is deliberate — at 16pt, four 2px
-// bars separated by gaps are mostly white space and the mark read at roughly
-// half the weight of the battery and wifi glyphs beside it.
+// The mark as it stood before the translate, kept ONLY so the preview sheet
+// can put the two icons side by side. Nothing ships from these numbers — a
+// claim that the mark now sits centred is worth nothing without the old one
+// beside it.
+let LEGACY_SVG_BARS: [(x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, a: CGFloat)] =
+    SVG_BARS.map { (x: $0.x, y: $0.y - 2, w: $0.w, h: $0.h, a: $0.a) }
+let LEGACY_SVG_DOT = (cx: SVG_DOT.cx, cy: SVG_DOT.cy - 2, r: SVG_DOT.r)
+
+// The tray mark is no longer a simplification of the logo. It was three bars
+// where the logo has four, bought for weight at 16pt; SAA-130 buys that back.
+// The notification and the tray appear side by side, and a three-bar mark next
+// to a four-bar one reads as two products. Coherence won; the thinner bars are
+// the accepted cost and are NOT compensated for by widening them.
 //
-// So the check below can no longer be "the tray matches the SVG". It asserts
-// the relationship instead, in three parts:
+// So the check below asserts one relationship in three parts:
 //
-//   1. The APP ICON still matches the SVG exactly, bar for bar. It is drawn
-//      large enough for four bars and it should be the brand mark, not an
+//   1. The APP ICON matches the SVG exactly, bar for bar, including the
+//      post-translate y values. It should be the brand mark, not an
 //      interpretation of it. Any drift there is a bug.
-//   2. The SVG still has exactly LOGO_BAR_COUNT bars. The three-bar tray mark
-//      was derived from a four-bar logo; if the logo becomes three bars or
-//      five, the simplification has to be reconsidered rather than silently
-//      inherited, so this fires.
-//   3. The invariants the tray does NOT diverge on — the orange, and the
-//      presence of a status dot — still hold. Those carry the identity that
-//      survives the simplification.
+//   2. The TRAY MARK now matches the logo's bar COUNT as well — the one thing
+//      it used to diverge on. It still diverges on width, pitch and cap
+//      rounding, because those are pixel-hinting at 16pt rather than brand.
+//      If the logo gains or loses a bar, the tray has to follow, so this
+//      fires rather than letting the two drift apart again.
+//   3. The invariants both drawings share — the orange, and the presence of a
+//      status dot — still hold.
 //
 // Deleting this check because it became inconvenient would be worse than never
-// having had it, which is why it grew rather than went away.
+// having had it, which is why it keeps growing rather than going away.
 let LOGO_BAR_COUNT = 4
-let TRAY_BAR_COUNT = 3
+let TRAY_BAR_COUNT = 4
 
 func assertGeometry() {
     let path = "clipwise-mark.svg"
@@ -81,15 +96,37 @@ func assertGeometry() {
     for b in SVG_BARS {
         need("x=\"\(fmt(b.x))\" y=\"\(fmt(b.y))\"", "app icon bar")
     }
-    need("cx=\"34\" cy=\"7\" r=\"4\"", "app icon dot")
+    need("cx=\"\(fmt(SVG_DOT.cx))\" cy=\"\(fmt(SVG_DOT.cy))\" r=\"\(fmt(SVG_DOT.r))\"",
+         "app icon dot")
 
-    // (2) the premise the simplification rests on.
+    // (1b) the translate itself: the tallest bar sits equidistant from the top
+    // and bottom of the tile. This is what SAA-130 bought, and a later nudge
+    // "to taste" that breaks it should fail here rather than ship.
+    let tallest = SVG_BARS.max(by: { $0.h < $1.h })!
+    let above = tallest.y
+    let below = SVG_SIDE - (tallest.y + tallest.h)
+    if above != below {
+        problems.append(
+            "the tallest bar spans y\(fmt(tallest.y))..\(fmt(tallest.y + tallest.h)), leaving "
+            + "\(fmt(above)) above and \(fmt(below)) below. The mark is meant to sit "
+            + "equidistant in its tile; translate the whole mark, dot included, rather than "
+            + "resizing a bar")
+    }
+
+    // (2) the tray mark's bar count now tracks the logo's, rather than
+    // simplifying it. If the logo changes count, this fires.
     let barCount = svg.components(separatedBy: "<rect").count - 1 - 1  // minus the tile
     if barCount != LOGO_BAR_COUNT {
         problems.append(
-            "the tray mark simplifies \(LOGO_BAR_COUNT) logo bars down to \(TRAY_BAR_COUNT), "
-            + "but the logo now has \(barCount). Re-derive the tray mark rather than assuming "
-            + "\(TRAY_BAR_COUNT) still reads as the same brand")
+            "the tray mark draws \(TRAY_BAR_COUNT) bars to match a \(LOGO_BAR_COUNT)-bar logo, "
+            + "but the logo now has \(barCount). Redraw the tray mark to match rather than "
+            + "letting the two marks diverge again")
+    }
+    if TRAY_BAR_COUNT != LOGO_BAR_COUNT {
+        problems.append(
+            "the tray mark draws \(TRAY_BAR_COUNT) bars where the logo has \(LOGO_BAR_COUNT). "
+            + "They appear side by side in the notification and the menu bar; the counts match "
+            + "on purpose")
     }
 
     // (3) what the tray keeps, and must keep.
@@ -101,14 +138,15 @@ func assertGeometry() {
     need("#F5C842", "app icon dot colour")
 
     if !problems.isEmpty {
-        let msg = "render: clipwise-mark.svg and render.swift have diverged in a way that is "
-            + "NOT the intended simplification.\n  - "
+        let msg = "render: clipwise-mark.svg and render.swift have diverged. The SVG is the "
+            + "source; if it moved on purpose, move these numbers with it.\n  - "
             + problems.joined(separator: "\n  - ") + "\n"
         FileHandle.standardError.write(msg.data(using: .utf8)!)
         exit(1)
     }
-    print("  geometry check: app icon matches the SVG exactly; "
-          + "tray mark is the intended \(LOGO_BAR_COUNT)->\(TRAY_BAR_COUNT) simplification")
+    print("  geometry check: app icon matches the SVG exactly, bar for bar; "
+          + "tallest bar equidistant (\(fmt(above)) above, \(fmt(below)) below); "
+          + "tray mark matches the logo at \(TRAY_BAR_COUNT) bars")
 }
 
 func fmt(_ v: CGFloat) -> String {
@@ -152,6 +190,15 @@ func roundedRect(_ ctx: CGContext, _ rect: CGRect, _ radius: CGFloat) {
 
 func drawAppIcon(_ px: Int, _ path: String) {
     let ctx = newContext(px, px)
+    drawAppIconInto(ctx, px)
+    writePNG(ctx, path)
+}
+
+/// `legacy` draws the pre-SAA-130 geometry — the mark sitting 2 units high in
+/// its tile. Only the preview sheet passes it; nothing ships from it.
+func drawAppIconInto(_ ctx: CGContext, _ px: Int, legacy: Bool = false) {
+    let bars = legacy ? LEGACY_SVG_BARS : SVG_BARS
+    let dot = legacy ? LEGACY_SVG_DOT : SVG_DOT
     let S = CGFloat(px)
     let tile = (S * 824.0 / 1024.0).rounded()
     let inset = ((S - tile) / 2).rounded()
@@ -167,16 +214,15 @@ func drawAppIcon(_ px: Int, _ path: String) {
     roundedRect(ctx, CGRect(x: 0, y: 0, width: tile, height: tile), SVG_CORNER * k)
     ctx.fillPath()
 
-    for b in SVG_BARS {
+    for b in bars {
         ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: b.a)
         roundedRect(ctx, CGRect(x: b.x * k, y: b.y * k, width: b.w * k, height: b.h * k),
                     (b.w / 2) * k)
         ctx.fillPath()
     }
     ctx.setFillColor(red: DOT_YELLOW.r, green: DOT_YELLOW.g, blue: DOT_YELLOW.b, alpha: 1)
-    ctx.fillEllipse(in: CGRect(x: (SVG_DOT.cx - SVG_DOT.r) * k, y: (SVG_DOT.cy - SVG_DOT.r) * k,
-                               width: SVG_DOT.r * 2 * k, height: SVG_DOT.r * 2 * k))
-    writePNG(ctx, path)
+    ctx.fillEllipse(in: CGRect(x: (dot.cx - dot.r) * k, y: (dot.cy - dot.r) * k,
+                               width: dot.r * 2 * k, height: dot.r * 2 * k))
 }
 
 // --- 2. the tray marks -----------------------------------------------------
@@ -196,21 +242,22 @@ func drawAppIcon(_ px: Int, _ path: String) {
 // Recording is the one state with varied bars, because recording-or-not is the
 // distinction that matters most and it should be readable without comparison.
 //
-// THREE bars, not the logo's four. At 16pt four 2px bars with gaps between
-// them are mostly white space, and the mark read at roughly half the visual
-// weight of the battery and wifi glyphs it sits beside. Three bars at 3px in
-// the same 11px span carry the same identity — it is bars-and-a-dot, and the
-// count was never the load-bearing part — with half again as much ink.
+// FOUR bars, matching the logo. This was three for one commit, bought because
+// four 2px bars with gaps at 16pt are mostly white space and the mark read at
+// roughly half the weight of the battery and wifi glyphs beside it. That trade
+// is off: the notification and the tray appear side by side and the mismatch
+// showed. Thin bars are the accepted cost, and they are NOT widened to
+// compensate — 2px on a 3px pitch is what four bars fit in the same 11px span.
 //
-// Bars are pixel-hinted rather than scaled: 3px wide on a 4px pitch at @1x,
+// Bars are pixel-hinted rather than scaled: 2px wide on a 3px pitch at @1x,
 // doubled at @2x, so every bar edge lands on a whole pixel at both scales. A
 // proportional scale of the SVG puts fractional bars on half-pixel boundaries
 // and they turn to grey mush at @1x. The dot is drawn as a real circle with
 // antialiasing, because a hinted small circle is a plus sign.
 //
-// `legacy` reproduces the four-bar mark exactly as it stood at eeb3ad2, so the
-// preview sheet can put the two side by side. A claim that the mark got
-// heavier is worth nothing without the old one beside it.
+// `legacy` reproduces the THREE-bar mark exactly as it stood at 6da71e6, so
+// the preview sheet can put the two side by side. A claim that the four-bar
+// mark still reads at 16pt is worth nothing without the old one beside it.
 
 enum TrayState: String, CaseIterable {
     case stopped, starting, recording, stalled
@@ -252,17 +299,23 @@ func drawTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool,
     ctx.translateBy(x: 0, y: side)
     ctx.scaleBy(x: 1, y: -1)
 
-    // Three bars, 3px wide on a 4px pitch, filling the same x 0..10 span the
-    // four-bar version used — the mark's footprint is unchanged, its ink is not.
-    let count = legacy ? 4 : TRAY_BAR_COUNT
-    let barW = (legacy ? 2 : 3) * s
-    let pitch = (legacy ? 3 : 4) * s
+    // Four bars, 2px wide on a 3px pitch, filling the same x 0..11 span the
+    // three-bar version used — the mark's footprint is unchanged either way.
+    let count = legacy ? 3 : TRAY_BAR_COUNT
+    let barW = (legacy ? 3 : 2) * s
+    let pitch = (legacy ? 4 : 3) * s
     let baseline = 14 * s  // bar bottoms, 1px of air beneath at @1x
-    // A peak off dead centre, echoing the logo's own tallest-bar-third-of-four.
-    let variedH: [CGFloat] = legacy ? [6, 9, 12, 7] : [8, 13, 10]
-    // Flat sits below every varied height, so the silhouette differs on all
-    // three bars rather than on one of them.
-    let flatH: CGFloat = legacy ? 6 : 7
+    // Tallest bar third of four, echoing the logo's own profile. This is the
+    // eeb3ad2 four-bar profile with ONE pixel changed: the first bar was 6,
+    // which tied with flat and left that bar carrying no state at all. 7 buys
+    // the distinction back.
+    let variedH: [CGFloat] = legacy ? [8, 13, 10] : [7, 9, 12, 7]
+    // Flat sits strictly below EVERY varied height, so the silhouette differs
+    // on all four bars rather than on three of them. Held at 6 rather than
+    // dropped to 5 to clear the old first bar: three of the four states are
+    // flat, so this height IS the mark's resting weight, and the four-bar
+    // restoration already spends enough of that going from 3px bars to 2px.
+    let flatH: CGFloat = legacy ? 7 : 6
 
     if mono {
         ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)
@@ -279,7 +332,9 @@ func drawTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool,
     }
 
     // Dot: 5px at @1x in the top-right, clear of the tallest bar (bars end at
-    // x=10, the dot starts at x=11). 5px rather than 4px because ring-versus-
+    // x=11, the dot starts at x=11 but five rows above the tallest bar's top).
+    // Unchanged by the four-bar restoration: 4 bars at 2px on a 3px pitch and
+    // 3 bars at 3px on a 4px pitch both end at x=11. 5px rather than 4px because ring-versus-
     // filled is the only thing separating starting from stalled, and a 4px
     // ring has a 2px hole that closes up at @1x.
     if state.dot != .none {
@@ -386,6 +441,14 @@ func text(_ ctx: CGContext, _ str: String, x: CGFloat, baseline: CGFloat,
     ctx.restoreGState()
 }
 
+/// An app icon rendered into its own bitmap, so the sheet can blit it without
+/// the icon's own y-flip leaking into the sheet's transform.
+func appIconImage(px: Int, legacy: Bool) -> CGImage {
+    let ctx = newContext(px, px)
+    drawAppIconInto(ctx, px, legacy: legacy)
+    return ctx.makeImage()!
+}
+
 /// A tray mark rendered into its own bitmap at true device size, with the
 /// template inversion applied when the background calls for it.
 func trayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool,
@@ -419,7 +482,7 @@ func hybridIsMono(_ st: TrayState) -> Bool {
 // 16 and 32 device px, which is the only thing that makes this sheet worth
 // looking at.
 func buildPreviewSheet(path: String) {
-    let W: CGFloat = 1180, H: CGFloat = 940
+    let W: CGFloat = 1180, H: CGFloat = 1190
     let ctx = newContext(Int(W), Int(H))
     ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
     ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
@@ -427,24 +490,68 @@ func buildPreviewSheet(path: String) {
     var top: CGFloat = 24
     func Y(_ t: CGFloat) -> CGFloat { H - t }
 
-    text(ctx, "Clipwise tray marks - SAA-130 - rendered at actual size",
+    text(ctx, "Clipwise mark - SAA-130 - old beside new, rendered at actual size",
          x: 24, baseline: Y(top + 16), size: 17, dark: false, bold: true)
     top += 26
-    text(ctx, "Every mark is blitted 1:1. The 1x column is 16 device px, the 2x column 32 device px - what a Retina menu bar puts on screen for a 16pt slot.",
+    text(ctx, "Two changes to judge: the whole mark translated down 2 units on the 40-unit grid, and the tray mark back to four bars to match the app icon.",
+         x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
+    top += 17
+    text(ctx, "Tray marks are blitted 1:1. The 1x column is 16 device px, the 2x column 32 device px - what a Retina menu bar puts on screen for a 16pt slot.",
          x: 24, baseline: Y(top + 12), size: 11.5, dark: false)
     top += 30
 
-    // ---- block A: weight, old four-bar against new three-bar --------------
-    text(ctx, "WEIGHT  -  old four-bar (left of each pair) against new three-bar (right).  Monochrome, so the comparison is ink and nothing else.",
+    // ---- block A: the translate, old icon against new ---------------------
+    //
+    // The centreline is the whole point. The tile's vertical middle is drawn
+    // across both icons; on the NEW mark the tallest bar's own midpoint sits
+    // on it (y10..30 of 40), on the OLD one the bar rides 2 units above it.
+    // Without the line this is a claim; with it, it is a measurement.
+    text(ctx, "THE TRANSLATE  -  old (left of each pair) against new (right).  The line is the tile's vertical centre; the new mark's tallest bar is centred on it.",
          x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
-    top += 24
+    top += 22
+    text(ctx, "Old: tallest bar y8..28, so 8 units of air above and 12 below.        New: y10..30, so 10 and 10.  One uniform +2 on bars and dot together - nothing resized.",
+         x: 24, baseline: Y(top + 12), size: 11, dark: false)
+    top += 22
+
+    do {
+        let blockTop = top
+        var x: CGFloat = 44
+        for px in [128, 96, 64, 32] {
+            let p = CGFloat(px)
+            text(ctx, "\(px)px", x: x, baseline: Y(blockTop + 10), size: 9.5, dark: false)
+            for (j, isLegacy) in [true, false].enumerated() {
+                let ix = (x + CGFloat(j) * (p + 12)).rounded()
+                let iy = (Y(blockTop + 16 + p)).rounded()
+                ctx.saveGState(); ctx.interpolationQuality = .none
+                ctx.draw(appIconImage(px: px, legacy: isLegacy),
+                         in: CGRect(x: ix, y: iy, width: p, height: p))
+                ctx.restoreGState()
+                // The centreline, run a little past the icon on both sides.
+                ctx.setFillColor(red: 0.85, green: 0.1, blue: 0.45, alpha: 1)
+                ctx.fill(CGRect(x: ix - 5, y: (iy + p / 2).rounded(), width: p + 10, height: 1))
+                text(ctx, isLegacy ? "old" : "new", x: ix, baseline: Y(blockTop + 26 + p),
+                     size: 9, dark: false, bold: !isLegacy)
+            }
+            x += 2 * p + 12 + 40
+        }
+        top = blockTop + 16 + 128 + 26
+    }
+    top += 16
+
+    // ---- block B: weight, old three-bar against new four-bar --------------
+    text(ctx, "TRAY WEIGHT  -  old three-bar (left of each pair) against new four-bar (right).  Monochrome, so the comparison is ink and nothing else.",
+         x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
+    top += 22
+    text(ctx, "The four-bar mark is lighter at 16pt and that is the accepted cost of matching the app icon. Bars are 2px on a 3px pitch - not widened to compensate.",
+         x: 24, baseline: Y(top + 12), size: 11, dark: false)
+    top += 22
 
     let wStart: CGFloat = 160, wStep: CGFloat = 210
     for (i, st) in TrayState.allCases.enumerated() {
         let x = wStart + CGFloat(i) * wStep
         text(ctx, st.rawValue, x: x, baseline: Y(top + 10), size: 11, dark: false, bold: true)
-        text(ctx, "old 1x  2x", x: x, baseline: Y(top + 23), size: 9, dark: false)
-        text(ctx, "new 1x  2x", x: x + 86, baseline: Y(top + 23), size: 9, dark: false)
+        text(ctx, "old 3bar 1x 2x", x: x, baseline: Y(top + 23), size: 9, dark: false)
+        text(ctx, "new 4bar 1x 2x", x: x + 86, baseline: Y(top + 23), size: 9, dark: false)
     }
     top += 29
 

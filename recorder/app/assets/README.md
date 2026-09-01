@@ -14,9 +14,40 @@ geometry compiled into it, so the two cannot drift apart silently.
 
 `clipwise-mark.svg` is a byte-for-byte copy of the repo's `favicon.svg`, which
 is in turn identical to both inline copies in `index.html` — verified, not
-assumed. It is a true vector: an orange `#F4620A` rounded tile, four white bars
-at descending opacities, and a `#F5C842` dot. Nothing here is upscaled from a
-raster.
+assumed. That is **four** copies of the mark, not three; all four hash the same
+and any edit has to touch all four. It is a true vector: an orange `#F4620A`
+rounded tile, four white bars at descending opacities, and a `#F5C842` dot.
+Nothing here is upscaled from a raster.
+
+### The mark sits 2 units lower than it used to (SAA-130)
+
+The tallest bar spanned y8..28 on the 40-unit grid — 8 units of air above it and
+12 below — so the mark hung high in its tile. The whole mark, bars and dot
+together, was translated down 2 in one uniform step: bars to y10..30, dot `cy`
+7 -> 9. Nothing was resized and nothing was recentred by eye, which is why every
+`y` moved by exactly 2 and no `x`, `width`, `height` or `r` moved at all.
+
+`render.swift` asserts the result rather than trusting it: the tallest bar must
+leave equal air above and below, so a later nudge "to taste" fails the build.
+
+### The bars do not share a baseline
+
+Bar bottoms are at y29, y29, y30, y28 — y27/27/28/26 before the translate, and
+the translate did not touch the relationship. Read as **drift, not design**:
+
+  * Every `y` and every `height` in the SVG is a round number (19/14/10/15 and
+    10/15/20/13). Bottoms are the *sum* of the two, and sums of independently
+    chosen round numbers land wherever they land. A deliberate baseline would
+    have made the bottoms round and let the tops fall out instead.
+  * The spread is 2 units out of 40 — 0.8px at a 16pt tray slot and about 1px
+    on a 32px Dock icon. A designer choosing an uneven baseline chooses one
+    that is visible; this one is not.
+  * There is no pattern in it. Not a slant, not a curve, not an arch — 29, 29,
+    30, 28 is noise, and the tallest bar being the odd one out is what you get
+    from picking `y=10, height=20` because both are round.
+
+**Left exactly as found.** It is the brand mark, and tidying it is a separate
+decision for whoever owns the brand — not a thing to slip into a geometry fix.
 
 There is no SVG rasteriser on this machine (no `rsvg-convert`, no Inkscape, no
 Pillow), so `render.swift` redraws the mark in CoreGraphics from the SVG's
@@ -45,17 +76,27 @@ Wired into `build-app.sh`, which copies the `.icns` into `Resources/` and sets
   * `<state>.png` / `@2x` — fixed colour, using the same dot palette
     `main.js`'s `DOT` table already uses.
 
-The tray mark drops the tile and uses **three** bars, not the logo's four. A
-16pt orange square with bars inside it is a blob, and a coloured tile cannot be
-a template image at all. Four 2px bars with gaps were mostly white space and
-read at roughly half the weight of the battery and wifi glyphs beside them;
-three 3px bars in the same 11px span carry the same identity — it is
-bars-and-a-dot, and the count was never the load-bearing part — for about 30%
-more ink (`stoppedTemplate.png` went from 48 to 63 opaque pixels).
+The tray mark drops the tile — a 16pt orange square with bars inside it is a
+blob, and a coloured tile cannot be a template image at all — but it keeps the
+logo's **four** bars.
 
-This divergence from the logo is deliberate and applies only to the tray. The
-app icon keeps all four bars: it is rendered large enough for them and it should
-be the brand mark rather than an interpretation of it.
+It was three bars for one commit. Three 3px bars in the same 11px span bought
+about 30% more ink than four 2px ones (`stoppedTemplate.png` 48 -> 63 opaque
+pixels) and the count looked like the cheap thing to spend. It was not: the
+notification and the tray appear side by side, and a three-bar mark next to a
+four-bar one reads as two products. Coherence won. The thinner bars are the
+accepted cost and are **not** compensated for by widening — 2px on a 3px pitch
+is what four bars fit in that span, and `stoppedTemplate.png` is back to 48
+opaque pixels, matching the original four-bar mark exactly.
+
+One pixel differs from that original: the first varied bar went 6 -> 7. At 6 it
+tied with the flat height, so the leading bar carried no state at all. Flat was
+held at 6 rather than dropped to 5 to clear it, because three of the four states
+are flat and that height is the mark's resting weight.
+
+The app icon and the tray mark now differ only in pixel-hinting — bar width,
+pitch and cap rounding, which are 16pt survival rather than brand. `render.swift`
+asserts the counts match, so they cannot drift apart again.
 
 State is encoded on two channels, so it survives monochrome where hue does not
 exist:
@@ -117,12 +158,16 @@ looking.
 
 ## Preview
 
-`preview/tray-preview.png` — four blocks, all at true 16 and 32 device pixels on
+`preview/tray-preview.png` — an app-icon block, then four tray blocks at true 16
+and 32 device pixels on
 light and dark menu bar backgrounds, with drawn neighbour glyphs at the same
 scale:
 
-  1. **Weight** — the superseded four-bar mark beside the new three-bar one, so
-     the change is judgeable rather than asserted.
+  0. **The translate** — the old app icon beside the new one at 128, 96, 64 and
+     32px, with the tile's vertical centreline drawn across both. The new
+     mark's tallest bar is centred on that line; the old one rides above it.
+  1. **Tray weight** — the superseded three-bar mark beside the new four-bar
+     one, so the change is judgeable rather than asserted.
   2. **Monochrome template**, full variant.
   3. **Colour**, full variant.
   4. **The hybrid as wired.**
