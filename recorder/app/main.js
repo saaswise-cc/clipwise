@@ -226,6 +226,12 @@ let isQuitting = false;
 // 'stopped' | 'starting' | 'recording' | 'stalled'
 let state = 'stopped';
 let session = null;
+// What caused the capture that is about to start, when it was not a person.
+// Set immediately before the detection path calls startRecording() and
+// consumed unconditionally there, so it can never survive to label a later,
+// unrelated start. Carries the fact the removed "call detected" notification
+// used to carry (SAA-151).
+let pendingStartTrigger = null;
 let teardownInFlight = false;
 
 // Pipeline state is tracked separately from capture state, not folded into
@@ -760,6 +766,24 @@ function renderTray() {
             { label: 'Dismiss failure', click: dismissPipelineFailure },
         );
     }
+    // The combos, permanently readable. This replaces the launch notification
+    // that used to announce them (SAA-151): the combos never change, so a
+    // notification that persists until dismissed was charging a recurring
+    // dismissal for a fact that only has to be discoverable once. A menu item
+    // costs no menu bar width — only the title does — and is there whenever it
+    // is wanted rather than only at launch. A hotkey that did not register is
+    // still reported by notification, because that one is news.
+    if (hotkeys.length) {
+        items.push({ type: 'separator' }, {
+            label: 'Hotkeys',
+            submenu: hotkeys.map(h => ({
+                label: h.live
+                    ? `${h.accel} — ${h.what}`
+                    : `${h.accel} — ${h.what} (did not register)`,
+                enabled: false,
+            })),
+        });
+    }
     items.push({ type: 'separator' }, { label: 'Quit', click: quitApp });
     tray.setContextMenu(Menu.buildFromTemplate(items));
 }
@@ -845,14 +869,23 @@ function formatElapsed(ms) {
 // after stopRecording has already flipped the state).
 function notifyStateChange(prev, next) {
     const stem = session ? session.stem : null;
-    if (next === 'starting') {
-        notify('Clipwise: capture starting', stem || 'Waiting for both tracks.');
-        return;
-    }
+    // 'starting' is deliberately silent (SAA-151). It fired roughly a second
+    // before 'recording started' and said less: the useful fact is that both
+    // tracks are writing, and until they are there is nothing to report that
+    // the next notification does not report better. The tray already shows the
+    // starting state, and a start that never reaches 'recording' still gets a
+    // notification — the stopped branch below says nothing was saved.
+    if (next === 'starting') return;
     if (next === 'recording' && prev === 'starting') {
-        notify('Clipwise: recording started', stem
+        // Names the detecting application when one started this capture. That
+        // is what the removed 'call detected' notification carried a second
+        // earlier; folding it in here costs nothing and drops a notification.
+        const detail = stem
             ? `Both tracks are writing — ${stem}`
-            : 'Both tracks are writing.');
+            : 'Both tracks are writing.';
+        notify('Clipwise: recording started', session && session.trigger
+            ? `Detected ${session.trigger}. ${detail}`
+            : detail);
         return;
     }
     // The flapping pair.
@@ -1199,7 +1232,11 @@ function handleDetectEvent(ev) {
     }
     if (decision === 'record') {
         console.error(`detect: ${key} is allowed — starting capture`);
-        notify('Clipwise: call detected', `${detectName(ev)} — starting a capture.`);
+        // No notification here (SAA-151). This fired, then 'capture starting',
+        // then 'recording started' — three for one event, all within about a
+        // second. The one fact this carried that the others did not is the
+        // application name, which now rides on 'recording started'.
+        pendingStartTrigger = detectName(ev);
         startRecording();
         return;
     }
@@ -1622,6 +1659,12 @@ function registerIdentityIpc() {
 // --- lifecycle ------------------------------------------------------------
 
 function startRecording() {
+    // Consumed before the guard, not after: a trigger describes the start
+    // attempt being made now. Leaving it set when this returns early would
+    // label some later manual start with an application that had nothing to
+    // do with it.
+    const trigger = pendingStartTrigger;
+    pendingStartTrigger = null;
     if (state !== 'stopped' || session) return;
     fs.mkdirSync(OUTDIR, { recursive: true });
     const stamp = utcStamp();
@@ -1721,6 +1764,9 @@ function startRecording() {
         paths,
         stem: stamp,
         recordingId: manifest.recording_id,
+        // Which application's microphone use started this, or null when a
+        // person did. Read only by the 'recording started' notification.
+        trigger,
         // Wall clock at spawn, for the elapsed figure the status hotkey and
         // the stop notification report. Separate from the manifest's
         // started_at, which is an ISO string for consumers downstream.
@@ -1977,15 +2023,17 @@ function registerHotkeys() {
         return { name, accel, what, returned, readback, live, error };
     });
 
-    // Surfaced at launch, by notification, because the tray item is precisely
-    // what cannot be relied on to deliver this. Both outcomes are reported: on
-    // success because you have to be told which combos are live before you can
-    // press them, and on failure because a dead hotkey is otherwise invisible.
+    // Only failure is notified now (SAA-151). The success case fired at every
+    // single launch and, with alert style at Persistent, had to be dismissed at
+    // every single launch — to report a pair of combos that had not changed
+    // since the last time. It is a fact to look up, not an event, so it moved
+    // to the tray menu above where looking it up is always possible.
+    //
+    // Failure stays a notification: a dead hotkey IS an event, it is news, it
+    // happens rarely, and the tray item is precisely what cannot be relied on
+    // to carry it — that is the whole reason the hotkeys exist.
     const dead = hotkeys.filter(h => !h.live);
-    if (dead.length === 0) {
-        notify('Clipwise hotkeys registered',
-            `${HOTKEY_TOGGLE} starts/stops. ${HOTKEY_STATUS} reports state.`);
-    } else {
+    if (dead.length > 0) {
         const live = hotkeys.filter(h => h.live);
         notify(
             dead.length === hotkeys.length
@@ -1997,6 +2045,9 @@ function registerHotkeys() {
                 'Use the menu bar icon for anything not covered.',
             ].join('\n'));
     }
+    // Re-render: the tray was first built before these existed, so the Hotkeys
+    // submenu is empty until this runs.
+    renderTray();
     return hotkeys;
 }
 
