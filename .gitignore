@@ -4,4 +4,6 @@ recorder/miccap/.build/
 recorder/app/node_modules/
 recorder/app/dist/
 recorder/diagnostics/audioinuse
+# Built on demand by menubarwatch.sh, same as audioinuse above.
+recorder/diagnostics/menubarscan
 recorder/micwatch
