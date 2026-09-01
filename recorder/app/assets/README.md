@@ -77,115 +77,105 @@ Wired into `build-app.sh`, which copies the `.icns` into `Resources/` and sets
     `main.js`'s `DOT` table already uses.
 
 The tray mark drops the tile — a 16pt orange square with bars inside it is a
-blob, and a coloured tile cannot be a template image at all — but it keeps the
-logo's **four** bars.
+blob, and a coloured tile cannot be a template image at all — and is otherwise
+**the logo's own geometry**: four bars at their real widths, heights and
+spacing, plus the dot at its real size and position, scaled to fill the slot.
 
-It was three bars for one commit. Three 3px bars in the same 11px span bought
-about 30% more ink than four 2px ones (`stoppedTemplate.png` 48 -> 63 opaque
-pixels) and the count looked like the cheap thing to spend. It was not: the
-notification and the tray appear side by side, and a three-bar mark next to a
-four-bar one reads as two products. Coherence won. The thinner bars are the
-accepted cost and are **not** compensated for by widening — 2px on a 3px pitch
-is what four bars fit in that span, and `stoppedTemplate.png` is back to 48
-opaque pixels, matching the original four-bar mark exactly.
-
-One pixel differs from that original: the first varied bar went 6 -> 7. At 6 it
-tied with the flat height, so the leading bar carried no state at all. Flat was
-held at 6 rather than dropped to 5 to clear it, because three of the four states
-are flat and that height is the mark's resting weight.
-
-The app icon and the tray mark now differ only in pixel-hinting — bar width,
-pitch and cap rounding, which are 16pt survival rather than brand. `render.swift`
-asserts the counts match, so they cannot drift apart again.
-
-State is encoded on two channels, so it survives monochrome where hue does not
-exist:
-
-| state     | bars   | dot    |
-|-----------|--------|--------|
-| stopped   | flat   | none   |
-| starting  | flat   | ring   |
-| recording | varied | filled |
-| stalled   | flat   | filled |
-
-Recording is the only state with varied bars, because recording-or-not is the
-distinction that has to be readable without comparing against anything.
-
-## The proposed mark (`tray-proposed/`) — NOT wired in
-
-An alternative to everything above: the logo's own geometry rather than a
-redrawn approximation of it. `tray-proposed/` holds all sixteen files;
-`build-app.sh` copies `tray/` and nothing reads this directory. Choosing
-between the two is a separate decision that this pass deliberately does not
-make.
-
-**What it is.** The mark exactly as it sits inside the app icon — four bars at
-their real widths, heights and spacing, plus the dot at its real size and
-position — with the tile dropped and the whole thing scaled to fill the 16pt
-slot. Nothing is reinterpreted: `drawLogoTrayMark` iterates `SVG_BARS` and
-`SVG_DOT` directly, so a fifth bar in the SVG becomes a fifth bar in the tray
-with no edit. The tray mark and the app icon are the same drawing at two sizes.
+`drawLogoTrayMark` iterates `SVG_BARS` and `SVG_DOT` directly. There is no
+second table of numbers, so the tray mark and the app icon are one drawing at
+two sizes and a fifth bar in the SVG becomes a fifth bar in the tray with no
+edit to the renderer.
 
 **The box is the mark, not the tile.** Bars span x10..30 and the dot x30..38;
-bars span y10..30 and the dot y5..13. So the mark is 28 wide by 25 tall —
-*wider than it is tall* — and fitting it into a square slot is width-bound at
-16/28. The spare height becomes air above and below. `assertGeometry` checks
-those bounds and that the box does not touch the tile edge, because a box that
-did would mean the tile was never dropped.
+bars span y10..30 and the dot y5..13. So the mark is 28 wide by 25 tall — wider
+than it is tall — and fitting it into a square slot is width-bound at 16/28,
+with the spare height as air above and below. `assertGeometry` checks those
+bounds and that the box does not touch the tile edge, because a box that did
+would mean the tile was never dropped.
 
 **The dot is present in every state, stopped included.** It is the distinctive
-half of the logo, and the shipped mark's resting state has no dot at all, which
-is why it reads as a generic signal meter. State therefore lives in the dot's
-fill rather than its presence: hollow for starting, filled for everything else.
+half of the logo; the drawing this replaced had no dot at rest, which is why it
+read as a generic signal meter. State lives in the dot's fill rather than its
+presence:
+
+| state     | bars          | dot    | variant  |
+|-----------|---------------|--------|----------|
+| stopped   | logo profile  | filled | template |
+| starting  | logo profile  | ring   | template |
+| recording | logo profile  | filled | colour, red dot |
+| stalled   | logo profile  | filled | colour, yellow dot |
+
+The bars no longer vary between states — they are the logo's fixed profile —
+so the varied-versus-flat channel that used to carry "audio is arriving" is
+gone. Nothing is lost at the state level: colour carries recording-versus-not,
+and the dot's fill carries starting.
+
+### What the superseded drawing was
+
+`drawApproxTrayMark` is still in `render.swift`, rendered only into the preview
+sheet so the change is visible. It was a redrawn approximation: bars invented at
+2px on a 3px pitch so every edge landed on a whole pixel, flat-versus-varied
+heights carrying state, and no dot at rest. `assertGeometry` still checks its
+bar count, because it is captioned in the sheet as what the mark used to be and
+so it has to actually be that.
 
 ### It costs pixel alignment, and the cost is real
 
 True proportions do not land on the pixel grid. A 5.5-unit bar pitch becomes
-3.14px at 16pt where the shipped mark uses a whole 3px by construction.
-Measured with alpha forced to 0-or-1, so anything in between is antialiasing
-and nothing else — bars and dot counted apart, because a circle is soft at any
-size in any drawing and lumping it in would blame curvature on the proposal:
+3.14px at 16pt. Measured with alpha forced to 0-or-1, so anything in between is
+antialiasing and nothing else — bars and dot counted apart, because a circle is
+soft at any size in any drawing and lumping it in would blame curvature on the
+geometry:
 
 | mark | bars @1x | bars @2x | dot @1x | dot @2x |
 |------|----------|----------|---------|---------|
-| shipped  | **0% soft** | 2% | 64% | 27% |
-| proposed | **65% soft** | 43% | 72% | 35% |
+| superseded | **0% soft** | 2% | 64% | 27% |
+| shipped    | **65% soft** | 43% | 72% | 35% |
 
-So yes: it turns soft at @1x, and the number is two thirds of the bar pixels.
-It has NOT been re-hinted back into alignment, because pixel-hinting is the
-approximation being replaced. @2x — which is what a Retina menu bar actually
-draws — is 43% and holds up; @1x only reaches the screen on a non-Retina
-display.
+Two thirds of the bar pixels at @1x. It has **not** been hinted back into
+alignment, because hinting is what made the old mark an approximation. @2x —
+what a Retina menu bar actually draws — is 43% and holds up; @1x only reaches
+the screen on a non-Retina display.
 
 The hollow dot survives the size: at @1x the ring's own ink is 234/255 and its
-hole 28/255, so filled-versus-hollow is a 227/255 gap rather than a smudge.
-At @2x it is 255 against 0.
+hole 28/255, a 227/255 gap rather than a smudge. At @2x it is 255 against 0.
 
-### Four states hold apart — but only under the hybrid
+### Two consequences worth knowing
 
-Checked by hashing the rendered files rather than by eye:
+**The all-template variant no longer separates four states.** Hashing the
+rendered files:
 
-| variant | shipped mark | proposed mark |
-|---------|--------------|---------------|
+| variant | superseded | shipped |
+|---------|-----------|---------|
 | the hybrid, as wired | 4 distinct of 4 | **4 distinct of 4** |
 | all-colour | 4 of 4 | 4 of 4 |
 | all-template | 4 of 4 | **2 of 4** |
 
-Under the shipped hybrid the proposed mark separates all four: template versus
-colour splits {stopped, starting} from {recording, stalled}, the dot's fill
-splits stopped from starting, and the dot's colour splits recording from
-stalled.
+Under all-template, `stoppedTemplate`, `recordingTemplate` and
+`stalledTemplate` come out byte-identical — the bars are always the logo's
+fixed profile and the dot is filled in all three, so there is no varied-versus-
+flat cue left to carry recording and no absent-dot cue to carry stopped. The
+hybrid, which is what ships, separates all four. But "switching to all-template
+is that table and nothing else" is no longer true, and the note under
+[The hybrid](#the-hybrid) should be read with that in mind.
 
-Under the **all-template** variant it collapses. `stoppedTemplate`,
-`recordingTemplate` and `stalledTemplate` come out byte-identical, because the
-bars are now always the logo's fixed profile and the dot is filled in all
-three — there is no varied-versus-flat bar cue left to carry recording, and no
-absent-dot cue left to carry stopped. The shipped mark keeps all four there.
+**The SAA-105 eviction harness has much less margin.** `menubarscan` establishes
+presence by counting pixels near the brand orange `#F4620A`, needing 40. The
+logo gives its bars descending opacities, so three of the four now blend with
+the bar and stop matching; only the fully-opaque third bar still does. Measured
+on a real captured menu bar:
 
-That matters because "both full variants stay on disk, switching is that table
-and nothing else" (below) stops being true for this mark. It is stated rather
-than fixed: fixing it would mean varying the bars, and varying the bars is
-reinterpreting the geometry, which is the thing being replaced.
+| mark | presence px | over the threshold of 40 | state dot px |
+|------|-------------|--------------------------|--------------|
+| superseded, recording | 280 | 7.0x | 68 |
+| superseded, stalled | 192 | 4.8x | 68 |
+| shipped, recording | **64** | **1.6x** | 52 |
+| shipped, stalled | **64** | **1.6x** | 52 |
+
+Detection still works — both states are still named correctly — but presence
+now rests on a single 3px-wide bar rather than a 22px group. That bar is fully
+opaque, so the count is background-independent and stable; the margin is simply
+thinner. Nothing in `recorder/diagnostics` has been changed to compensate.
 
 ## The hybrid
 
@@ -208,8 +198,12 @@ Confirmed on both layers rather than assumed: AppKit redraws one status item's
 button colour -> template -> colour with no latching, and Electron preserves
 each image's flag across four alternating `setImage` calls.
 
-Both full variants stay on disk. Switching to all-template or all-colour is that
-table and nothing else; no regeneration needed.
+Both full variants stay on disk and switching is still just that table, with no
+regeneration needed — but since the mark became the logo's own geometry, the
+all-template variant no longer separates all four states: stopped, recording
+and stalled render byte-identical there. All-colour still separates four, and
+so does the hybrid as wired. See
+[Two consequences worth knowing](#two-consequences-worth-knowing).
 
 `createFromPath` loads the `@2x` sibling automatically (the loaded image reports
 `scaleFactors [1,2]`), so only base names appear in the code. It returns an
@@ -234,17 +228,16 @@ looking.
 
 ## Preview
 
-`preview/tray-proposed.png` — the proposed mark against the shipped one: all
-four states at true 16 and 32 device pixels on the dark menu bar with the same
-drawn neighbours, in the hybrid and in monochrome, then 8x and 4x
+`preview/tray-geometry-change.png` — the shipped mark against the drawing it
+replaced: all four states at true 16 and 32 device pixels on the dark menu bar
+with the same drawn neighbours, in the hybrid and in monochrome, then 8x and 4x
 nearest-neighbour blow-ups of those same pixels so the antialiasing is visible
 rather than described. The blow-up block leads with stopped and starting,
-because in the proposed mark those two differ only by the dot's fill.
+because those two differ only by the dot's fill.
 
-A `new, flat alpha` row drops the logo's per-bar opacities (0.6 / 0.8 / 1.0 /
-0.7). The proposed mark keeps them — they are part of the same drawing — and
-that row exists only so the cost of keeping them is visible. It is not a third
-proposal.
+A `shipped, flat alpha` row drops the logo's per-bar opacities (0.6 / 0.8 / 1.0
+/ 0.7). The shipped mark keeps them — they are part of the same drawing — and
+that row exists only so the cost of keeping them is visible.
 
 
 `preview/tray-preview.png` — an app-icon block, then four tray blocks at true 16

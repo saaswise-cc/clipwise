@@ -113,45 +113,45 @@ func assertGeometry() {
             + "resizing a bar")
     }
 
-    // (2) the SHIPPED tray mark's bar count still tracks the logo's. It is a
-    // redrawn approximation, so its count is an independent number that can
-    // drift; this is what catches that.
+    // (2) the SUPERSEDED drawing's bar count still tracks the logo's. It no
+    // longer ships, but the preview sheet still renders it to show what
+    // changed, and a comparison against a mark that had drifted would mislead.
     let barCount = svg.components(separatedBy: "<rect").count - 1 - 1  // minus the tile
     if barCount != LOGO_BAR_COUNT {
         problems.append(
-            "the shipped tray mark draws \(TRAY_BAR_COUNT) bars to match a \(LOGO_BAR_COUNT)-bar "
-            + "logo, but the logo now has \(barCount). Redraw it to match rather than letting "
-            + "the two marks diverge again")
+            "the superseded drawing in the preview sheet has \(TRAY_BAR_COUNT) bars against a "
+            + "\(LOGO_BAR_COUNT)-bar logo, but the logo now has \(barCount). Fix it or drop it "
+            + "from the sheet; a comparison against stale art is worse than none")
     }
     if TRAY_BAR_COUNT != LOGO_BAR_COUNT {
         problems.append(
-            "the shipped tray mark draws \(TRAY_BAR_COUNT) bars where the logo has "
-            + "\(LOGO_BAR_COUNT). They appear side by side in the notification and the menu "
-            + "bar; the counts match on purpose")
+            "the superseded drawing has \(TRAY_BAR_COUNT) bars where the logo has "
+            + "\(LOGO_BAR_COUNT). It is only preview art now, but it is captioned as what "
+            + "the mark used to be, so it has to actually be that")
     }
 
-    // (2b) the PROPOSED tray mark does not need a count check, because it has
-    // no count of its own: drawLogoTrayMark iterates SVG_BARS directly, so a
-    // fifth bar in the SVG becomes a fifth bar in the tray with no edit here.
-    // What it does need is for the box it scales into to be the mark rather
-    // than the tile — the whole meaning of "minus the tile" — and for the dot
-    // to be inside that box rather than clipped by it.
+    // (2b) the SHIPPED tray mark needs no count check, because it has no count
+    // of its own: drawLogoTrayMark iterates SVG_BARS directly, so a fifth bar
+    // in the SVG becomes a fifth bar in the tray with no edit here. What it
+    // does need is for the box it scales into to be the mark rather than the
+    // tile — the whole meaning of "minus the tile" — and for the dot to be
+    // inside that box rather than clipped by it.
     if MARK_X0 != 10 || MARK_X1 != 38 || MARK_Y0 != 5 || MARK_Y1 != 30 {
         problems.append(
-            "the proposed tray mark scales the box x\(fmt(MARK_X0))..\(fmt(MARK_X1)), "
+            "the shipped tray mark scales the box x\(fmt(MARK_X0))..\(fmt(MARK_X1)), "
             + "y\(fmt(MARK_Y0))..\(fmt(MARK_Y1)) into the menu bar slot. That was the union of "
             + "the bars and the dot when this was written; if the mark moved, re-read it rather "
             + "than trusting these bounds")
     }
     if MARK_X0 == 0 || MARK_Y0 == 0 || MARK_X1 == SVG_SIDE || MARK_Y1 == SVG_SIDE {
         problems.append(
-            "the proposed tray mark's box touches the tile edge, which means it is scaling the "
+            "the shipped tray mark's box touches the tile edge, which means it is scaling the "
             + "TILE and not the mark. Dropping the tile is the point")
     }
     // The dot is the distinctive half and it must survive the crop in every
     // state, stopped included.
     if SVG_DOT.cx + SVG_DOT.r > MARK_X1 || SVG_DOT.cy - SVG_DOT.r < MARK_Y0 {
-        problems.append("the proposed tray mark would clip the dot, which is the half of the "
+        problems.append("the shipped tray mark would clip the dot, which is the half of the "
                         + "logo that makes it Clipwise rather than a signal meter")
     }
 
@@ -172,8 +172,8 @@ func assertGeometry() {
     }
     print("  geometry check: app icon matches the SVG exactly, bar for bar; "
           + "tallest bar equidistant (\(fmt(above)) above, \(fmt(below)) below); "
-          + "shipped tray mark matches the logo at \(TRAY_BAR_COUNT) bars; "
-          + "proposed tray mark derives from the SVG (box "
+          + "superseded preview art still at \(TRAY_BAR_COUNT) bars; shipped tray mark "
+          + "derives from the SVG (box "
           + "\(fmt(MARK_W))x\(fmt(MARK_H)) units, \(SVG_BARS.count) bars + dot, tile dropped)")
 }
 
@@ -323,7 +323,7 @@ enum DotKind { case none, ring, filled }
 
 /// Draws the mark into `ctx` at the origin, `scale` = 1 or 2.
 /// `mono` draws pure black (alpha carries the shape; AppKit inverts it).
-func drawTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool,
+func drawApproxTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool,
                   legacy: Bool = false) {
     let s = CGFloat(scale)
     let side = 16 * s
@@ -400,21 +400,24 @@ func drawTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool,
 
 func writeTrayMark(state: TrayState, scale: Int, mono: Bool, path: String) {
     let ctx = newContext(16 * scale, 16 * scale)
-    drawTrayMark(ctx, state: state, scale: scale, mono: mono)
+    drawLogoTrayMark(ctx, state: state, scale: scale, mono: mono)
     writePNG(ctx, path)
 }
 
-// --- 2b. the PROPOSED tray mark: the logo's own geometry, minus the tile ----
+// --- 2b. THE SHIPPED tray mark: the logo's own geometry, minus the tile -----
 //
-// Everything above this line is a redrawn approximation of the mark: bars
-// invented at 2px on a 3px pitch so every edge lands on a whole pixel. This is
-// the alternative — the mark exactly as it sits inside the app icon, tile
-// dropped, scaled to fill the 16pt slot. Nothing is reinterpreted: every number
-// below is read out of SVG_BARS and SVG_DOT, so the tray mark and the app icon
-// are the same drawing at two sizes.
+// This is what tray/ holds and what the bundle loads. drawApproxTrayMark above
+// is the drawing it replaced — bars invented at 2px on a 3px pitch so every
+// edge lands on a whole pixel, and no dot at rest — kept only so the preview
+// sheet can show what changed. Nothing here is reinterpreted: every number is
+// read out of SVG_BARS and SVG_DOT, so the tray mark and the app icon are the
+// same drawing at two sizes, and a fifth bar in the SVG becomes a fifth bar in
+// the tray with no edit here.
 //
-// Not wired in. These render into tray-proposed/ and nothing loads them; the
-// shipped tray/ marks are untouched.
+// The cost is pixel alignment: true proportions put 65% of the bar pixels on
+// fractional coverage at @1x (43% at @2x). That is measured at the end of this
+// file rather than asserted, and it is NOT hinted back into alignment, because
+// hinting is what made the old mark an approximation.
 //
 // The mark's bounding box is the union of the bars and the dot — NOT the 40x40
 // tile, which is exactly what "minus the tile" means. Bars span x10..30, the
@@ -475,12 +478,6 @@ func drawLogoTrayMark(_ ctx: CGContext, state: TrayState, scale: Int, mono: Bool
                                      width: (r - lw / 2) * 2, height: (r - lw / 2) * 2))
     }
     ctx.restoreGState()
-}
-
-func writeLogoTrayMark(state: TrayState, scale: Int, mono: Bool, path: String) {
-    let ctx = newContext(16 * scale, 16 * scale)
-    drawLogoTrayMark(ctx, state: state, scale: scale, mono: mono)
-    writePNG(ctx, path)
 }
 
 // --- the softness check ----------------------------------------------------
@@ -601,11 +598,11 @@ func appIconImage(px: Int, legacy: Bool) -> CGImage {
 
 /// A tray mark rendered into its own bitmap at true device size, with the
 /// template inversion applied when the background calls for it.
-func trayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool,
+func approxTrayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool,
                legacy: Bool = false) -> CGImage {
     let px = 16 * scale
     let mctx = newContext(px, px)
-    drawTrayMark(mctx, state: state, scale: scale, mono: mono, legacy: legacy)
+    drawApproxTrayMark(mctx, state: state, scale: scale, mono: mono, legacy: legacy)
     let img = mctx.makeImage()!
     guard mono && dark else { return img }
     // What AppKit does to a template image on a dark bar: keep the alpha,
@@ -719,8 +716,8 @@ func buildPreviewSheet(path: String) {
                 let x = (wStart + CGFloat(i) * wStep + offsets[j]).rounded()
                 let yb = (Y(top + stripH) + (stripH - px) / 2).rounded()
                 ctx.saveGState(); ctx.interpolationQuality = .none
-                ctx.draw(trayImage(state: st, scale: scale, mono: true, dark: dark,
-                                   legacy: isLegacy),
+                ctx.draw(approxTrayImage(state: st, scale: scale, mono: true, dark: dark,
+                                         legacy: isLegacy),
                          in: CGRect(x: x, y: yb, width: px, height: px))
                 ctx.restoreGState()
             }
@@ -802,10 +799,10 @@ func buildPreviewSheet(path: String) {
     writePNG(ctx, path)
 }
 
-/// A proposed-mark image at true device size, with template inversion applied
-/// where the background calls for it — same treatment trayImage gives the
-/// shipped mark, so the two are comparable rather than merely adjacent.
-func logoTrayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool,
+/// The shipped mark at true device size, with template inversion applied where
+/// the background calls for it — the same treatment approxTrayImage gives the
+/// superseded drawing, so the two are comparable rather than merely adjacent.
+func trayImage(state: TrayState, scale: Int, mono: Bool, dark: Bool,
                    flatAlpha: Bool = false) -> CGImage {
     let px = 16 * scale
     let mctx = newContext(px, px)
@@ -891,10 +888,10 @@ func buildProposedSheet(path: String) {
          x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
     top += 24
     stateHeader { hybridIsMono($0) ? "template" : "colour" }
-    strip("current") { st, sc in
+    strip("superseded") { st, sc in
+        approxTrayImage(state: st, scale: sc, mono: hybridIsMono(st), dark: true) }
+    strip("SHIPPED") { st, sc in
         trayImage(state: st, scale: sc, mono: hybridIsMono(st), dark: true) }
-    strip("new") { st, sc in
-        logoTrayImage(state: st, scale: sc, mono: hybridIsMono(st), dark: true) }
     top += 22
 
     // ---- block B: monochrome, so the comparison is ink and nothing else ----
@@ -902,10 +899,10 @@ func buildProposedSheet(path: String) {
          x: 24, baseline: Y(top + 13), size: 12.5, dark: false, bold: true)
     top += 24
     stateHeader { _ in "template" }
-    strip("current") { st, sc in trayImage(state: st, scale: sc, mono: true, dark: true) }
-    strip("new") { st, sc in logoTrayImage(state: st, scale: sc, mono: true, dark: true) }
-    strip("new, flat alpha") { st, sc in
-        logoTrayImage(state: st, scale: sc, mono: true, dark: true, flatAlpha: true) }
+    strip("superseded") { st, sc in approxTrayImage(state: st, scale: sc, mono: true, dark: true) }
+    strip("SHIPPED") { st, sc in trayImage(state: st, scale: sc, mono: true, dark: true) }
+    strip("shipped, flat alpha") { st, sc in
+        trayImage(state: st, scale: sc, mono: true, dark: true, flatAlpha: true) }
     text(ctx, "The logo gives its bars descending opacities (0.6 / 0.8 / 1.0 / 0.7). \"new\" keeps them, because they are part of the same drawing. \"new, flat alpha\" drops",
          x: 24, baseline: Y(top + 12), size: 11, dark: false)
     top += 15
@@ -928,13 +925,13 @@ func buildProposedSheet(path: String) {
     // distinguishability question and it belongs where it can be seen.
     for st in [TrayState.stopped, TrayState.starting, TrayState.recording] {
         var col = bx
-        for (lbl, isNew, scale) in [("current 1x", false, 1), ("new 1x", true, 1),
-                                    ("current 2x", false, 2), ("new 2x", true, 2)] {
+        for (lbl, isNew, scale) in [("superseded 1x", false, 1), ("shipped 1x", true, 1),
+                                    ("superseded 2x", false, 2), ("shipped 2x", true, 2)] {
             text(ctx, lbl, x: col, baseline: Y(top + 10), size: 9.5, dark: false,
                  bold: isNew)
             let img = isNew
-                ? logoTrayImage(state: st, scale: scale, mono: hybridIsMono(st), dark: true)
-                : trayImage(state: st, scale: scale, mono: hybridIsMono(st), dark: true)
+                ? trayImage(state: st, scale: scale, mono: hybridIsMono(st), dark: true)
+                : approxTrayImage(state: st, scale: scale, mono: hybridIsMono(st), dark: true)
             ctx.setFillColor(red: MENUBAR_DARK.r, green: MENUBAR_DARK.g, blue: MENUBAR_DARK.b, alpha: 1)
             ctx.fill(CGRect(x: col, y: Y(top + 16 + tile), width: tile, height: tile))
             ctx.saveGState(); ctx.interpolationQuality = .none
@@ -990,38 +987,20 @@ print("  wrote \(count) tray marks into tray/")
 buildPreviewSheet(path: "preview/tray-preview.png")
 print("  wrote preview/tray-preview.png")
 
-// The proposed mark. Written to its own directory and loaded by nothing —
-// build-app.sh copies tray/, not this. Choosing between the two is a separate
-// decision, and this pass deliberately does not make it.
-try? FileManager.default.createDirectory(atPath: "tray-proposed",
-                                         withIntermediateDirectories: true)
-var proposed = 0
-for st in TrayState.allCases {
-    for scale in [1, 2] {
-        let suffix = scale == 2 ? "@2x" : ""
-        writeLogoTrayMark(state: st, scale: scale, mono: true,
-                          path: "tray-proposed/\(st.rawValue)Template\(suffix).png")
-        writeLogoTrayMark(state: st, scale: scale, mono: false,
-                          path: "tray-proposed/\(st.rawValue)\(suffix).png")
-        proposed += 2
-    }
-}
-print("  wrote \(proposed) proposed marks into tray-proposed/ (wired into nothing)")
-
-buildProposedSheet(path: "preview/tray-proposed.png")
-print("  wrote preview/tray-proposed.png")
+buildProposedSheet(path: "preview/tray-geometry-change.png")
+print("  wrote preview/tray-geometry-change.png")
 
 // The fractional-pixel question, answered in numbers rather than adjectives.
 // Alpha is forced to 0-or-1 so anything in between is antialiasing.
 print("  edge softness, geometry only (alpha forced to 0 or 1), bars and dot counted apart:")
-// `recording` for the current mark, because that is its only state with a
-// filled dot — comparing against a stopped mark that has no dot at all would
-// flatter it. The proposed mark has a dot in every state, which is the point.
-softnessReport("current  recording") { c, s in
-    drawTrayMark(c, state: .recording, scale: s, mono: true) }
-softnessReport("proposed recording") { c, s in
+// `recording` for the superseded mark, because that was its only state with a
+// filled dot — comparing against a stopped mark that had no dot at all would
+// flatter it. The shipped mark has a dot in every state, which is the point.
+softnessReport("superseded recording") { c, s in
+    drawApproxTrayMark(c, state: .recording, scale: s, mono: true) }
+softnessReport("shipped    recording") { c, s in
     drawLogoTrayMark(c, state: .recording, scale: s, mono: true, geometryOnly: true) }
-softnessReport("proposed stopped  ") { c, s in
+softnessReport("shipped    stopped  ") { c, s in
     drawLogoTrayMark(c, state: .stopped, scale: s, mono: true, geometryOnly: true) }
 
 // Does the hollow dot still read as hollow? In the proposed mark, filled-vs-
