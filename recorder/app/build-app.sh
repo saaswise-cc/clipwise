@@ -92,9 +92,18 @@ mv "$C/MacOS/Electron" "$C/MacOS/$APP_NAME"
 # integrity hash in Info.plist with it — a stale hash against a missing file is
 # a launch failure waiting for a fuse to be flipped.
 rm -f "$C/Resources/default_app.asar"
-# Shipping electron.icns would put the Electron icon in Login Items next to the
-# name Clipwise. A generic icon is not worse than a wrong one.
+# Electron's own icon goes, and ours takes its place (SAA-130). Until now the
+# bundle shipped with no icon at all, deliberately — the reasoning recorded here
+# was that a generic icon is not worse than a wrong one, and Electron's icon
+# beside the name Clipwise in Login Items is a wrong one. That trade expires the
+# moment a real icon exists.
 rm -f "$C/Resources/electron.icns"
+if [ -f "$APP_SRC/assets/$APP_NAME.icns" ]; then
+  cp "$APP_SRC/assets/$APP_NAME.icns" "$C/Resources/$APP_NAME.icns"
+else
+  echo "build-app: assets/$APP_NAME.icns missing — run assets/render.swift, see assets/README.md" >&2
+  exit 1
+fi
 
 mkdir -p "$C/Resources/app" "$C/Resources/bin"
 cp "$APP_SRC/main.js" "$C/Resources/app/main.js"
@@ -189,7 +198,9 @@ set_key LSMinimumSystemVersion  string "14.2"
 set_key NSMicrophoneUsageDescription string "Clipwise records your microphone as one track of the meetings you capture."
 set_key NSAudioCaptureUsageDescription string "Clipwise records system audio as the other track of the meetings you capture."
 $PB -c "Delete :ElectronAsarIntegrity" "$PLIST" >/dev/null 2>&1 || true
-$PB -c "Delete :CFBundleIconFile" "$PLIST" >/dev/null 2>&1 || true
+# Points at Resources/Clipwise.icns, copied in above. Was deleted outright until
+# SAA-130, because there was nothing to point it at.
+set_key CFBundleIconFile        string "$APP_NAME"
 $PB -c "Delete :LSApplicationCategoryType" "$PLIST" >/dev/null 2>&1 || true
 
 # --- 4. sign --------------------------------------------------------------
