@@ -186,13 +186,35 @@ case "states":
         die("usage: menubarscan states <png> name:RRGGBB [name:RRGGBB ...] [--tol N] [--min N]")
     }
     var tol = 12
-    var minPx = 25          // below this, a "match" is antialiasing on something else
+    // The state dot is SMALL. On the SAA-130 marks it is 42px for recording
+    // and 25px for stalled, against 300px for the flat circle that preceded
+    // them, so a threshold tuned for the old artwork sat exactly on top of
+    // stalled. Presence is established by the bars instead; this floor only
+    // has to be high enough to reject a stray antialiased pixel.
+    var minPx = 12
+    // The presence marker: a large, distinctive block that says "Clipwise is
+    // on the bar" without saying which state. The state dot then names the
+    // state. Splitting the two is what keeps the harness working now that the
+    // thing carrying identity and the thing carrying state are different sizes.
+    var presence: (String, (Int, Int, Int))? = nil
+    var presenceMin = 40
     var candidates: [(String, (Int, Int, Int))] = []
     var ai = 3
     while ai < args.count {
         let a = args[ai]
         if a == "--tol", ai + 1 < args.count { tol = Int(args[ai + 1]) ?? tol; ai += 2; continue }
         if a == "--min", ai + 1 < args.count { minPx = Int(args[ai + 1]) ?? minPx; ai += 2; continue }
+        if a == "--presence-min", ai + 1 < args.count {
+            presenceMin = Int(args[ai + 1]) ?? presenceMin; ai += 2; continue
+        }
+        if a == "--presence", ai + 1 < args.count {
+            let pp = args[ai + 1].split(separator: ":")
+            guard pp.count == 2, pp[1].count == 6, let pv = Int(pp[1], radix: 16) else {
+                die("menubarscan: bad --presence \(args[ai + 1]), expected name:RRGGBB")
+            }
+            presence = (String(pp[0]), ((pv >> 16) & 0xFF, (pv >> 8) & 0xFF, pv & 0xFF))
+            ai += 2; continue
+        }
         let parts = a.split(separator: ":")
         guard parts.count == 2, parts[1].count == 6, let v = Int(parts[1], radix: 16) else {
             die("menubarscan: bad candidate \(a), expected name:RRGGBB")
@@ -209,8 +231,7 @@ case "states":
         print("BLANK - 0 - strip did not photograph a menu bar; result withheld")
         exit(3)
     }
-    var hits: [(name: String, n: Int, lo: Int, hi: Int)] = []
-    for (name, t) in candidates {
+    func count(_ t: (Int, Int, Int)) -> (n: Int, lo: Int, hi: Int) {
         var n = 0, lo = w2, hi = 0
         for y in 0..<h2 {
             for x in 0..<w2 {
@@ -220,13 +241,30 @@ case "states":
                 }
             }
         }
-        if n >= minPx { hits.append((name, n, lo, hi)) }
+        return (n, lo, hi)
     }
-    if hits.isEmpty {
+
+    var hits: [(name: String, n: Int, lo: Int, hi: Int)] = []
+    for (name, t) in candidates {
+        let r = count(t)
+        if r.n >= minPx { hits.append((name, r.n, r.lo, r.hi)) }
+    }
+    var presenceHit: (n: Int, lo: Int, hi: Int)? = nil
+    if let (_, pt) = presence {
+        let r = count(pt)
+        if r.n >= presenceMin { presenceHit = r }
+    }
+
+    if hits.isEmpty && presenceHit == nil {
         print("ABSENT - 0 -")
+    } else if hits.isEmpty, let ph = presenceHit {
+        // The mark is on the bar but no state dot matched. Reported honestly as
+        // unknown rather than guessed at.
+        print("PRESENT unknown \(ph.n) \(ph.lo)..\(ph.hi) bars=\(ph.n)")
     } else {
         let best = hits.max(by: { $0.n < $1.n })!
         var line = "PRESENT \(best.name) \(best.n) \(best.lo)..\(best.hi)"
+        if let ph = presenceHit { line += " bars=\(ph.n)" }
         if hits.count > 1 {
             let others = hits.filter { $0.name != best.name }
                 .map { "\($0.name):\($0.n)" }.joined(separator: ",")

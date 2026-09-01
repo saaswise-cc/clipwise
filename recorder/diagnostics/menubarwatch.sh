@@ -58,23 +58,47 @@ ROOT="$HOME/Library/Application Support/clipwise-diagnostics/menubar"
 RUN_DIR="$ROOT/$(date +%Y-%m-%d)"
 PIDFILE="$ROOT/menubarwatch.pid"
 
-# All four tray states, not one. These are main.js's DOT table verbatim, which
-# is what dotIcon paints the tray dot from.
+# WHAT MATCHES, AND WHAT NO LONGER DOES — updated for the SAA-130 marks, built
+# into the bundle on 2026-09-01 at commit 9b3e0d7.
 #
-# Keying this to a single colour was a real defect while it lasted: the stopped
-# grey is what the icon shows when nothing is happening, and a real meeting is
-# spent almost entirely in `recording` (#FF453A). A harness matching only the
-# grey would have reported ABSENT for the whole window it exists to observe —
-# the opposite of the right answer, delivered confidently, which is precisely
-# the failure mode this harness was built to end.
+# The tray is now a HYBRID (main.js TRAY_VARIANT):
 #
-# The matched state is recorded per frame, so the index also shows what the
-# recorder believed it was doing at the moment of each capture.
+#   stopped    monochrome template  -> NOT DETECTABLE by colour. A template has
+#   starting   monochrome template     no fixed hue; macOS paints it black or
+#                                      white to follow the menu bar, so there is
+#                                      nothing here to match on.
+#   recording  colour  #F4620A bars + #FF453A dot  -> detectable
+#   stalled    colour  #F4620A bars + #FFD60A dot  -> detectable
 #
-# If the SAA-130 marks ship, stopped and starting become monochrome templates
-# that follow the menu bar and will NOT match a fixed colour; recording and
-# stalled stay #F4620A bars with these dots and will still match. Revisit then.
+# This is acceptable ONLY because every frame that matters for the SAA-105
+# eviction test is a recording frame. Measured against the shipped assets:
+#
+#   stopped    -> ABSENT - 0 -
+#   starting   -> ABSENT - 0 -
+#   recording  -> PRESENT recording 42 ... bars=238
+#   stalled    -> PRESENT stalled  25 ... bars=156
+#
+# TWO CONSEQUENCES THAT MUST NOT BE MISREAD.
+#
+# 1. ABSENT while the recorder is idle is EXPECTED, not eviction. Those frames
+#    are annotated below so the index cannot be read the wrong way round.
+#
+# 2. The `starting` state spawns miccap and systemtap, so capture_state reads
+#    "recording" while the tray is still showing the undetectable template. At a
+#    10s interval at most one frame per capture can land in that window
+#    (STARTING_TIMEOUT_MS is 9s). So an ISOLATED ABSENT at the very beginning of
+#    a capture is probably the starting template; SUSTAINED ABSENT across many
+#    recording frames is the eviction. Read runs, not single frames.
+#
+# Presence and state are matched separately, because after SAA-130 the thing
+# carrying identity and the thing carrying state are very different sizes. The
+# #F4620A bars are 156-238px and appear nowhere else on this menu bar (verified:
+# ABSENT on a frame with only the template mark). The state dot is 25-42px,
+# down from 300px for the flat circle that preceded it — small enough that a
+# threshold tuned for the old artwork sat exactly on top of `stalled`. So the
+# bars establish that Clipwise is there and the dot names which state.
 CLIPWISE_STATES="${MENUBARWATCH_STATES:-stopped:8E8E93 starting:FF9F0A recording:FF453A stalled:FFD60A}"
+CLIPWISE_PRESENCE="${MENUBARWATCH_PRESENCE:-bars:F4620A}"
 
 log() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -123,7 +147,13 @@ tick() {
     return 1
   fi
   # shellcheck disable=SC2086 -- CLIPWISE_STATES is a deliberate word list
-  found="$("$SCAN" states "$png" $CLIPWISE_STATES 2>/dev/null | head -1)"
+  found="$("$SCAN" states "$png" $CLIPWISE_STATES --presence "$CLIPWISE_PRESENCE" 2>/dev/null | head -1)"
+  # An idle recorder shows a monochrome template, which has no colour to match.
+  # Annotated so a reader cannot mistake a row of expected ABSENTs for the
+  # eviction this harness exists to catch.
+  case "$found" in
+    ABSENT*) [ "$state" = "idle" ] && found="ABSENT-expected-idle-template 0 -" ;;
+  esac
   printf '%s\t%s\t%s\t%s\t%s\n' \
     "$stamp" "$(basename "$png")" "$front" "$state" "$found" >> "$dir/index.tsv"
   # "PRESENT recording 300 2294..2313" -> verdict and state, for the console line
@@ -137,7 +167,7 @@ new_index() {
   local dir="$1"
   [ -f "$dir/index.tsv" ] && return
   printf '# SAA-105 menu bar observation — started %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$dir/index.tsv"
-  printf '# interval=%ss  strip_height=%spt  clipwise_states=%s\n' "$INTERVAL" "$MENUBAR_H" "$CLIPWISE_STATES" >> "$dir/index.tsv"
+  printf '# interval=%ss  strip_height=%spt  states=%s  presence=%s\n' "$INTERVAL" "$MENUBAR_H" "$CLIPWISE_STATES" "$CLIPWISE_PRESENCE" >> "$dir/index.tsv"
   printf '# stamp\tfile\tfrontmost\tcapture_state\tclipwise\n' >> "$dir/index.tsv"
 }
 
@@ -161,8 +191,12 @@ cmd_check() {
   local rc=$?
   log ""
   # shellcheck disable=SC2086
-  log "  Clipwise: $("$SCAN" states "$png" $CLIPWISE_STATES)"
-  log "  (states searched: $CLIPWISE_STATES)"
+  log "  Clipwise: $("$SCAN" states "$png" $CLIPWISE_STATES --presence "$CLIPWISE_PRESENCE")"
+  log "  (states: $CLIPWISE_STATES | presence: $CLIPWISE_PRESENCE)"
+  if [ "$(capture_state)" = "idle" ]; then
+    log "  NOTE: idle recorder shows a monochrome template — ABSENT here is expected,"
+    log "        not eviction. The eviction test needs a capture running."
+  fi
   log "  frontmost: $(frontmost)   capture: $(capture_state)"
   rm -rf "$tmp"
   return $rc
