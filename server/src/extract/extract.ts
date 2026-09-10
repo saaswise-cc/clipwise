@@ -52,6 +52,34 @@ For each moment, name the speaker(s) if known and give a start/end offset in sec
 
 Zero moments is a valid answer if the span is pure filler. Otherwise, err on the side of one strong moment rather than several thin ones.`;
 
+// Appended to MOMENT_EXTRACTION_SYSTEM when the recording's speaker tracks
+// were never resolved to real identities (SAA-165) — the identity mapping
+// in ingest/identity.ts declines to name `me`/`them` unless the call has
+// exactly one named guest, and that decline covers `me` as well as `them`.
+// Without this, the model fills the gap itself: it reads a name spoken in
+// the dialogue and writes it into the moment as the actor, which is a
+// guess dressed as a fact, and unlike the transcript it produces a
+// standalone written record. A group call's `them` track can carry more
+// than one remote voice, so no line of "them" text can be pinned on one
+// of them from the track alone, and per SAA-165 a wrong owner is worse
+// than none — never trade a correct-looking guess for a wrong one.
+function unresolvedIdentityGuard(attendeeNames: string[]): string {
+  const roster =
+    attendeeNames.length > 0
+      ? `This call's known attendees are: ${attendeeNames.join(", ")}. Do not use any other person's name, and do not guess at a name or its spelling from what you think you heard — if you are not certain a name from the dialogue is one of these attendees, spelled this way, leave it out.`
+      : `This call's attendee list is empty or was not captured, so no name is confirmed at all.`;
+
+  return `Speaker identity was not established for this call. The transcript's speaker labels ("me", "them") are raw capture tracks, not verified individuals — in particular "them" can be a single mixed feed carrying more than one remote participant, so the track alone never tells you which of them said a given line.
+
+${roster}
+
+Never name a specific individual as the one who said, did, agreed to, committed to, or was scheduled to do something — that includes phrasing like "X agreed", "synced with X", "blocked time with X", where X reads as a participant in the exchange. You cannot verify from the track who that participant was, even when a name was spoken aloud, and even when the name is one of the attendees above. Write these without naming an individual instead ("a participant offered to...", "the group decided to...", "blocked time on Thursday to work through it together").
+
+The one exception is naming someone strictly as the target or subject of an unnamed participant's action — someone a task is directed at or a fact is about, not someone credited with doing anything themselves in this call (e.g. "flagged the ask to Juan", "waiting on approval from Daniela and Mike"). Use an exact name from the attendee list above for this only when you are confident of the spelling; otherwise leave it out too.
+
+Set \`speakers\` to the raw track label(s) only ("me" and/or "them"), never a person's name. Never write a raw track label into the title or summary as if it were a person's name (e.g. never write "Speaker will...").`;
+}
+
 type Segment = {
   orderIndex: number;
   startSec: number;
@@ -99,6 +127,35 @@ function renderTranscript(segs: Segment[]): string {
     .join("\n");
 }
 
+// Whether ingest/identity.ts's applySpeakerNames ever named a track on this
+// recording. It only writes displayName for exactly-one-named-guest calls
+// and declines for everyone else (including `me`), so "no speaker row has
+// a displayName" is the same condition that decline leaves behind — this
+// just reads it back rather than re-deriving the guest count.
+async function loadIdentityResolved(recordingId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: schema.speakers.id })
+    .from(schema.speakers)
+    .where(
+      and(
+        eq(schema.speakers.recordingId, recordingId),
+        sql`${schema.speakers.displayName} IS NOT NULL`,
+      ),
+    );
+  return row !== undefined;
+}
+
+// Ground truth for the roster the unresolved-identity guard hands the
+// model, so a spoken "John" can be checked against "Jon Dwyer" instead of
+// taken on faith (SAA-165).
+async function loadAttendeeNames(recordingId: string): Promise<string[]> {
+  const rows = await db
+    .select({ name: schema.attendees.name })
+    .from(schema.attendees)
+    .where(eq(schema.attendees.recordingId, recordingId));
+  return rows.map((r) => r.name).filter((n): n is string => !!n && n.trim().length > 0);
+}
+
 async function loadRecording(recordingId: string): Promise<{ accountId: string; title: string | null }> {
   const [row] = await db
     .select({
@@ -129,10 +186,25 @@ type ExtractedMoment = {
   offsetsOriginal?: { start_sec: number; end_sec: number };
 };
 
+// Span labels land in metadata.span_label and are returned by search_moments
+// alongside the moment itself, so a name that leaks in here is just as
+// visible as one in the title (SAA-165) — pass1 needs the same guard as
+// pass2, just shorter, since a label is a topic tag rather than a claim
+// about who did what.
+function unresolvedIdentitySpanGuard(attendeeNames: string[]): string {
+  const roster =
+    attendeeNames.length > 0
+      ? `known attendees: ${attendeeNames.join(", ")}`
+      : "no confirmed attendee list";
+  return `\n\nSpeaker identity was not established for this call (${roster}) — "me"/"them" are raw capture tracks, and "them" may mix more than one remote participant. Do not name a specific individual in a span label as the one who said or did something; describe the topic instead ("revenue presentation sync", not "syncing with <name>"). Do not guess at a name or its spelling from what you think you heard.`;
+}
+
 async function runPass1(
   client: Anthropic,
   transcriptRendered: string,
   segCount: number,
+  identityResolved: boolean,
+  attendeeNames: string[],
 ): Promise<Span[]> {
   const tool = {
     name: "emit_spans",
@@ -158,10 +230,14 @@ async function runPass1(
     },
   } as const;
 
+  const system = identityResolved
+    ? TOPIC_SEGMENTATION_SYSTEM
+    : TOPIC_SEGMENTATION_SYSTEM + unresolvedIdentitySpanGuard(attendeeNames);
+
   const resp = await client.messages.create({
     model: MODEL,
     max_tokens: 16000,
-    system: TOPIC_SEGMENTATION_SYSTEM,
+    system,
     tools: [tool as never],
     tool_choice: { type: "tool", name: "emit_spans" },
     messages: [
@@ -198,6 +274,8 @@ async function runPass2(
   transcriptRendered: string,
   span: Span,
   segs: Segment[],
+  identityResolved: boolean,
+  attendeeNames: string[],
 ): Promise<ExtractedMoment[]> {
   const spanSegs = segs.filter(
     (s) =>
@@ -250,10 +328,14 @@ async function runPass2(
     },
   } as const;
 
+  const system = identityResolved
+    ? MOMENT_EXTRACTION_SYSTEM
+    : `${MOMENT_EXTRACTION_SYSTEM}\n\n${unresolvedIdentityGuard(attendeeNames)}`;
+
   const resp = await client.messages.create({
     model: MODEL,
     max_tokens: 8000,
-    system: MOMENT_EXTRACTION_SYSTEM,
+    system,
     tools: [tool as never],
     tool_choice: { type: "tool", name: "emit_moments" },
     messages: [
@@ -293,13 +375,22 @@ async function runPass2(
       is_personnel_assessment: boolean;
       speakers: string[];
     };
+    // Backstop for the metadata field specifically (SAA-165): the prompt
+    // above tells the model to use only the raw track labels here when
+    // identity isn't resolved, but this is a structured field we can
+    // enforce in code rather than trust to compliance — drop anything
+    // that isn't literally "me" or "them" instead of storing a name the
+    // mapping never verified.
+    const speakers = identityResolved
+      ? (r.speakers ?? [])
+      : (r.speakers ?? []).filter((s) => s === "me" || s === "them");
     return {
       kind: r.kind,
       title: r.title,
       summary: r.summary,
       startSec: r.start_sec,
       endSec: r.end_sec,
-      speakers: r.speakers ?? [],
+      speakers,
       isPersonnelAssessment: r.is_personnel_assessment === true,
     };
   });
@@ -404,13 +495,18 @@ export async function runExtraction(
   if (segs.length === 0) {
     throw new Error(`recording ${recordingId} has zero segments — nothing to extract`);
   }
+  const identityResolved = await loadIdentityResolved(recordingId);
+  const attendeeNames = await loadAttendeeNames(recordingId);
+  console.log(
+    `extract: identity resolved for this recording: ${identityResolved} (attendees: ${attendeeNames.join(", ") || "none"})`,
+  );
   const rendered = renderTranscript(segs);
   const runUuid = randomUUID();
 
   console.log(`extract: recording ${recordingId} — ${segs.length} segments`);
   console.log(`extract: run uuid ${runUuid}`);
   console.log(`extract: pass 1 (topic segmentation) starting`);
-  const spans = await runPass1(client, rendered, segs.length);
+  const spans = await runPass1(client, rendered, segs.length, identityResolved, attendeeNames);
   console.log(`extract: pass 1 emitted ${spans.length} spans`);
 
   // Assert spans tile [0, segCount-1]. Report gaps and overlaps loudly;
@@ -451,7 +547,7 @@ export async function runExtraction(
   let outOfRange = 0;
   for (let i = 0; i < spans.length; i++) {
     const span = spans[i];
-    const moments = await runPass2(client, rendered, span, segs);
+    const moments = await runPass2(client, rendered, span, segs, identityResolved, attendeeNames);
 
     // Validate offsets in code (see schema comment on start_sec/end_sec).
     const spanSegs = segs.filter(
