@@ -169,12 +169,24 @@ momentsRouter.get(
       );
     }
     if (query.q) {
-      const like = `%${query.q}%`;
-      const textMatch = or(
-        ilike(schema.moments.title, like),
-        ilike(schema.moments.summary, like),
-      );
-      if (textMatch) conditions.push(textMatch);
+      // SAA-158: this used to run one ILIKE against the whole query
+      // string, so a multi-word query only matched a moment where the
+      // words appeared contiguously and in that order — a query for two
+      // words that are both in the moment's text, just not next to each
+      // other, returned zero regardless of what the store contained.
+      // Split on whitespace and AND a substring match per word instead
+      // (each word can land in either title or summary independently).
+      // Still pure substring matching, no ranking or embeddings — AD
+      // #13's separation of the lexical and semantic paths is unchanged.
+      const words = query.q.split(/\s+/).filter(Boolean);
+      for (const word of words) {
+        const like = `%${word}%`;
+        const wordMatch = or(
+          ilike(schema.moments.title, like),
+          ilike(schema.moments.summary, like),
+        );
+        if (wordMatch) conditions.push(wordMatch);
+      }
     }
 
     // Semantic path — separate from substring per AD #13. Return shape

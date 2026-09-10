@@ -19,7 +19,7 @@ const DESC = {
   searchMomentsTool:
     "Search the Clipwise moments database for the configured account. Two retrieval paths (per Architecture Decision #13, kept separate rather than fused): `query` for lexical/substring matching, `semanticQuery` for cosine-similarity retrieval over embeddings. Pass one or the other, not both. Returns moment metadata plus the recording title so Claude can cite where the moment came from; semantic results also include a similarity score and the producing embedding model.",
   query:
-    "Lexical search. Case-insensitive substring match against moment title/summary. Best for exact terms — names, product names, dollar figures — where similarity cannot separate them even in principle.",
+    "Lexical search. Case-insensitive substring match against moment title/summary. Best for exact terms — names, product names, dollar figures — where similarity cannot separate them even in principle. A multi-word query ANDs a substring match per word (each word can land in title or summary independently); words need not be contiguous or in order.",
   semanticQuery:
     "Semantic search. Free-text question or description; results are ranked by cosine similarity against moment embeddings. Best for interpretation-heavy queries (what did we decide about X, who pushed back on Y). Returns up to `limit` results with a per-result `similarity` score in [-1,1]. Results always fill up to the limit regardless of relevance because there is no distance floor — you MUST read the similarity score to judge whether a low-ranked result is actually a match, otherwise you will treat unrelated moments as answers. Mutually exclusive with `query` — pass one or the other, not both.",
   recordingId: "Restrict to a single recording (UUID).",
