@@ -36,7 +36,17 @@ export class ClipwiseClient {
     kind?: string;
     attendee?: string;
     limit?: number;
-  }): Promise<{ moments: MomentSummary[] }> {
+  }): Promise<{
+    moments: MomentSummary[];
+    // True count of moments matching the filters, before `limit` cut it
+    // down (SAA-131, SAA-108) — read this rather than moments.length to
+    // tell a complete result from a truncated one.
+    totalMatches: number;
+    // totalMatches > moments.length. When true, this result is a partial
+    // answer: absence of something from `moments` is not evidence it
+    // doesn't exist, and a conclusion drawn from it should say so.
+    truncated: boolean;
+  }> {
     return this.get(`/accounts/${this.config.accountId}/moments`, {
       q: params.q,
       semantic_q: params.semanticQ,

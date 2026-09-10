@@ -211,6 +211,17 @@ momentsRouter.get(
       // avoids sorting on NULL distance which pgvector treats as
       // greater than any distance value.
       conditions.push(isNotNull(schema.moments.embedding));
+
+      // True match count (SAA-131, SAA-108): computed against the same
+      // `conditions` this query's WHERE uses, before `limit` cuts it down,
+      // so a caller can tell a complete result from a page of one.
+      const [{ count: totalMatches }] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(schema.moments)
+        .innerJoin(schema.recordings, eq(schema.moments.recordingId, schema.recordings.id))
+        .where(and(...conditions));
+
+      const limit = query.limit ?? 50;
       const rows = await db
         .select({
           id: schema.moments.id,
@@ -242,11 +253,20 @@ momentsRouter.get(
         )
         .where(and(...conditions))
         .orderBy(asc(distance))
-        .limit(query.limit ?? 50);
-      res.json({ moments: rows });
+        .limit(limit);
+      res.json({ moments: rows, totalMatches, truncated: totalMatches > rows.length });
       return;
     }
 
+    // True match count (SAA-131, SAA-108) — see the semantic branch above
+    // for why this runs against `conditions` before `limit` is applied.
+    const [{ count: totalMatches }] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(schema.moments)
+      .innerJoin(schema.recordings, eq(schema.moments.recordingId, schema.recordings.id))
+      .where(and(...conditions));
+
+    const limit = query.limit ?? 50;
     const rows = await db
       .select({
         id: schema.moments.id,
@@ -270,9 +290,9 @@ momentsRouter.get(
       )
       .where(and(...conditions))
       .orderBy(desc(schema.moments.createdAt))
-      .limit(query.limit ?? 50);
+      .limit(limit);
 
-    res.json({ moments: rows });
+    res.json({ moments: rows, totalMatches, truncated: totalMatches > rows.length });
   }),
 );
 
