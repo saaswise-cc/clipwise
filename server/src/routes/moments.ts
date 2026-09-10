@@ -289,7 +289,23 @@ momentsRouter.get(
         eq(schema.moments.recordingId, schema.recordings.id),
       )
       .where(and(...conditions))
-      .orderBy(desc(schema.moments.createdAt))
+      // SAA-108: plain `desc(createdAt)` exhausts the most-recently-extracted
+      // recording before a caller ever sees a second one, because moments
+      // from one extraction run land within seconds of each other — a
+      // query matching 9+ recordings returned all 50 from the newest 1-2.
+      // Round-robin by recording instead: rank each recording's own matches
+      // by recency (most recent first within that recording), then take
+      // every recording's rank-1 moment before any recording's rank-2, and
+      // so on. This is ordering, not scoring — no relevance model, nothing
+      // AD #13 would call fusion — so a single-recording query (one
+      // partition) degenerates to the original createdAt-desc order with
+      // nothing dropped, while a multi-recording query gets breadth without
+      // thinning out the recordings that actually have many matches (they
+      // keep contributing at every round-robin depth).
+      .orderBy(
+        sql`row_number() over (partition by ${schema.moments.recordingId} order by ${schema.moments.createdAt} desc)`,
+        desc(schema.moments.createdAt),
+      )
       .limit(limit);
 
     res.json({ moments: rows, totalMatches, truncated: totalMatches > rows.length });
