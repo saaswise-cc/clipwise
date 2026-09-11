@@ -36,6 +36,7 @@ export class ClipwiseClient {
     kind?: string;
     attendee?: string;
     limit?: number;
+    scope?: "work" | "personal" | "all";
   }): Promise<{
     moments: MomentSummary[];
     // True count of moments matching the filters, before `limit` cut it
@@ -46,6 +47,11 @@ export class ClipwiseClient {
     // answer: absence of something from `moments` is not evidence it
     // doesn't exist, and a conclusion drawn from it should say so.
     truncated: boolean;
+    // The personal-vs-work scope actually applied (SAA-153) — "work" when
+    // the caller passed none.
+    scope: "work" | "personal" | "all";
+    // True when `scope` was not passed and "work" was applied by default.
+    scopeDefaulted: boolean;
   }> {
     return this.get(`/accounts/${this.config.accountId}/moments`, {
       q: params.q,
@@ -54,6 +60,7 @@ export class ClipwiseClient {
       kind: params.kind,
       attendee: params.attendee,
       limit: params.limit?.toString(),
+      scope: params.scope,
     });
   }
 

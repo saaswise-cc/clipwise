@@ -17,7 +17,7 @@ import { ClipwiseClient, loadConfig } from "./client.js";
 
 const DESC = {
   searchMomentsTool:
-    "Search the Clipwise moments database for the configured account. Two retrieval paths (per Architecture Decision #13, kept separate rather than fused): `query` for lexical/substring matching, `semanticQuery` for cosine-similarity retrieval over embeddings. Pass one or the other, not both. Returns moment metadata plus the recording title so Claude can cite where the moment came from; semantic results also include a similarity score and the producing embedding model. The response also carries `totalMatches` (the true count before `limit` cut it down) and `truncated` (true when `totalMatches` exceeds the returned list). Check `truncated` before concluding something is absent or rare — on a truncated result that conclusion is unsound, and raising `limit` or narrowing the query (e.g. adding `recordingId`) is required first.",
+    "Search the Clipwise moments database for the configured account. Two retrieval paths (per Architecture Decision #13, kept separate rather than fused): `query` for lexical/substring matching, `semanticQuery` for cosine-similarity retrieval over embeddings. Pass one or the other, not both. Returns moment metadata plus the recording title so Claude can cite where the moment came from; semantic results also include a similarity score and the producing embedding model. The response also carries `totalMatches` (the true count before `limit` cut it down) and `truncated` (true when `totalMatches` exceeds the returned list). Check `truncated` before concluding something is absent or rare — on a truncated result that conclusion is unsound, and raising `limit` or narrowing the query (e.g. adding `recordingId`) is required first. The response also carries `scope` (the personal/work filter that actually ran) and `scopeDefaulted` (true when `scope` was not passed and \"work\" was applied automatically) — a caller drawing a conclusion like \"there's nothing about X\" should check this before treating it as evidence about personal calls too.",
   query:
     "Lexical search. Case-insensitive substring match against moment title/summary. Best for exact terms — names, product names, dollar figures — where similarity cannot separate them even in principle. A multi-word query ANDs a substring match per word (each word can land in title or summary independently); words need not be contiguous or in order.",
   semanticQuery:
@@ -27,6 +27,8 @@ const DESC = {
   attendee:
     "Restrict to recordings this person was on. Case-insensitive substring match against the attendee's name — who was in the meeting, not who the moment talks about, so a call where they never came up still matches and a call where they were only mentioned does not. Composes with `query` or `semanticQuery` (both filters apply) and works on its own. Only recordings whose attendee list was captured can match; one with no attendee rows is invisible to this filter rather than an error.",
   limit: "Max results. Defaults to 50.",
+  scope:
+    'Personal-vs-work filter (SAA-153). One of "work" (default), "personal", or "all". Defaults to "work" when omitted — pass "personal" explicitly to reach personal calls (e.g. the family FaceTime case this was built for), or "all" to search across both. The response echoes back which scope actually ran.',
   getTranscriptTool:
     "Fetch the full transcript for a recording, with per-segment timestamps and speaker labels.",
   getTranscriptRecordingId: "The recording to fetch the transcript for (UUID).",
@@ -39,6 +41,7 @@ const searchMomentsInput = z.object({
   kind: z.string().optional().describe(DESC.kind),
   attendee: z.string().min(1).max(256).optional().describe(DESC.attendee),
   limit: z.number().int().min(1).max(200).optional().describe(DESC.limit),
+  scope: z.enum(["work", "personal", "all"]).optional().describe(DESC.scope),
 });
 
 const getTranscriptInput = z.object({
@@ -66,6 +69,11 @@ async function main(): Promise<void> {
             kind: { type: "string", description: DESC.kind },
             attendee: { type: "string", description: DESC.attendee },
             limit: { type: "number", description: DESC.limit },
+            scope: {
+              type: "string",
+              enum: ["work", "personal", "all"],
+              description: DESC.scope,
+            },
           },
         },
       },
@@ -98,6 +106,7 @@ async function main(): Promise<void> {
           kind: input.kind,
           attendee: input.attendee,
           limit: input.limit,
+          scope: input.scope,
         });
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

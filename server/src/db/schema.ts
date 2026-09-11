@@ -83,6 +83,18 @@ export const recordings = pgTable(
     endedAt: timestamp("ended_at", { withTimezone: true }),
     status: varchar("status", { length: 32 }).notNull().default("pending"),
     meetingKind: varchar("meeting_kind", { length: 32 }),
+    // Personal-vs-work classification (SAA-153) — deliberately a separate
+    // column from meeting_kind rather than an overload of it: "kind of
+    // meeting" and "personal versus work" are not the same axis, and
+    // meeting_kind is null on every self-capture already. Null here means
+    // unclassified, not "work" — search_moments' default-scope filter
+    // treats null as work for now (see moments.ts), since almost every
+    // existing recording predates this column and defaulting unclassified
+    // to invisible would make the common case regress the day this ships.
+    // Source of truth going forward is the identity-prompt answer at stop
+    // (settled in the issue; the recorder-side prompt UI itself is not
+    // part of this change).
+    scope: varchar("scope", { length: 16 }),
     metadata: jsonb("metadata"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -95,6 +107,7 @@ export const recordings = pgTable(
     accountIdx: index("recordings_account_idx").on(t.accountId),
     sourceIdx: index("recordings_source_idx").on(t.source, t.sourceId),
     slugIdx: uniqueIndex("recordings_slug_idx").on(t.slug),
+    scopeValid: check("recordings_scope_valid", sql`${t.scope} IN ('work', 'personal')`),
   }),
 );
 

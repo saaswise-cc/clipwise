@@ -7,6 +7,7 @@ import {
   exists,
   ilike,
   isNotNull,
+  isNull,
   or,
   sql,
 } from "drizzle-orm";
@@ -42,6 +43,11 @@ const searchMomentsQuerySchema = z.object({
   // be fed from that side.
   attendee: z.string().min(1).max(256).optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
+  // Personal-vs-work classification filter (SAA-153). Defaults to "work"
+  // when omitted — see the default-scope handling below for why, and for
+  // why the response always echoes which scope actually applied rather
+  // than narrowing silently.
+  scope: z.enum(["work", "personal", "all"]).optional(),
 });
 
 export const momentsRouter = Router({ mergeParams: true });
@@ -130,6 +136,30 @@ momentsRouter.get(
     if (query.kind) {
       conditions.push(eq(schema.moments.kind, query.kind));
     }
+    // Personal-vs-work filter (SAA-153). Defaults to "work" when the
+    // caller names no scope: it's the overwhelming majority of use, and
+    // the failure mode of leaking a personal call into a work answer is
+    // worse than the reverse (a work query missing personal content is
+    // one re-query away via scope=all). The response states which scope
+    // actually ran (see res.json below) so this default is never silent.
+    //
+    // A recording with scope IS NULL — every recording predating this
+    // column — counts as "work" under the work filter rather than being
+    // excluded. Almost the entire existing corpus is unclassified today;
+    // treating unclassified as invisible would regress the common case
+    // the moment this ships. Only a recording explicitly marked
+    // 'personal' is excluded from "work".
+    const resolvedScope = query.scope ?? "work";
+    const scopeDefaulted = query.scope === undefined;
+    if (resolvedScope === "work") {
+      conditions.push(
+        or(isNull(schema.recordings.scope), eq(schema.recordings.scope, "work"))!,
+      );
+    } else if (resolvedScope === "personal") {
+      conditions.push(eq(schema.recordings.scope, "personal"));
+    }
+    // resolvedScope === "all" adds no condition.
+
     // Attendee filter (SAA-127) — the person→call hop. Correlated EXISTS
     // on the moment's recording rather than a join, so a recording with
     // several matching attendee rows still yields each moment once and
@@ -254,7 +284,13 @@ momentsRouter.get(
         .where(and(...conditions))
         .orderBy(asc(distance))
         .limit(limit);
-      res.json({ moments: rows, totalMatches, truncated: totalMatches > rows.length });
+      res.json({
+        moments: rows,
+        totalMatches,
+        truncated: totalMatches > rows.length,
+        scope: resolvedScope,
+        scopeDefaulted,
+      });
       return;
     }
 
@@ -308,7 +344,13 @@ momentsRouter.get(
       )
       .limit(limit);
 
-    res.json({ moments: rows, totalMatches, truncated: totalMatches > rows.length });
+    res.json({
+      moments: rows,
+      totalMatches,
+      truncated: totalMatches > rows.length,
+      scope: resolvedScope,
+      scopeDefaulted,
+    });
   }),
 );
 
