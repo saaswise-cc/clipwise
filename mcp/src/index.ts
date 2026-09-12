@@ -17,7 +17,7 @@ import { ClipwiseClient, loadConfig } from "./client.js";
 
 const DESC = {
   searchMomentsTool:
-    "Search the Clipwise moments database for the configured account. Two retrieval paths (per Architecture Decision #13, kept separate rather than fused): `query` for lexical/substring matching, `semanticQuery` for cosine-similarity retrieval over embeddings. Pass one or the other, not both. Returns moment metadata plus the recording title so Claude can cite where the moment came from; semantic results also include a similarity score and the producing embedding model. The response also carries `totalMatches` (the true count before `limit` cut it down) and `truncated` (true when `totalMatches` exceeds the returned list). Check `truncated` before concluding something is absent or rare — on a truncated result that conclusion is unsound, and raising `limit` or narrowing the query (e.g. adding `recordingId`) is required first. The response also carries `scope` (the personal/work filter that actually ran) and `scopeDefaulted` (true when `scope` was not passed and \"work\" was applied automatically) — a caller drawing a conclusion like \"there's nothing about X\" should check this before treating it as evidence about personal calls too.",
+    "Search the Clipwise moments database for the configured account. Two retrieval paths (per Architecture Decision #13, kept separate rather than fused): `query` for lexical/substring matching, `semanticQuery` for cosine-similarity retrieval over embeddings. Pass one or the other, not both. Returns moment metadata plus the recording title so Claude can cite where the moment came from; semantic results also include a similarity score and the producing embedding model. The response also carries `totalMatches` (the true count before `limit` cut it down) and `truncated` (true when `totalMatches` exceeds the returned list). Check `truncated` before concluding something is absent or rare — on a truncated result that conclusion is unsound, and raising `limit` or narrowing the query (e.g. adding `recordingId`) is required first. The response also carries `scope` (the personal/work filter that actually ran) and `scopeDefaulted` (true when `scope` was not passed and \"work\" was applied automatically) — a caller drawing a conclusion like \"there's nothing about X\" should check this before treating it as evidence about personal calls too. A third mode, `index` (SAA-85), enumerates recordings themselves — which meetings existed, with attendees and moment counts by kind, no moment content — for questions like \"what happened last week\" or \"every 1:1 with X\"; see the `index` parameter.",
   query:
     "Lexical search. Case-insensitive substring match against moment title/summary. Best for exact terms — names, product names, dollar figures — where similarity cannot separate them even in principle. A multi-word query ANDs a substring match per word (each word can land in title or summary independently); words need not be contiguous or in order.",
   semanticQuery:
@@ -29,6 +29,12 @@ const DESC = {
   limit: "Max results. Defaults to 50.",
   scope:
     'Personal-vs-work filter (SAA-153). One of "work" (default), "personal", or "all". Defaults to "work" when omitted — pass "personal" explicitly to reach personal calls (e.g. the family FaceTime case this was built for), or "all" to search across both. The response echoes back which scope actually ran.',
+  index:
+    "Recording-level enumeration instead of a moment search (SAA-85). Mutually exclusive with `query`/`semanticQuery` — pass this alone, optionally with `attendee`, `dateFrom`/`dateTo`, `scope` and `recordingId` to narrow which recordings are listed. Use this to answer \"what happened over this period\" or \"list every 1:1 with X\" — questions about which meetings existed, not what was said in them. Returns `recordings` instead of `moments`: each entry has the recording id (needed for get_transcript — otherwise a UUID is only discoverable by accident from a moment result), title, startedAt, durationSec, attendees (guests, not the host), momentCounts (an object keyed by moment kind, e.g. {\"decision\": 2, \"observation\": 5} — a kind with zero moments is simply absent, not present as 0) and totalMoments. Carries no moment title/summary text — this is an index, not a content view; follow up with a regular query scoped to a specific recordingId to read what was actually said. Still respects `truncated`/`totalMatches` and the personal/work `scope` default exactly like a moment search.",
+  dateFrom:
+    "With `index`: only recordings started at or after this ISO 8601 datetime (e.g. \"2026-09-07T00:00:00Z\"). Combine with dateTo to bound a window; either alone is a valid half-open range.",
+  dateTo:
+    "With `index`: only recordings started at or before this ISO 8601 datetime. See dateFrom.",
   getTranscriptTool:
     "Fetch the full transcript for a recording, with per-segment timestamps and speaker labels.",
   getTranscriptRecordingId: "The recording to fetch the transcript for (UUID).",
@@ -42,6 +48,9 @@ const searchMomentsInput = z.object({
   attendee: z.string().min(1).max(256).optional().describe(DESC.attendee),
   limit: z.number().int().min(1).max(200).optional().describe(DESC.limit),
   scope: z.enum(["work", "personal", "all"]).optional().describe(DESC.scope),
+  index: z.boolean().optional().describe(DESC.index),
+  dateFrom: z.string().optional().describe(DESC.dateFrom),
+  dateTo: z.string().optional().describe(DESC.dateTo),
 });
 
 const getTranscriptInput = z.object({
@@ -74,6 +83,9 @@ async function main(): Promise<void> {
               enum: ["work", "personal", "all"],
               description: DESC.scope,
             },
+            index: { type: "boolean", description: DESC.index },
+            dateFrom: { type: "string", description: DESC.dateFrom },
+            dateTo: { type: "string", description: DESC.dateTo },
           },
         },
       },
@@ -107,6 +119,9 @@ async function main(): Promise<void> {
           attendee: input.attendee,
           limit: input.limit,
           scope: input.scope,
+          index: input.index,
+          dateFrom: input.dateFrom,
+          dateTo: input.dateTo,
         });
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

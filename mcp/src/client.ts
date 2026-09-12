@@ -37,22 +37,13 @@ export class ClipwiseClient {
     attendee?: string;
     limit?: number;
     scope?: "work" | "personal" | "all";
-  }): Promise<{
-    moments: MomentSummary[];
-    // True count of moments matching the filters, before `limit` cut it
-    // down (SAA-131, SAA-108) — read this rather than moments.length to
-    // tell a complete result from a truncated one.
-    totalMatches: number;
-    // totalMatches > moments.length. When true, this result is a partial
-    // answer: absence of something from `moments` is not evidence it
-    // doesn't exist, and a conclusion drawn from it should say so.
-    truncated: boolean;
-    // The personal-vs-work scope actually applied (SAA-153) — "work" when
-    // the caller passed none.
-    scope: "work" | "personal" | "all";
-    // True when `scope` was not passed and "work" was applied by default.
-    scopeDefaulted: boolean;
-  }> {
+    // Recording-level enumeration (SAA-85) instead of a moment search —
+    // mutually exclusive with q/semanticQ. Changes the response shape from
+    // `moments` to `recordings`; see SearchMomentsResult below.
+    index?: boolean;
+    dateFrom?: string;
+    dateTo?: string;
+  }): Promise<SearchMomentsResult> {
     return this.get(`/accounts/${this.config.accountId}/moments`, {
       q: params.q,
       semantic_q: params.semanticQ,
@@ -61,6 +52,9 @@ export class ClipwiseClient {
       attendee: params.attendee,
       limit: params.limit?.toString(),
       scope: params.scope,
+      index: params.index ? "true" : undefined,
+      dateFrom: params.dateFrom,
+      dateTo: params.dateTo,
     });
   }
 
@@ -97,6 +91,36 @@ export interface MomentSummary {
   // transition across a model change.
   embeddingModel?: string | null;
 }
+
+// One recording in an index (SAA-85) result — date, attendees, duration and
+// moment counts by kind, no moment content. `momentCounts` keys are
+// whatever `kind` values are actually present on this recording (e.g.
+// "decision", "commitment", "observation"); a kind with zero moments is
+// simply absent from the object rather than present as 0.
+export interface RecordingIndexEntry {
+  id: string;
+  title: string | null;
+  startedAt: string | null;
+  durationSec: number | null;
+  // Guests, not the host — matches what the identity prompt already asks
+  // for ("who was on this call with") and what search_moments' own
+  // attendee filter matches against.
+  attendees: string[];
+  momentCounts: Record<string, number>;
+  totalMoments: number;
+}
+
+// Common to both response shapes search_moments can return.
+interface SearchMomentsEnvelope {
+  totalMatches: number;
+  truncated: boolean;
+  scope: "work" | "personal" | "all";
+  scopeDefaulted: boolean;
+}
+
+export type SearchMomentsResult =
+  | (SearchMomentsEnvelope & { moments: MomentSummary[] })
+  | (SearchMomentsEnvelope & { recordings: RecordingIndexEntry[] });
 
 export interface RecordingRecord {
   id: string;

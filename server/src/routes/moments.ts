@@ -1,13 +1,16 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import {
   and,
   asc,
   desc,
   eq,
   exists,
+  gte,
   ilike,
+  inArray,
   isNotNull,
   isNull,
+  lte,
   or,
   sql,
 } from "drizzle-orm";
@@ -48,6 +51,15 @@ const searchMomentsQuerySchema = z.object({
   // why the response always echoes which scope actually applied rather
   // than narrowing silently.
   scope: z.enum(["work", "personal", "all"]).optional(),
+  // Recording-level enumeration (SAA-85), as a mode of this same tool
+  // rather than a separate list_recordings endpoint — settled 2026-09-10.
+  // Mutually exclusive with q/semantic_q: this counts and lists recordings,
+  // it does not search moment text.
+  index: z.coerce.boolean().optional(),
+  // Bounds recordings.started_at. Both optional and independent — either
+  // alone is a valid half-open range.
+  dateFrom: z.string().datetime().optional(),
+  dateTo: z.string().datetime().optional(),
 });
 
 export const momentsRouter = Router({ mergeParams: true });
@@ -95,6 +107,169 @@ momentsRouter.post(
   }),
 );
 
+// Recording-level enumeration (SAA-85). Settled 2026-09-10: a filter within
+// search_moments rather than a separate list_recordings tool, returning
+// date, attendees, duration and moment counts by kind, with a date-range
+// filter. Explicitly the index only — the content view for a bounded
+// window is a separate, later step that waits on SAA-153 (personal/work
+// separation), per that same discussion. This function only counts and
+// lists recordings; it never reads moment title/summary text.
+//
+// Answers "no enumeration" (the original gap: a 1:1 whose moments never
+// matched a substring search was invisible) by listing recordings directly,
+// independent of whether any moment inside them matches anything. A
+// recording with zero in-scope moments still appears, honestly, rather than
+// silently dropping out.
+async function runRecordingIndex(
+  res: Response,
+  accountId: string,
+  query: z.infer<typeof searchMomentsQuerySchema>,
+): Promise<void> {
+  const conditions = [eq(schema.recordings.accountId, accountId)];
+  if (query.recordingId) {
+    conditions.push(eq(schema.recordings.id, query.recordingId));
+  }
+  if (query.dateFrom) {
+    conditions.push(gte(schema.recordings.startedAt, new Date(query.dateFrom)));
+  }
+  if (query.dateTo) {
+    conditions.push(lte(schema.recordings.startedAt, new Date(query.dateTo)));
+  }
+
+  // Same scope filter and default as the moment-search path, and the same
+  // reasoning (SAA-153): work by default, disclosed rather than silent,
+  // unclassified counts as work. SAA-153's remaining classification work
+  // does not gate this — the filter already exists and the index simply
+  // respects it, the same way every other recording-scoped query does.
+  const resolvedScope = query.scope ?? "work";
+  const scopeDefaulted = query.scope === undefined;
+  if (resolvedScope === "work") {
+    conditions.push(or(isNull(schema.recordings.scope), eq(schema.recordings.scope, "work"))!);
+  } else if (resolvedScope === "personal") {
+    conditions.push(eq(schema.recordings.scope, "personal"));
+  }
+
+  // Attendee filter (SAA-127), same shape as the moment-search path but
+  // correlated on recordings.id directly rather than moments.recording_id
+  // — this query's base table is recordings, not moments.
+  if (query.attendee) {
+    const attendeeLike = `%${query.attendee}%`;
+    conditions.push(
+      exists(
+        db
+          .select({ one: sql`1` })
+          .from(schema.attendees)
+          .leftJoin(schema.people, eq(schema.people.id, schema.attendees.personId))
+          .where(
+            and(
+              eq(schema.attendees.recordingId, schema.recordings.id),
+              or(
+                ilike(schema.attendees.name, attendeeLike),
+                ilike(schema.people.name, attendeeLike),
+              ),
+            ),
+          ),
+      ),
+    );
+  }
+
+  // True match count (SAA-131, SAA-108's pattern, carried over): computed
+  // before `limit` cuts the list down, so a caller can tell a complete
+  // enumeration from a partial one rather than trusting a list that looks
+  // whole.
+  const [{ count: totalMatches }] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(schema.recordings)
+    .where(and(...conditions));
+
+  const limit = query.limit ?? 50;
+  const recordingRows = await db
+    .select({
+      id: schema.recordings.id,
+      title: schema.recordings.title,
+      startedAt: schema.recordings.startedAt,
+      durationSec: schema.recordings.durationSec,
+    })
+    .from(schema.recordings)
+    .where(and(...conditions))
+    // Chronological, not round-robin/recency: this is enumeration, not a
+    // relevance search, so every row is equally "relevant" and the natural
+    // order for a bounded window is the order the meetings happened in.
+    .orderBy(asc(schema.recordings.startedAt))
+    .limit(limit);
+
+  const recordingIds = recordingRows.map((r) => r.id);
+  const attendeesByRecording = new Map<string, string[]>();
+  const momentsByRecording = new Map<string, { counts: Record<string, number>; total: number }>();
+
+  if (recordingIds.length > 0) {
+    // Host excluded — this lists who the call was *with*, matching the
+    // shape the identity prompt already asks for and the shape rendered in
+    // the design discussion (never "Jon Dwyer" alongside the guests).
+    const attendeeRows = await db
+      .select({ recordingId: schema.attendees.recordingId, name: schema.attendees.name })
+      .from(schema.attendees)
+      .where(
+        and(
+          inArray(schema.attendees.recordingId, recordingIds),
+          eq(schema.attendees.isHost, false),
+        ),
+      );
+    for (const row of attendeeRows) {
+      if (!row.name) continue;
+      const list = attendeesByRecording.get(row.recordingId) ?? [];
+      list.push(row.name);
+      attendeesByRecording.set(row.recordingId, list);
+    }
+
+    // Same visibility rules search_moments itself applies (SAA-80 soft-
+    // delete, SAA-78 current-run gate) — a count that included a collapsed
+    // duplicate or a superseded extraction run would overstate what a
+    // moment query against these recordings can actually reach, breaking
+    // the reason this index exists.
+    const kindRows = await db
+      .select({
+        recordingId: schema.moments.recordingId,
+        kind: schema.moments.kind,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(schema.moments)
+      .innerJoin(schema.recordings, eq(schema.moments.recordingId, schema.recordings.id))
+      .where(
+        and(
+          inArray(schema.moments.recordingId, recordingIds),
+          sql`(${schema.moments.metadata}->>'collapsed_into') IS NULL`,
+          sql`((${schema.moments.metadata}->>'source') = 'hand_curated' OR (${schema.moments.metadata}->>'extraction_run') = (${schema.recordings.metadata}->>'current_extraction_run'))`,
+        ),
+      )
+      .groupBy(schema.moments.recordingId, schema.moments.kind);
+    for (const row of kindRows) {
+      const entry = momentsByRecording.get(row.recordingId) ?? { counts: {}, total: 0 };
+      entry.counts[row.kind] = row.count;
+      entry.total += row.count;
+      momentsByRecording.set(row.recordingId, entry);
+    }
+  }
+
+  const recordings = recordingRows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    startedAt: r.startedAt,
+    durationSec: r.durationSec,
+    attendees: attendeesByRecording.get(r.id) ?? [],
+    momentCounts: momentsByRecording.get(r.id)?.counts ?? {},
+    totalMoments: momentsByRecording.get(r.id)?.total ?? 0,
+  }));
+
+  res.json({
+    recordings,
+    totalMatches,
+    truncated: totalMatches > recordings.length,
+    scope: resolvedScope,
+    scopeDefaulted,
+  });
+}
+
 momentsRouter.get(
   "/",
   asyncHandler(async (req, res) => {
@@ -108,6 +283,18 @@ momentsRouter.get(
       // right retrieval mechanism. Blending them behind a caller's back
       // is exactly the fusion this decision defers.
       throw new HttpError(400, "q_and_semantic_q_are_mutually_exclusive");
+    }
+    if (query.index && (query.q || query.semantic_q)) {
+      // Index mode enumerates recordings; it does not search moment text.
+      // Combining the two would mean guessing which behaviour the caller
+      // wanted, the same reasoning q_and_semantic_q_are_mutually_exclusive
+      // already applies one line up.
+      throw new HttpError(400, "index_and_query_are_mutually_exclusive");
+    }
+
+    if (query.index) {
+      await runRecordingIndex(res, accountId, query);
+      return;
     }
 
     // Soft-delete filter (SAA-80): moments merged away by the collapse
