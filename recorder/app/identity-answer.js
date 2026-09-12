@@ -12,7 +12,11 @@
 const fs = require('fs');
 const path = require('path');
 
-const IDENTITY_VERSION = 1;
+// Bumped 1 -> 2 for `scope` (SAA-153) and the selection-vs-typing split
+// (SAA-169) — the shape this writes changed. Nothing reads this number to
+// gate behavior; it is a shared marker so identity.ts's copy gets bumped in
+// the same change rather than drifting.
+const IDENTITY_VERSION = 2;
 
 // The prompt window's content box. Height is not a constant: the page measures
 // itself and asks to be resized, because a fixed height is a bet that the copy
@@ -48,12 +52,84 @@ function parseNames(raw) {
     return names;
 }
 
+// SAA-169: every previously-written identity-<stem>.json in `dir` is a
+// record of a name someone typed at this exact prompt before. Scanning them
+// is the "known names" roster the picker offers, so the same person is
+// selected rather than retyped — no server round trip, no new local cache
+// to keep in sync, just the answers already sitting on disk. Self is not
+// included: it is one person, already remembered separately via
+// identity-self.json (readSelfName in main.js).
+//
+// Same dedup rule as parseNames: case-insensitive, first spelling kept.
+// Sorted for a stable, scannable list rather than insertion/file order,
+// which is filesystem-dependent and not meaningful here.
+function knownGuestNames(dir) {
+    const seen = new Set();
+    const names = [];
+    let files;
+    try {
+        files = fs.readdirSync(dir).filter((f) => /^identity-.*\.json$/.test(f));
+    } catch {
+        return names;
+    }
+    for (const file of files) {
+        let doc;
+        try {
+            doc = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+        } catch {
+            continue;
+        }
+        for (const guest of (doc && doc.guests) || []) {
+            const name = typeof guest?.name === 'string' ? guest.name.trim() : '';
+            if (!name) continue;
+            const key = name.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            names.push(name);
+        }
+    }
+    names.sort((a, b) => a.localeCompare(b));
+    return names;
+}
+
+// The submitted guest list is two sources merged: names picked from the
+// known-names list (selection, SAA-169's fix) and names typed into the
+// "someone new" field (parseNames, unchanged — this is still exactly how a
+// first meeting with anyone works). Selected names win the case-insensitive
+// dedup on overlap, since they are already the canonical on-disk spelling
+// rather than freshly typed text.
+function mergeGuestNames(selected, typedRaw) {
+    const seen = new Set();
+    const names = [];
+    for (const raw of selected || []) {
+        const name = String(raw || '').trim();
+        if (!name) continue;
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        names.push(name);
+    }
+    for (const name of parseNames(typedRaw)) {
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        names.push(name);
+    }
+    return names;
+}
+
 // `self` is the person answering: the prompt asks who the call was *with*, so
 // their own row is implied by the question rather than typed into it. A null
 // name is a real answer — attendance without a claim about who — and is what
 // this carries until they say what they are called. It is never derived from
 // the OS account: `id -F` on the machine this was written on answers "JD".
-function buildAnswerDoc({ stem, recordingId, names, selfName, answeredAt }) {
+// `scope` (SAA-153) is the same "one more choice on a prompt already being
+// answered" the issue settled on — personal vs. work, asked once per call
+// rather than inferred. Anything other than the literal 'work' or
+// 'personal' is written as null: an unrecognised value is not a scope
+// server-side (recordings_scope_valid only permits those two), and null is
+// the honest "not answered" rather than a guess at which one was meant.
+function buildAnswerDoc({ stem, recordingId, names, selfName, scope, answeredAt }) {
     return {
         identity_version: IDENTITY_VERSION,
         recording_id: recordingId,
@@ -64,6 +140,7 @@ function buildAnswerDoc({ stem, recordingId, names, selfName, answeredAt }) {
             source: selfName ? 'recorder_identity_prompt' : null,
         },
         guests: (names || []).map(name => ({ name })),
+        scope: scope === 'work' || scope === 'personal' ? scope : null,
     };
 }
 
@@ -93,6 +170,8 @@ module.exports = {
     IDENTITY_WINDOW,
     contentHeightFor,
     parseNames,
+    knownGuestNames,
+    mergeGuestNames,
     buildAnswerDoc,
     writeAnswer,
 };

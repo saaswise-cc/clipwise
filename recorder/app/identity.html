@@ -3,23 +3,31 @@
 <head>
 <meta charset="utf-8">
 <!-- The identity prompt (SAA-114). Shown after a capture stops, asking who was
-     on the call; the answer becomes attendee rows.
+     on the call; the answer becomes attendee rows. Also carries (SAA-153) a
+     personal/work choice, and (SAA-169) a pick-list of known guests so a
+     repeat attendee is selected rather than retyped — a typo at this prompt
+     used to mint a permanent second person with no mechanism that would ever
+     surface it.
 
      Loaded from file:// with nodeIntegration on. That is a deliberate,
      bounded choice: this page is shipped inside the bundle, loads no remote
-     content, and the only thing it sends is the text typed into it. A preload
-     bridge would be the same two calls behind one more file. Nothing here ever
-     puts a typed name into the DOM as markup — the name goes to the main
-     process and no further.
+     content, and the only thing it sends is the text typed into it (or the
+     names checked off) and which scope button is active. A preload bridge
+     would be the same calls behind one more file. Nothing here ever puts a
+     typed or known name into the DOM as markup beyond a checkbox label — the
+     name goes to the main process and no further.
 
      Dismissing this window is a real answer with a real consequence: the
-     recording stays unidentified. It is never the capture that is lost.
+     recording stays unidentified and unclassified. It is never the capture
+     that is lost.
 
-     Both fields ask for full names, and say so, because the filter that reads
-     them back is a case-insensitive substring match (SAA-127): a stored "Mike"
-     is unreachable by a search for "Michael Lynch", while a stored full name
+     Names ask for full names, and say so, because the filter that reads them
+     back is a case-insensitive substring match (SAA-127): a stored "Mike" is
+     unreachable by a search for "Michael Lynch", while a stored full name
      answers both. The imported rows already spell names in full, so a short
-     form here would also make the two sources disagree. -->
+     form here would also make the two sources disagree. The known-names list
+     is exactly the full names typed at this prompt before (identity-answer.js:
+     knownGuestNames), so it already carries that convention. -->
 <title>Who was on this call?</title>
 <style>
   :root {
@@ -88,6 +96,24 @@
   }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* Known-guest picker (SAA-169): a plain checklist, not a fancy combobox —
+     there is no bundler here to pull one in, and a checklist needs none of
+     the "is this a new entry or a match" ambiguity a type-ahead would add. */
+  #known { max-height: 108px; overflow-y: auto; border: 1px solid var(--field-border);
+    border-radius: 6px; background: var(--field-bg); padding: 2px 0; }
+  #known label { display: flex; align-items: center; gap: 6px; font-size: 12px;
+    color: var(--fg); padding: 4px 8px; margin: 0; cursor: default; }
+  #known label:hover { background: var(--bg); }
+  #known input[type="checkbox"] { width: auto; }
+  #known.empty { display: none; }
+
+  /* Scope toggle (SAA-153): two buttons acting as one control, "work"
+     pre-selected — see identity-answer.js's note on why. */
+  .segmented { display: flex; border: 1px solid var(--field-border); border-radius: 6px; overflow: hidden; }
+  .segmented button { flex: 1 1 0; border: none; border-radius: 0; }
+  .segmented button + button { border-left: 1px solid var(--field-border); }
+  .segmented button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 </style>
 </head>
 <body>
@@ -95,17 +121,30 @@
   <p class="capture" id="capture"></p>
 
   <div id="fields">
+  <div class="field" id="known-field">
+    <label>Who else — check anyone already known</label>
+    <div id="known"></div>
+  </div>
+
   <div class="field">
-    <label for="names">Full names — one per line, or separated by commas</label>
-    <textarea id="names" autofocus spellcheck="false" placeholder="Grace Hopper"></textarea>
+    <label for="names">Someone new? Full name(s) — one per line, or separated by commas</label>
+    <textarea id="names" spellcheck="false" placeholder="Grace Hopper"></textarea>
     <p class="hint">Full names, as they would be written elsewhere. Searching is
       substring-based, so "Grace" is not found by a search for "Grace Hopper".
-      Leave empty if it was just you.</p>
+      Leave everything empty if it was just you.</p>
   </div>
 
   <div class="field">
     <label for="self">You (host) — your full name</label>
     <input id="self" spellcheck="false" placeholder="Ada Lovelace — asked once, remembered after">
+  </div>
+
+  <div class="field">
+    <label>Personal or work?</label>
+    <div class="segmented" id="scope" role="group">
+      <button type="button" data-value="work" class="active">Work</button>
+      <button type="button" data-value="personal">Personal</button>
+    </div>
   </div>
 
   </div>
@@ -121,6 +160,46 @@
 
   document.getElementById('capture').textContent = params.get('stem') || '';
   document.getElementById('self').value = params.get('self') || '';
+
+  // SAA-169: render the known-names checklist before anything measures the
+  // page, so the height sent below already accounts for it. Hide the field
+  // entirely rather than leave an empty box when nobody has been named at
+  // this prompt before — a fresh install, or every name so far having gone
+  // through the "someone new" field only.
+  let knownNames = [];
+  try {
+    knownNames = JSON.parse(params.get('knownNames') || '[]');
+  } catch {
+    knownNames = [];
+  }
+  const knownEl = document.getElementById('known');
+  if (Array.isArray(knownNames) && knownNames.length > 0) {
+    for (const name of knownNames) {
+      const label = document.createElement('label');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = name;
+      label.appendChild(checkbox);
+      label.appendChild(document.createTextNode(name));
+      knownEl.appendChild(label);
+    }
+  } else {
+    document.getElementById('known-field').style.display = 'none';
+  }
+
+  // SAA-153: "work" is pre-selected (see identity-answer.js) — click toggles
+  // which button carries .active, and that is the only state read on save.
+  const scopeEl = document.getElementById('scope');
+  scopeEl.addEventListener('click', (e) => {
+    const button = e.target.closest('button');
+    if (!button) return;
+    for (const b of scopeEl.querySelectorAll('button')) b.classList.remove('active');
+    button.classList.add('active');
+  });
+  function selectedScope() {
+    return scopeEl.querySelector('button.active')?.dataset.value === 'personal'
+      ? 'personal' : 'work';
+  }
 
   // Tell the main process how tall this page actually is, so the window is
   // sized to the copy rather than the copy trimmed to fit the window. Measured
@@ -155,10 +234,13 @@
   ipcRenderer.send('identity:resize', { token: params.get('token'), height: measuredHeight() });
 
   function save() {
+    const selectedNames = Array.from(knownEl.querySelectorAll('input:checked')).map((c) => c.value);
     ipcRenderer.send('identity:submit', {
       token: params.get('token'),
-      names: document.getElementById('names').value,
+      selectedNames,
+      newNames: document.getElementById('names').value,
       self: document.getElementById('self').value,
+      scope: selectedScope(),
     });
   }
   function skip() {

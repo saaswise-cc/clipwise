@@ -17,7 +17,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-    IDENTITY_WINDOW, contentHeightFor, parseNames, buildAnswerDoc, writeAnswer,
+    IDENTITY_WINDOW, contentHeightFor, knownGuestNames, mergeGuestNames,
+    buildAnswerDoc, writeAnswer,
 } = require('./identity-answer.js');
 
 // --- constants ------------------------------------------------------------
@@ -1532,11 +1533,13 @@ function writeIdentityAnswer(capture, answer) {
         recordingId: capture.recordingId,
         names: answer.names,
         selfName: answer.selfName,
+        scope: answer.scope,
     });
     const finalPath = writeAnswer(OUTDIR, doc);
     console.error(
         `[clipwise-recorder] identity ${capture.stem}: ` +
-        `self=${JSON.stringify(answer.selfName)} guests=${JSON.stringify(answer.names)} -> ${finalPath}`);
+        `self=${JSON.stringify(answer.selfName)} guests=${JSON.stringify(answer.names)} ` +
+        `scope=${JSON.stringify(doc.scope)} -> ${finalPath}`);
     return finalPath;
 }
 
@@ -1659,6 +1662,12 @@ function pumpIdentityQueue() {
             token: capture.token,
             stem: capture.stem,
             self: readSelfName() || '',
+            // SAA-169: names from every previous answer on this machine, so
+            // the page can offer them as a pick-list instead of requiring
+            // them to be retyped. Small (JSON array of strings) and local —
+            // a directory scan, not a network or DB call — so this stays
+            // synchronous with the rest of window setup.
+            knownNames: JSON.stringify(knownGuestNames(OUTDIR)),
         },
     }).catch((err) => {
         console.error(`identity: prompt failed to load: ${String(err)}`);
@@ -1697,11 +1706,16 @@ function registerIdentityIpc() {
     ipcMain.on('identity:submit', (_event, payload) => {
         const capture = claimIdentityPrompt(payload && payload.token);
         if (!capture) return;
-        const names = parseNames(payload.names);
+        // SAA-169: guests are known names the person checked off, plus
+        // anyone typed into the "someone new" field — merged and deduped in
+        // identity-answer.js so a known name checked AND (redundantly)
+        // retyped still only counts once.
+        const names = mergeGuestNames(payload.selectedNames, payload.newNames);
         const selfName = String(payload.self || '').trim() || null;
+        const scope = payload.scope === 'personal' ? 'personal' : 'work';
         writeSelfName(selfName);
         try {
-            writeIdentityAnswer(capture, { names, selfName });
+            writeIdentityAnswer(capture, { names, selfName, scope });
         } catch (err) {
             // The answer is lost; the capture is not. Say so where it can be
             // read rather than pretending it was written.

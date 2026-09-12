@@ -39,9 +39,11 @@ import { db, schema } from "../db/index.js";
 import { slugify } from "../lib/slug.js";
 import {
   applyIdentity,
+  applyScope,
   applySpeakerNames,
   describeMapping,
   describeRows,
+  describeScope,
   readIdentityAnswer,
   type IdentityAnswer,
 } from "./identity.js";
@@ -275,6 +277,7 @@ export async function ingestTranscript(
     if (identity) {
       const applied = await applyIdentity(db, existing.id, identity);
       const mapping = await applySpeakerNames(db, existing.id, identity);
+      const scope = await applyScope(db, existing.id, identity);
       process.stdout.write(
         `ingest: identity (existing row) inserted=${describeRows(applied.inserted)} ` +
           `already_present=${describeRows(applied.skipped)}\n`,
@@ -282,6 +285,7 @@ export async function ingestTranscript(
       process.stdout.write(
         `ingest: speaker names (existing row) ${describeMapping(mapping)}\n`,
       );
+      process.stdout.write(`ingest: scope (existing row) ${describeScope(scope)}\n`);
     }
     return {
       recordingId: existing.id,
@@ -422,6 +426,12 @@ export async function ingestTranscript(
       ? await applySpeakerNames(tx, recording.id, identity)
       : null;
 
+    // Personal-vs-work classification (SAA-153), same answer, same
+    // transaction, for the same reason as the two calls above: a recording
+    // visible without its scope applied would read as unclassified (and
+    // therefore "work") for however long it takes something else to notice.
+    const scopeApplication = identity ? await applyScope(tx, recording.id, identity) : null;
+
     return {
       recording,
       transcript,
@@ -429,6 +439,7 @@ export async function ingestTranscript(
       speakerIds: Object.fromEntries(speakerByLabel),
       appliedIdentity,
       speakerMapping,
+      scopeApplication,
     };
   });
 
@@ -455,6 +466,9 @@ export async function ingestTranscript(
       process.stdout.write(
         `ingest: speaker names ${describeMapping(result.speakerMapping)}\n`,
       );
+    }
+    if (result.scopeApplication) {
+      process.stdout.write(`ingest: scope ${describeScope(result.scopeApplication)}\n`);
     }
   } else {
     process.stdout.write(

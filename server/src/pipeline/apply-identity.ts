@@ -28,9 +28,11 @@ import { db, pool, schema } from "../db/index.js";
 import { CLIPWISE_SOURCE } from "../ingest/clipwise.js";
 import {
   applyIdentity,
+  applyScope,
   applySpeakerNames,
   describeMapping,
   describeRows,
+  describeScope,
   findRecordingForCapture,
   readIdentityAnswer,
 } from "../ingest/identity.js";
@@ -118,6 +120,11 @@ async function main(): Promise<void> {
   // real call, or the reverse.
   const mapping = await applySpeakerNames(db, recordingId, answer);
   process.stdout.write(`apply-identity: speaker names ${describeMapping(mapping)}\n`);
+
+  // Same reasoning as the mapping above (SAA-153): a late answer still has
+  // to carry scope to a recording that already exists.
+  const scope = await applyScope(db, recordingId, answer);
+  process.stdout.write(`apply-identity: scope ${describeScope(scope)}\n`);
 }
 
 main()

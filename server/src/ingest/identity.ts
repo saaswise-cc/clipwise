@@ -44,7 +44,12 @@ import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 
-export const IDENTITY_VERSION = 1;
+// Bumped 1 -> 2 for `scope` (SAA-153/SAA-169): the shape the recorder writes
+// changed, so per the header note in identity-answer.js this and that
+// constant move together. Nothing here gates on the number — it is a shared
+// marker for whoever next has to reconcile the two files, not a runtime
+// check.
+export const IDENTITY_VERSION = 2;
 
 // Written by the recorder's prompt at stop. `self` is the person who answered
 // — name null when they have not told the recorder what they are called, which
@@ -56,6 +61,11 @@ export type IdentityAnswer = {
   answered_at?: string;
   self?: { name?: string | null; source?: string } | null;
   guests?: Array<{ name?: string | null }> | null;
+  // Personal-vs-work classification (SAA-153), answered on the same prompt.
+  // Null/absent means the answer predates this field, or scope was never
+  // asked — recordings.scope stays NULL in that case, which search_moments
+  // already treats as "work" by default (moments.ts).
+  scope?: "work" | "personal" | null;
 };
 
 export type AttendeeRow = { name: string | null; isHost: boolean };
@@ -178,6 +188,54 @@ export async function applyIdentity(
     application.inserted.push(row);
   }
   return application;
+}
+
+export type ScopeApplication = {
+  applied: "work" | "personal" | null;
+  // Set when nothing was written, with why: no scope in the answer, or the
+  // recording already carries one.
+  skipped: string | null;
+};
+
+// Writes recordings.scope from the same answer applyIdentity reads (SAA-153).
+// Separate function, not folded into applyIdentity, because it writes a
+// different table for a different reason — attendees describes who was on
+// the call, this describes whether the call itself is reachable by a work
+// query, and the two have already diverged once (the 2026-09-11 backlog
+// classification set scope by hand, per-person, with no attendee row
+// touched).
+//
+// Never overwrites an existing scope. A recording already classified —
+// by this same answer reaching ingest twice, or by a manual pass like the
+// backlog one above — is left alone: a later answer replaying through is
+// not automatically a better one, the same reasoning applySpeakerNames
+// already uses for an already-named speaker.
+export async function applyScope(
+  executor: typeof db | Tx,
+  recordingId: string,
+  answer: IdentityAnswer,
+): Promise<ScopeApplication> {
+  const scope = answer.scope === "work" || answer.scope === "personal" ? answer.scope : null;
+  if (!scope) {
+    return { applied: null, skipped: "the answer supplies no scope" };
+  }
+  const [existing] = await executor
+    .select({ scope: schema.recordings.scope })
+    .from(schema.recordings)
+    .where(eq(schema.recordings.id, recordingId));
+  if (existing?.scope) {
+    return { applied: null, skipped: `already classified ${JSON.stringify(existing.scope)}` };
+  }
+  await executor
+    .update(schema.recordings)
+    .set({ scope })
+    .where(eq(schema.recordings.id, recordingId));
+  return { applied: scope, skipped: null };
+}
+
+export function describeScope(application: ScopeApplication): string {
+  if (application.applied) return `set to ${application.applied}`;
+  return `not applied — ${application.skipped}`;
 }
 
 // The recording a capture was filed under, or null when ingest has not reached
