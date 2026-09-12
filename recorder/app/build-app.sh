@@ -121,6 +121,9 @@ cp "$APP_SRC/main.js" "$C/Resources/app/main.js"
 # itself, so a bundle without it has a stop that silently identifies nothing.
 cp "$APP_SRC/identity.html" "$C/Resources/app/identity.html"
 cp "$APP_SRC/identity-answer.js" "$C/Resources/app/identity-answer.js"
+# App -> scope inference (SAA-170). main.js requires this by relative path;
+# a bundle without it fails to launch at all, not just to infer scope.
+cp "$APP_SRC/app-scope.js" "$C/Resources/app/app-scope.js"
 install -m 755 "$SYSTEMTAP_BIN" "$C/Resources/bin/systemtap"
 install -m 755 "$MICCAP_BIN"    "$C/Resources/bin/miccap"
 install -m 755 "$AUDIODEVS_BIN" "$C/Resources/bin/audiodevs"

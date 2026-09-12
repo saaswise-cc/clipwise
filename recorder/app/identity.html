@@ -140,9 +140,9 @@
   </div>
 
   <div class="field">
-    <label>Personal or work?</label>
+    <label id="scope-label">Personal or work?</label>
     <div class="segmented" id="scope" role="group">
-      <button type="button" data-value="work" class="active">Work</button>
+      <button type="button" data-value="work">Work</button>
       <button type="button" data-value="personal">Personal</button>
     </div>
   </div>
@@ -187,18 +187,35 @@
     document.getElementById('known-field').style.display = 'none';
   }
 
-  // SAA-153: "work" is pre-selected (see identity-answer.js) — click toggles
-  // which button carries .active, and that is the only state read on save.
+  // SAA-170: pre-selected from the detected app when there is one — shown,
+  // not silent (see identity-answer.js's note on why this is never fully
+  // automatic). Click toggles which button carries .active; that is the
+  // only state read on save, so overriding the inference is exactly
+  // clicking the other button, same as choosing it from scratch.
+  //
+  // Neither button starts active when there is no inference (a manual
+  // start, or an app with no entry) — SAA-170 deliberately stopped
+  // defaulting to "work" here, because a value indistinguishable from a
+  // deliberate choice is worse than an honestly unset one now that a real
+  // per-capture signal exists for the common case.
   const scopeEl = document.getElementById('scope');
+  const inferredScope = params.get('inferredScope');
+  if (inferredScope === 'work' || inferredScope === 'personal') {
+    scopeEl.querySelector(`button[data-value="${inferredScope}"]`).classList.add('active');
+    document.getElementById('scope-label').textContent = 'Personal or work? (guessed from the app — change if wrong)';
+  }
   scopeEl.addEventListener('click', (e) => {
     const button = e.target.closest('button');
     if (!button) return;
     for (const b of scopeEl.querySelectorAll('button')) b.classList.remove('active');
     button.classList.add('active');
   });
+  // null when neither button is active — no inference and nothing clicked.
+  // main.js writes that through as an unset scope rather than guessing.
   function selectedScope() {
-    return scopeEl.querySelector('button.active')?.dataset.value === 'personal'
-      ? 'personal' : 'work';
+    const active = scopeEl.querySelector('button.active');
+    if (!active) return null;
+    return active.dataset.value === 'personal' ? 'personal' : 'work';
   }
 
   // Tell the main process how tall this page actually is, so the window is

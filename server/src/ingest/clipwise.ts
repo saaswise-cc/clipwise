@@ -81,6 +81,12 @@ export type CaptureIdentity = {
   manifestFile: string;
   tracks?: unknown;
   permissions?: { tap?: string; mic?: string };
+  // Which application's mic use started this capture, or null for a manual
+  // start (SAA-170). Denormalised onto the recording below alongside the
+  // rest of the manifest; scope itself still comes through the identity
+  // answer (applyScope), not read back out of this — this is provenance,
+  // not a second write path for the same column.
+  triggerApp?: { key?: string; name?: string } | null;
 };
 
 // Only what ingest needs from the classifier; the full shape lives in
@@ -357,6 +363,7 @@ export async function ingestTranscript(
                 stem: capture.stem,
                 started_at: capture.startedAt,
                 tracks: capture.tracks ?? null,
+                trigger_app: capture.triggerApp ?? null,
               }
             : null,
           // The identity answer as it was given (SAA-114). The attendee rows

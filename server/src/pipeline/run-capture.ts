@@ -130,6 +130,9 @@ type Manifest = {
   stem?: string;
   tracks?: unknown;
   permissions?: { tap?: string; mic?: string };
+  // Which application's mic use started this capture, or null for a manual
+  // start (SAA-170). Absent on manifests written before this shipped.
+  trigger_app?: { key?: string; name?: string } | null;
 };
 
 function readManifest(dir: string, stem: string): CaptureIdentity {
@@ -157,6 +160,7 @@ function readManifest(dir: string, stem: string): CaptureIdentity {
     // Absent on manifests written before SAA-89. The classifier treats an
     // unknown permission as unknown rather than assuming granted.
     permissions: doc.permissions,
+    triggerApp: doc.trigger_app ?? null,
   };
 }
 

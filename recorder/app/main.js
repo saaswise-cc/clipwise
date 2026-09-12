@@ -20,6 +20,7 @@ const {
     IDENTITY_WINDOW, contentHeightFor, knownGuestNames, mergeGuestNames,
     buildAnswerDoc, writeAnswer,
 } = require('./identity-answer.js');
+const { loadAppScope, scopeForKey } = require('./app-scope.js');
 
 // --- constants ------------------------------------------------------------
 // All measurements come from 5-second captures on 2026-08-09. A long
@@ -266,6 +267,16 @@ let detectProc = null;
 let detectPending = null;
 const detectLastPrompt = new Map();
 
+// App -> scope inference (SAA-170). Logic lives in app-scope.js (no
+// Electron in it, same reason identity-answer.js is split out); this is
+// just the lazy load and the lookup main.js's capture path calls.
+let appScope = null;
+function scopeForDetectedKey(key) {
+    if (!key) return null;
+    if (!appScope) appScope = loadAppScope(SUPPORT_DIR);
+    return scopeForKey(key, appScope);
+}
+
 // Which application keys are using the microphone right now, maintained from
 // micwatch's in_start/in_stop pairs. Only needed to answer one question: when
 // an answer arrives after its prompt has lapsed, is the call still going?
@@ -370,7 +381,7 @@ function deniedServices(dev) {
 // written at capture start. sample_rate_source records that provenance in the
 // file so a consumer never has to guess which it is holding — and for the mic
 // track it is rewritten to wav_fmt_chunk_readback once the file is finished.
-function buildManifest(stamp, startedAt, dev, paths) {
+function buildManifest(stamp, startedAt, dev, paths, trigger) {
     return {
         manifest_version: MANIFEST_VERSION,
         recording_id: randomUUID().toUpperCase(),
@@ -378,6 +389,12 @@ function buildManifest(stamp, startedAt, dev, paths) {
         // The filename stem stays the human-readable handle. It is recorded,
         // not derived from — recording_id is the identifier.
         stem: stamp,
+        // Which application's microphone use started this capture, or null
+        // for a manual start (SAA-170). This is step one of that issue:
+        // nothing downstream can be verified about app-inferred scope until
+        // the app that triggered a capture is on the record somewhere other
+        // than a variable that dies with the process.
+        trigger_app: trigger ? { key: trigger.key, name: trigger.name } : null,
         tracks: [
             {
                 track: 'system',
@@ -949,7 +966,7 @@ function notifyStateChange(prev, next) {
             ? `Both tracks are writing — ${stem}`
             : 'Both tracks are writing.';
         notify('Clipwise: recording started', session && session.trigger
-            ? `Detected ${session.trigger}. ${detail}`
+            ? `Detected ${session.trigger.name}. ${detail}`
             : detail);
         return;
     }
@@ -1301,7 +1318,12 @@ function handleDetectEvent(ev) {
         // then 'recording started' — three for one event, all within about a
         // second. The one fact this carried that the others did not is the
         // application name, which now rides on 'recording started'.
-        pendingStartTrigger = detectName(ev);
+        //
+        // Carries the key alongside the name (SAA-170): the name is what a
+        // person reads, the key is what the scope mapping matches on — the
+        // same distinction detectApps already draws, for the same reason
+        // (a display name can be refreshed later; the bundle ID cannot).
+        pendingStartTrigger = { key, name: detectName(ev) };
         startRecording();
         return;
     }
@@ -1668,6 +1690,11 @@ function pumpIdentityQueue() {
             // a directory scan, not a network or DB call — so this stays
             // synchronous with the rest of window setup.
             knownNames: JSON.stringify(knownGuestNames(OUTDIR)),
+            // SAA-170: which scope the triggering app implies, or '' for no
+            // inference (a manual start, or an app with no entry) — the page
+            // pre-selects this and nothing else, never defaulting on its own.
+            inferredScope: capture.inferredScope === 'work' || capture.inferredScope === 'personal'
+                ? capture.inferredScope : '',
         },
     }).catch((err) => {
         console.error(`identity: prompt failed to load: ${String(err)}`);
@@ -1712,7 +1739,14 @@ function registerIdentityIpc() {
         // retyped still only counts once.
         const names = mergeGuestNames(payload.selectedNames, payload.newNames);
         const selfName = String(payload.self || '').trim() || null;
-        const scope = payload.scope === 'personal' ? 'personal' : 'work';
+        // SAA-170: no default here. 'work' used to be assumed whenever
+        // nothing else was chosen — but now that an actual signal exists for
+        // the common case (the detected app), assuming a value indistinguishable
+        // from a deliberate one is worse than leaving scope unset when there
+        // truly is no basis for either. identity.html only sends 'work' or
+        // 'personal' when a button is actually active (inferred or clicked);
+        // anything else means neither was, and null is the honest answer.
+        const scope = payload.scope === 'personal' || payload.scope === 'work' ? payload.scope : null;
         writeSelfName(selfName);
         try {
             writeIdentityAnswer(capture, { names, selfName, scope });
@@ -1743,6 +1777,10 @@ function startRecording() {
     // do with it.
     const trigger = pendingStartTrigger;
     pendingStartTrigger = null;
+    // SAA-170: computed once, here, from whichever app (if any) triggered
+    // this specific start — never re-derived later from a stale global, for
+    // the same reason `trigger` itself is consumed immediately above.
+    const inferredScope = trigger ? scopeForDetectedKey(trigger.key) : null;
     if (state !== 'stopped' || session) return;
     fs.mkdirSync(OUTDIR, { recursive: true });
     const stamp = utcStamp();
@@ -1799,7 +1837,7 @@ function startRecording() {
     permissionIssue = null;
 
     try {
-        manifest = buildManifest(stamp, startedAt, dev, paths);
+        manifest = buildManifest(stamp, startedAt, dev, paths, trigger);
         // Written before the children spawn, so no audio file can exist
         // without one. OUTDIR was just created, so a failure here means the
         // directory is unwritable and the capture would have been lost
@@ -1843,8 +1881,10 @@ function startRecording() {
         stem: stamp,
         recordingId: manifest.recording_id,
         // Which application's microphone use started this, or null when a
-        // person did. Read only by the 'recording started' notification.
+        // person did. Read by the 'recording started' notification (.name)
+        // and, at stop, carried onto the identity prompt (SAA-170).
         trigger,
+        inferredScope,
         // Wall clock at spawn, for the elapsed figure the status hotkey and
         // the stop notification report. Separate from the manifest's
         // started_at, which is an ISO string for consumers downstream.
@@ -1967,7 +2007,7 @@ function stopRecording() {
     // exit. Accepted: Stop is user-initiated and nobody is watching the
     // gap. Record the gap here so it isn't rediscovered as a bug later.
     const capture = session && session.reachedRecording
-        ? { stem: session.stem, recordingId: session.recordingId }
+        ? { stem: session.stem, recordingId: session.recordingId, inferredScope: session.inferredScope }
         : null;
     const stem = capture ? capture.stem : null;
     setState('stopped');
