@@ -35,6 +35,8 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { db, pool, schema } from "../db/index.js";
 import { CLIPWISE_SOURCE } from "../ingest/clipwise.js";
 import { TERMINAL_STATUS } from "../extract/extract.js";
+import { applyIdentityForCapture } from "./apply-identity.js";
+import { describeMapping, describeRows, describeScope } from "../ingest/identity.js";
 import { runCapturePipeline, type Sidecar } from "./run-capture.js";
 
 // How many times a single capture may be picked up before this pass stops
@@ -251,11 +253,26 @@ export type RecoveryOutcome = {
   detail: string;
 };
 
+// SAA-173: an identity answer can be written, correctly deferred by
+// apply-identity.ts (no recording row yet), and then never re-asked —
+// because isComplete() above is entirely about extraction succeeding and
+// knows nothing about attendees. A recording can be "complete" by that
+// definition and still be missing the identity its own capture directory
+// has sitting right next to it. This runs for every manifest regardless of
+// isComplete/in_flight/budget — those gate the expensive pipeline re-run
+// below; this is a cheap, idempotent check-and-write with no LLM call and
+// no re-transcription, so there is no cost to asking again on every pass.
+export type IdentityRecoveryOutcome = {
+  stem: string;
+  status: "no_answer" | "pending" | "applied" | "already_applied";
+  detail: string;
+};
+
 export async function runRecoveryPass(opts: {
   dir: string;
   maxAttempts?: number;
   dryRun?: boolean;
-}): Promise<RecoveryOutcome[]> {
+}): Promise<{ processing: RecoveryOutcome[]; identity: IdentityRecoveryOutcome[] }> {
   const dir = resolve(opts.dir);
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const dryRun = opts.dryRun ?? false;
@@ -263,6 +280,45 @@ export async function runRecoveryPass(opts: {
   const candidates = manifestCandidates(dir);
   const state = await loadDbState(candidates.map((c) => c.recordingId));
   log(`${candidates.length} capture(s) on disk, ${state.size} with a recording row`);
+
+  // SAA-173: independent of the completion/attempt-budget gating below —
+  // a recording already marked complete by isComplete() can still be
+  // missing its attendees, and this is the only pass that will ever ask
+  // again after the recorder's one-shot spawn deferred.
+  const identityOutcomes: IdentityRecoveryOutcome[] = [];
+  if (!dryRun) {
+    for (const c of candidates) {
+      let result;
+      try {
+        result = await applyIdentityForCapture(dir, c.stem);
+      } catch (err) {
+        identityOutcomes.push({
+          stem: c.stem,
+          status: "no_answer",
+          detail: `error reading/applying identity: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        continue;
+      }
+      if (result.status === "no_answer") continue; // nothing was ever written — not this pass's concern
+      if (result.status === "pending") {
+        identityOutcomes.push({
+          stem: c.stem,
+          status: "pending",
+          detail: `no recording yet for source_id=${result.sourceId}`,
+        });
+        continue;
+      }
+      const gotNewRows = result.identity.inserted.length > 0;
+      identityOutcomes.push({
+        stem: c.stem,
+        status: gotNewRows ? "applied" : "already_applied",
+        detail:
+          `inserted=${describeRows(result.identity.inserted)} ` +
+          `speaker_names=${describeMapping(result.speakerMapping)} ` +
+          `scope=${describeScope(result.scope)}`,
+      });
+    }
+  }
 
   const outcomes: RecoveryOutcome[] = [];
   const todo: Candidate[] = [];
@@ -375,7 +431,7 @@ export async function runRecoveryPass(opts: {
     }
   }
 
-  return outcomes;
+  return { processing: outcomes, identity: identityOutcomes };
 }
 
 async function main(): Promise<void> {
@@ -404,15 +460,25 @@ async function main(): Promise<void> {
     }
   }
 
-  const outcomes = await runRecoveryPass({ dir, maxAttempts, dryRun });
+  const { processing, identity } = await runRecoveryPass({ dir, maxAttempts, dryRun });
+
+  process.stdout.write("\n=== identity recovery (SAA-173) ===\n");
+  if (identity.length === 0) {
+    process.stdout.write("(dry run — skipped)\n");
+  }
+  for (const o of identity) {
+    process.stdout.write(`${o.status.padEnd(16)} ${o.stem}  ${o.detail}\n`);
+  }
+  const identityApplied = identity.filter((o) => o.status === "applied").length;
+  process.stdout.write(`\nidentity applied=${identityApplied} total_checked=${identity.length}\n`);
 
   process.stdout.write("\n=== recovery pass ===\n");
-  for (const o of outcomes) {
+  for (const o of processing) {
     process.stdout.write(`${o.action.padEnd(18)} ${o.stem}  ${o.detail}\n`);
   }
-  const failed = outcomes.filter((o) => o.action === "failed").length;
-  const recovered = outcomes.filter((o) => o.action === "recovered").length;
-  process.stdout.write(`\nrecovered=${recovered} failed=${failed} total=${outcomes.length}\n`);
+  const failed = processing.filter((o) => o.action === "failed").length;
+  const recovered = processing.filter((o) => o.action === "recovered").length;
+  process.stdout.write(`\nrecovered=${recovered} failed=${failed} total=${processing.length}\n`);
   // A failure here is not a failure of the pass: the pass ran, found work and
   // reported what happened. Exiting non-zero would make the recorder treat a
   // single unrecoverable capture as a broken recovery mechanism.
