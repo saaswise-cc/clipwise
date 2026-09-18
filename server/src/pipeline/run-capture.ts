@@ -22,8 +22,15 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { db } from "../db/index.js";
 import { ingestTranscript, type CaptureIdentity } from "../ingest/clipwise.js";
 import { readExtractionCompletion, runExtraction } from "../extract/extract.js";
+import {
+  applyCalendarMatch,
+  describeCalendarMatchApplication,
+  readCalendarMatch,
+} from "../ingest/calendar-match.js";
+import { matchCaptureToCalendar } from "./match-calendar.js";
 import {
   classifyCapture,
   type CaptureClassification,
@@ -32,13 +39,21 @@ import {
 
 const SIDECAR_VERSION = 1;
 
-export type StepName = "transcribe" | "ingest" | "extract";
+export type StepName = "match" | "transcribe" | "ingest" | "extract";
 
 export type StepState =
   | "pending"
   | "running"
   | "ok"
   | "skipped"
+  // Match only. The step ran and produced a real answer, but not every
+  // calendar it was supposed to search was reachable (a share revoked, a
+  // calendar deleted) — see calendar_errors in the step's detail. Kept
+  // apart from "ok" deliberately: "ok" and "searched what it could, one
+  // source silently gone" must not read the same to someone scanning step
+  // states rather than opening the detail blob, which is exactly the
+  // failure shape SAA-183 exists to explain, one level down.
+  | "ok_partial"
   // Extraction only. runExtraction has no transactional boundary (SAA-82), so
   // a failure part-way through may already have written moments. Retrying it
   // blind would double-extract silently, so this state refuses to auto-retry
@@ -92,7 +107,7 @@ export class PipelineError extends Error {
   }
 }
 
-const STEP_ORDER: StepName[] = ["transcribe", "ingest", "extract"];
+const STEP_ORDER: StepName[] = ["match", "transcribe", "ingest", "extract"];
 
 function emptyStep(): StepRecord {
   return { state: "pending", started_at: null, ended_at: null, error: null, detail: null };
@@ -191,6 +206,7 @@ function loadSidecar(dir: string, stem: string, recordingId: string): Sidecar {
     updated_at: new Date().toISOString(),
     pid: null,
     steps: {
+      match: emptyStep(),
       transcribe: emptyStep(),
       ingest: emptyStep(),
       extract: emptyStep(),
@@ -318,6 +334,45 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
     throw err instanceof Error ? err : new Error(message);
   };
 
+  // --- match (SAA-115) ---
+  //
+  // Runs first, ahead of transcribe, so a matched event's attendee names
+  // are reachable by the capture pipeline before transcription runs — not
+  // only written to the database at ingest. This is the design constraint
+  // named on the issue: if the writes landed only at ingest, a whisper
+  // initial-prompt fix (SAA-185) would stay unavailable even on captures
+  // that matched an event, the one population it needs to work on.
+  //
+  // Best-effort only. Never calls fail("match", ...) — that would abort the
+  // whole pipeline run over a calendar lookup, which the recorder's own
+  // stated principle (nothing may delay or discard a capture) rules out.
+  // transcribe/ingest/extract proceed exactly as if nothing was configured
+  // whenever this is skipped, whatever the reason.
+  begin("match");
+  try {
+    const result = await matchCaptureToCalendar(dir, stem, capture);
+    const calendarErrorCount = Array.isArray(result.detail.calendar_errors)
+      ? result.detail.calendar_errors.length
+      : 0;
+    const hasCalendarErrors = calendarErrorCount > 0;
+    finish("match", hasCalendarErrors ? "ok_partial" : "ok", {
+      matched: result.matched,
+      ...result.detail,
+    });
+    if (result.matched) {
+      log(`calendar match: event=${result.detail.event_id} offset_ms=${result.detail.offset_ms}`);
+    } else {
+      log(`calendar match: none (${result.detail.reason})`);
+    }
+    if (hasCalendarErrors) {
+      log(`calendar match: ok_partial — ${calendarErrorCount} calendar(s) failed to fetch`);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    finish("match", "skipped", { error: message });
+    log(`calendar match: skipped — ${message}`);
+  }
+
   // --- transcribe ---
   let transcriptPath: string;
   begin("transcribe");
@@ -339,6 +394,38 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
     dbRecordingId = result.recordingId;
     reused = result.reused;
     sidecar.db_recording_id = dbRecordingId;
+
+    // Apply a calendar match written by the "match" step above, if any.
+    // No separate late-apply entry point is needed here (unlike identity —
+    // SAA-173's whole reason for existing): the match was computed
+    // synchronously, one step earlier in this same pipeline run, so there's
+    // no async-arrival race to close. Best-effort and separately caught: a
+    // failure writing invitees must not retroactively fail an ingest that
+    // already succeeded at inserting the recording, transcript and segments.
+    let calendarMatchDetail: Record<string, unknown> | null = null;
+    const calendarMatch = readCalendarMatch(dir, stem);
+    if (calendarMatch) {
+      try {
+        // Its own transaction, not the ingest one above (already committed
+        // by this point): several writes (N invitee upserts, then
+        // recurring_event_id, then title) that must land all-or-nothing.
+        // Without this, a failure partway leaves some applied and some
+        // not, with nothing to retry it (decision 1: no jobs table) — the
+        // same shape SAA-82 is open for on extraction. The upsert already
+        // makes re-application safe, which is what would make a rollback
+        // and a later retry compose correctly if a retry path ever exists.
+        const application = await db.transaction((tx) =>
+          applyCalendarMatch(tx, result.accountId, dbRecordingId, stem, calendarMatch),
+        );
+        calendarMatchDetail = { applied: true, ...application };
+        log(`calendar match applied: ${describeCalendarMatchApplication(application)}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        calendarMatchDetail = { applied: false, error: message };
+        log(`calendar match application failed (ingest still ok): ${message}`);
+      }
+    }
+
     finish("ingest", reused ? "skipped" : "ok", {
       db_recording_id: dbRecordingId,
       source_id: result.sourceId,
@@ -346,6 +433,7 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
       segment_count: result.segmentCount,
       excluded_segment_count: result.excluded.turnCount,
       classification,
+      calendar_match: calendarMatchDetail,
     });
     log(`db recording = ${dbRecordingId}${reused ? " (reused existing row)" : ""}`);
   } catch (err) {

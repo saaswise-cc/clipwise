@@ -136,6 +136,16 @@ function stampToIso(stamp: string): string | null {
   return `${m[1]}T${m[2]}:${m[3]}:${m[4]}Z`;
 }
 
+// Exported so calendar-match.ts (SAA-115) can reconstruct the exact same
+// string when deciding whether to overwrite a recording's title with the
+// matched event's title. One function, not two hand-written copies of
+// "Clipwise capture — " with an em dash to keep in sync — a second copy
+// that drifted by a character would make the comparison silently never
+// match, which reads identically to a correctly-left-alone hand-set title.
+export function titlePlaceholderFor(stamp: string): string {
+  return `Clipwise capture — ${stamp}`;
+}
+
 export async function ingestTranscript(
   transcriptPath: string,
   capture?: CaptureIdentity,
@@ -208,9 +218,7 @@ export async function ingestTranscript(
   }
   const account = accounts[0];
 
-  const title = stamp
-    ? `Clipwise capture — ${stamp}`
-    : `Clipwise capture — ${basename(transcriptPath)}`;
+  const title = titlePlaceholderFor(stamp ?? basename(transcriptPath));
   const slug = stamp
     ? `clipwise-capture-${slugify(stamp)}`
     : `clipwise-capture-${slugify(basename(transcriptPath))}`;

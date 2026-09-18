@@ -66,6 +66,61 @@ export const people = pgTable(
   }),
 );
 
+// One row per connected OAuth grant (SAA-115) — not one row per calendar.
+// That distinction wasn't obvious until the first real connect: a single
+// grant on jd@quorom.io can see other calendars too (jd@leadiq.com, shared
+// in), and the matcher needs to search all of them, not just the one the
+// grant is keyed on. calendar_email stays the grant's own identity
+// (primary calendar / who consented); searched_calendar_ids is the actual
+// list of calendars a match searches, computed once at connect time from
+// calendarList (see lib/google-calendar.ts's selectSearchableCalendars)
+// rather than recomputed on every match — an extra Calendar API call per
+// capture for a list that only changes when sharing changes. A truly
+// separate account (a second OAuth grant, e.g. someone whose calendar
+// can't be shared into this one) is still a second row.
+//
+// Tokens are encrypted at rest (lib/crypto.ts) — the open question the
+// 2026-09-16 design comment on SAA-115 left undecided, resolved here rather
+// than defaulted: a live table full of plaintext long-lived Google refresh
+// tokens is expensive to fix after the fact, and encrypting from the first
+// row is not.
+export const calendarConnections = pgTable(
+  "calendar_connections",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => accounts.id, { onDelete: "cascade" }),
+    provider: varchar("provider", { length: 32 }).notNull().default("google"),
+    calendarEmail: varchar("calendar_email", { length: 320 }).notNull(),
+    // AES-256-GCM ciphertext (lib/crypto.ts), never the raw token.
+    accessToken: text("access_token").notNull(),
+    refreshToken: text("refresh_token").notNull(),
+    tokenExpiresAt: timestamp("token_expires_at", { withTimezone: true }).notNull(),
+    scope: varchar("scope", { length: 256 }),
+    // Calendars this grant is authorized to search, by id — computed at
+    // connect time from calendarList, filtered to accessRole in
+    // (owner, writer, reader) and excluding Google's own meta-calendars
+    // (holiday/contacts/etc.) and freeBusyReader entries (no event detail
+    // visible, so they could never produce a usable match). Nullable only
+    // for a row written before this column existed; matchCaptureToCalendar
+    // treats null/empty the same as "nothing to search".
+    searchedCalendarIds: text("searched_calendar_ids").array(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
+  },
+  (t) => ({
+    accountEmailIdx: uniqueIndex("calendar_connections_account_email_idx").on(
+      t.accountId,
+      t.calendarEmail,
+    ),
+  }),
+);
+
 export const recordings = pgTable(
   "recordings",
   {
@@ -77,6 +132,10 @@ export const recordings = pgTable(
     title: varchar("title", { length: 512 }),
     source: varchar("source", { length: 64 }),
     sourceId: varchar("source_id", { length: 256 }),
+    // Google's id shared by every instance of a recurring series (SAA-115
+    // decision 4). Stored rather than the recurrence rule itself — this
+    // gives a consumer the thread directly with no rule parsing.
+    recurringEventId: varchar("recurring_event_id", { length: 256 }),
     mediaUrl: text("media_url"),
     durationSec: doublePrecision("duration_sec"),
     startedAt: timestamp("started_at", { withTimezone: true }),
@@ -305,6 +364,50 @@ export const attendees = pgTable(
   }),
 );
 
+// A calendar invitee (SAA-115 decision 3), deliberately separate from
+// `attendees`: an invitee who did not join is not an attendee, and the
+// first real event matched during the dry run showed why — the invite
+// list is not the attendance list even on a call that genuinely matches.
+//
+// email is NOT NULL, unlike attendees.email — deliberately, so this table
+// does not inherit SAA-128's still-open question (what makes a row unique
+// when the key field can be null). A calendar invitee always has an email;
+// a Google attendee object with none (a resource/room calendar, or a
+// malformed entry) is not inserted here at all, never written with a null.
+// That makes UNIQUE(recording_id, email) safe as a plain index — no
+// null-collapsing case to design around — and it is also the ON CONFLICT
+// target applyCalendarMatch upserts against.
+export const invitees = pgTable(
+  "invitees",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    recordingId: uuid("recording_id")
+      .notNull()
+      .references(() => recordings.id, { onDelete: "cascade" }),
+    // Linked only to a person row that already exists (by email) — never
+    // created from an invitee. An invited-but-declined/never-joined person
+    // must not become a resolvable identity in the known-names picker
+    // (SAA-180), which already degrades with every person added; that
+    // signal should keep coming from actual attendance, not an invite.
+    personId: uuid("person_id").references(() => people.id, {
+      onDelete: "set null",
+    }),
+    email: varchar("email", { length: 320 }).notNull(),
+    name: varchar("name", { length: 256 }),
+    // Google's own value: accepted / declined / tentative / needsAction.
+    responseStatus: varchar("response_status", { length: 32 }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
+  },
+  (t) => ({
+    recordingEmailIdx: uniqueIndex("invitees_recording_email_idx").on(
+      t.recordingId,
+      t.email,
+    ),
+  }),
+);
+
 // A share points to either a clip OR a recording (not both, not neither).
 // The `shares_target_exactly_one` check constraint below enforces XOR:
 // exactly one of clip_id or recording_id must be non-null.
@@ -355,6 +458,14 @@ export const accountsRelations = relations(accounts, ({ many }) => ({
   moments: many(moments),
   clips: many(clips),
   shares: many(shares),
+  calendarConnections: many(calendarConnections),
+}));
+
+export const calendarConnectionsRelations = relations(calendarConnections, ({ one }) => ({
+  account: one(accounts, {
+    fields: [calendarConnections.accountId],
+    references: [accounts.id],
+  }),
 }));
 
 export const peopleRelations = relations(people, ({ one, many }) => ({
@@ -363,6 +474,7 @@ export const peopleRelations = relations(people, ({ one, many }) => ({
     references: [accounts.id],
   }),
   attendees: many(attendees),
+  invitees: many(invitees),
   speakers: many(speakers),
 }));
 
@@ -376,6 +488,7 @@ export const recordingsRelations = relations(recordings, ({ one, many }) => ({
   moments: many(moments),
   clips: many(clips),
   attendees: many(attendees),
+  invitees: many(invitees),
   shares: many(shares),
 }));
 
@@ -457,6 +570,17 @@ export const attendeesRelations = relations(attendees, ({ one }) => ({
   }),
   person: one(people, {
     fields: [attendees.personId],
+    references: [people.id],
+  }),
+}));
+
+export const inviteesRelations = relations(invitees, ({ one }) => ({
+  recording: one(recordings, {
+    fields: [invitees.recordingId],
+    references: [recordings.id],
+  }),
+  person: one(people, {
+    fields: [invitees.personId],
     references: [people.id],
   }),
 }));

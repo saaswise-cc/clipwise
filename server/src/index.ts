@@ -7,6 +7,7 @@ import { peopleRouter } from "./routes/people.js";
 import { recordingsRouter } from "./routes/recordings.js";
 import { transcriptRouter } from "./routes/transcript.js";
 import { momentsRouter } from "./routes/moments.js";
+import { oauthRouter } from "./routes/oauth.js";
 import { errorHandler } from "./lib/http.js";
 
 const app = express();
@@ -28,6 +29,7 @@ app.use("/accounts/:accountId/people", peopleRouter);
 app.use("/accounts/:accountId/recordings", recordingsRouter);
 app.use("/accounts/:accountId/moments", momentsRouter);
 app.use("/", transcriptRouter);
+app.use("/", oauthRouter);
 
 app.use(errorHandler);
 
