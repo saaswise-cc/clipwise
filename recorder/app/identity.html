@@ -160,6 +160,21 @@
   const { ipcRenderer } = require('electron');
   const params = new URLSearchParams(window.location.search);
 
+  // Compact duration for this line only (SAA-187) — "23 min" / "9 sec".
+  // Deliberately not formatElapsed's job in main.js: that one serves a
+  // notification with room to spell the unit out, this one shares a line
+  // with the time and has to earn its space. Sub-minute resolution matters
+  // here specifically because a real meeting and a stray capture differ in
+  // seconds, not just minutes.
+  function formatDurationCompact(raw) {
+    if (raw === null || raw === undefined || raw === '') return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return null;
+    const totalSeconds = Math.round(n / 1000);
+    if (totalSeconds < 60) return `${totalSeconds} sec`;
+    return `${Math.round(totalSeconds / 60)} min`;
+  }
+
   // The stem is a UTC timestamp (utcStamp() in main.js), and this dialog
   // always runs on the machine that just recorded — moments after capture,
   // never read back later on another machine — so formatting it in the
@@ -167,22 +182,46 @@
   // read elsewhere (SAA-135's blocker on that is about the stored row, not
   // this dialog). Kept on the element as `title` rather than dropped, so
   // the raw stem is still one hover away for diagnosis.
-  function formatCaptureStem(stem) {
+  //
+  // Date precision escalates with distance (SAA-187) instead of always
+  // carrying a word like "Today": that word is true on nearly every showing
+  // of this dialog and a full date on a twenty-minute-old capture reads like
+  // a filing system. Compared as local calendar days, not raw elapsed hours,
+  // so 11:58pm and 12:02am the next morning read as today/yesterday rather
+  // than both landing inside "under a day ago". Year appears only when it
+  // isn't the current one — this dialog is not where anyone is hunting
+  // through last year's captures.
+  function formatCaptureStem(stem, durationRaw) {
     const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/.exec(stem || '');
     if (!m) return stem || '';
     const d = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
     if (Number.isNaN(d.getTime())) return stem;
     const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
     const now = new Date();
-    const sameDay = d.getFullYear() === now.getFullYear()
-      && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
-    if (sameDay) return `Today at ${time}`;
-    return `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} at ${time}`;
+    const midnight = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+    const daysAgo = Math.round((midnight(now) - midnight(d)) / 86400000);
+    let dateForm;
+    if (daysAgo <= 0) {
+      dateForm = time;
+    } else if (daysAgo === 1) {
+      dateForm = `Yesterday ${time}`;
+    } else if (daysAgo <= 6) {
+      dateForm = `${d.toLocaleDateString(undefined, { weekday: 'short' })} ${time}`;
+    } else {
+      const sameYear = d.getFullYear() === now.getFullYear();
+      const dateStr = d.toLocaleDateString(undefined, {
+        weekday: 'short', day: 'numeric', month: 'short',
+        ...(sameYear ? {} : { year: 'numeric' }),
+      });
+      dateForm = `${dateStr}, ${time}`;
+    }
+    const duration = formatDurationCompact(durationRaw);
+    return duration ? `${dateForm} · ${duration}` : dateForm;
   }
 
   const stem = params.get('stem') || '';
   const captureEl = document.getElementById('capture');
-  captureEl.textContent = formatCaptureStem(stem);
+  captureEl.textContent = formatCaptureStem(stem, params.get('duration'));
   captureEl.title = stem;
   document.getElementById('self').value = params.get('self') || '';
 

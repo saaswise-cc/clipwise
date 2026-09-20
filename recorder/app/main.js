@@ -914,9 +914,17 @@ function notify(title, body) {
     }
 }
 
-function formatElapsed(ms) {
-    const s = Math.max(0, Math.floor(ms / 1000));
-    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+// Natural-language duration for the stopped notification (SAA-187). Not
+// reused by the identity prompt, which needs its own compact form ("23
+// min") — this one spells the unit out because the notification has the
+// room and nothing else on the line competing for it.
+function formatDurationWords(ms) {
+    const totalSeconds = Math.max(0, Math.round(ms / 1000));
+    if (totalSeconds < 60) {
+        return `${totalSeconds} second${totalSeconds === 1 ? '' : 's'}`;
+    }
+    const minutes = Math.round(totalSeconds / 60);
+    return `${minutes} minute${minutes === 1 ? '' : 's'}`;
 }
 
 // Both halves of the started/stopped distinction the issue asks for, plus the
@@ -924,7 +932,6 @@ function formatElapsed(ms) {
 // while the session it describes is still assigned (teardown clears it only
 // after stopRecording has already flipped the state).
 function notifyStateChange(prev, next) {
-    const stem = session ? session.stem : null;
     // 'starting' is deliberately silent (SAA-151). It fired roughly a second
     // before 'recording started' and said less: the useful fact is that both
     // tracks are writing, and until they are there is nothing to report that
@@ -933,15 +940,14 @@ function notifyStateChange(prev, next) {
     // notification — the stopped branch below says nothing was saved.
     if (next === 'starting') return;
     if (next === 'recording' && prev === 'starting') {
-        // Names the detecting application when one started this capture. That
-        // is what the removed 'call detected' notification carried a second
-        // earlier; folding it in here costs nothing and drops a notification.
-        const detail = stem
-            ? `Both tracks are writing — ${stem}`
-            : 'Both tracks are writing.';
+        // Neither the stem nor a stop-style duration belongs here (SAA-187):
+        // this fires while the person is sitting at the call being announced,
+        // so it identifies nothing and doesn't need to — the recorder's
+        // internal filename is not a fact about the call worth reading aloud
+        // at the moment it starts.
         notify('Clipwise: recording started', session && session.trigger
-            ? `Detected ${session.trigger.name}. ${detail}`
-            : detail);
+            ? `Detected ${session.trigger.name}. Both tracks are writing.`
+            : 'Both tracks are writing.');
         return;
     }
     // The flapping pair.
@@ -960,13 +966,14 @@ function notifyStateChange(prev, next) {
     if (next === 'stopped') {
         // reachedRecording is what decides whether the pipeline runs, so it is
         // the honest thing to report: a capture that never got both tracks
-        // going produced nothing and will not be processed.
+        // going produced nothing and will not be processed. Unchanged by
+        // SAA-187 — the stem is dropped from the branch above it, but a
+        // duration on a capture that produced nothing would be its own kind
+        // of wrong answer, so this stays its own branch rather than folding
+        // a zero into the same sentence.
         const kept = session && session.reachedRecording;
-        const elapsed = session && session.startedAtMs
-            ? formatElapsed(Date.now() - session.startedAtMs)
-            : null;
         notify('Clipwise: recording stopped', kept
-            ? `${elapsed ? `${elapsed} — ` : ''}${stem} — processing now.`
+            ? `Recorded ${formatDurationWords(Date.now() - session.startedAtMs)}. Processing now.`
             : 'The capture never started — nothing was saved.');
     }
 }
@@ -1683,6 +1690,10 @@ function pumpIdentityQueue() {
             // pre-selects this and nothing else, never defaulting on its own.
             inferredScope: capture.inferredScope === 'work' || capture.inferredScope === 'personal'
                 ? capture.inferredScope : '',
+            // SAA-187: milliseconds, as a string — '' when unavailable rather
+            // than omitted, matching inferredScope's convention so the page
+            // can tell "not provided" from "provided as zero".
+            duration: Number.isFinite(capture.durationMs) ? String(capture.durationMs) : '',
         },
     }).catch((err) => {
         console.error(`identity: prompt failed to load: ${String(err)}`);
@@ -1995,7 +2006,17 @@ function stopRecording() {
     // exit. Accepted: Stop is user-initiated and nobody is watching the
     // gap. Record the gap here so it isn't rediscovered as a bug later.
     const capture = session && session.reachedRecording
-        ? { stem: session.stem, recordingId: session.recordingId, inferredScope: session.inferredScope }
+        ? {
+            stem: session.stem,
+            recordingId: session.recordingId,
+            inferredScope: session.inferredScope,
+            // SAA-187: computed here, where startedAtMs already lives for the
+            // stop notification, and carried through to the identity prompt
+            // rather than having the page re-derive it — the page has no
+            // access to session state and answering late must not change
+            // what a capture's own duration was.
+            durationMs: session.startedAtMs ? Date.now() - session.startedAtMs : null,
+          }
         : null;
     const stem = capture ? capture.stem : null;
     setState('stopped');
