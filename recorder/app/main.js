@@ -277,6 +277,17 @@ function scopeForDetectedKey(key) {
     return scopeForKey(key, appScope);
 }
 
+// The human-recognisable name for a detected-apps entry, preferring the
+// app-scope store's `label` (e.g. "FaceTime" for the avconferenced daemon)
+// over the process-derived `name` detectApps itself carries, and falling
+// back to the raw key when neither is set. Read path only — the label lives
+// in app-scope.js's store, not duplicated into detected-apps.json.
+function displayNameForDetectedKey(key, entry) {
+    if (!appScope) appScope = loadAppScope(SUPPORT_DIR);
+    const scoped = appScope[key];
+    return (scoped && scoped.label) || (entry && entry.name) || key;
+}
+
 // Which application keys are using the microphone right now, maintained from
 // micwatch's in_start/in_stop pairs. Only needed to answer one question: when
 // an answer arrives after its prompt has lapsed, is the call still going?
@@ -753,8 +764,9 @@ function iconFor(s) {
 // guardrail draws, and it is the reason this is allowed to exist at all.
 function detectedAppsMenu() {
     if (!detectApps) detectApps = loadDetectApps();
+    const displayName = key => displayNameForDetectedKey(key, detectApps[key]);
     const keys = Object.keys(detectApps).sort((a, b) =>
-        (detectApps[a].name || a).localeCompare(detectApps[b].name || b));
+        displayName(a).localeCompare(displayName(b)));
     if (keys.length === 0) {
         return {
             label: 'Detected applications',
@@ -765,9 +777,9 @@ function detectedAppsMenu() {
         label: 'Detected applications',
         submenu: keys.map(key => {
             const entry = detectApps[key];
-            const label = entry.decision === 'record' ? 'Always record' : 'Never ask';
+            const decisionLabel = entry.decision === 'record' ? 'Always record' : 'Never ask';
             return {
-                label: `${entry.name || key} — ${label}`,
+                label: `${displayName(key)} — ${decisionLabel}`,
                 submenu: [
                     { label: 'Always record', type: 'radio', checked: entry.decision === 'record',
                       click: () => setAppDecision(key, 'record', entry.name) },
