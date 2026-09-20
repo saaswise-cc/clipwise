@@ -69,6 +69,7 @@
   #fields { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
   #actions { flex: 0 0 auto; }
   h1 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+  .reason { color: var(--muted); font-size: 12px; margin: 0 0 6px; }
   .capture { color: var(--muted); font-size: 11px; margin: 0 0 12px; }
   label { display: block; font-size: 11px; color: var(--muted); margin: 0 0 4px; }
   textarea, input {
@@ -118,6 +119,7 @@
 </head>
 <body>
   <h1>Who was on this call?</h1>
+  <p class="reason">Names here let you search for this recording by who was on it.</p>
   <p class="capture" id="capture"></p>
 
   <div id="fields">
@@ -158,7 +160,30 @@
   const { ipcRenderer } = require('electron');
   const params = new URLSearchParams(window.location.search);
 
-  document.getElementById('capture').textContent = params.get('stem') || '';
+  // The stem is a UTC timestamp (utcStamp() in main.js), and this dialog
+  // always runs on the machine that just recorded — moments after capture,
+  // never read back later on another machine — so formatting it in the
+  // local zone here is correct in a way it would not be for a stored title
+  // read elsewhere (SAA-135's blocker on that is about the stored row, not
+  // this dialog). Kept on the element as `title` rather than dropped, so
+  // the raw stem is still one hover away for diagnosis.
+  function formatCaptureStem(stem) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/.exec(stem || '');
+    if (!m) return stem || '';
+    const d = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
+    if (Number.isNaN(d.getTime())) return stem;
+    const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    const now = new Date();
+    const sameDay = d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+    if (sameDay) return `Today at ${time}`;
+    return `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} at ${time}`;
+  }
+
+  const stem = params.get('stem') || '';
+  const captureEl = document.getElementById('capture');
+  captureEl.textContent = formatCaptureStem(stem);
+  captureEl.title = stem;
   document.getElementById('self').value = params.get('self') || '';
 
   // SAA-169: render the known-names checklist before anything measures the
