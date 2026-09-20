@@ -1617,7 +1617,20 @@ function pumpIdentityQueue() {
             // height of the title bar.
             useContentSize: true,
             width: IDENTITY_WINDOW.width,
-            height: IDENTITY_WINDOW.minHeight,
+            // Created at the full height from the start, then shrunk once
+            // the page reports its real size (SAA-186). Starting small and
+            // growing after load — the previous behaviour — corrupted the
+            // known-names checklist whenever the grow crossed into territory
+            // the hidden window had never painted: created at 220px, resized
+            // to a clamped 560px, the newly-exposed 220-560 band showed a
+            // stale/torn composite on first show(), reproducibly, on both
+            // the dev Electron binary and the signed packaged app. Creating
+            // at maxHeight and only ever shrinking from here never exposes
+            // unpainted territory — confirmed by the same repro with the
+            // creation height flipped and nothing else changed. The window
+            // is still hidden until reveal(), so a short dialog never
+            // visibly flashes the taller size.
+            height: IDENTITY_WINDOW.maxHeight,
             show: false,
             resizable: false,
             minimizable: false,
