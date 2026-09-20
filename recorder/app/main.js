@@ -945,9 +945,18 @@ function notifyStateChange(prev, next) {
         // so it identifies nothing and doesn't need to — the recorder's
         // internal filename is not a fact about the call worth reading aloud
         // at the moment it starts.
+        //
+        // "Both tracks are writing" was Clipwise's internal model (mic +
+        // system-audio tap), not what a user standing at the call wants to
+        // know — which is whether it's getting the other side or only them.
+        // That is exactly what the both-tracks check guarantees, so say that
+        // instead. Not "the meeting" or "everyone on the call": there is
+        // only ever one mixed far-side stream, not per-person audio
+        // (SAA-94), and it only covers from this moment on (SAA-105) — both
+        // would be over-claims in a notification the user is trusting.
         notify('Clipwise: recording started', session && session.trigger
-            ? `Detected ${session.trigger.name}. Both tracks are writing.`
-            : 'Both tracks are writing.');
+            ? `Detected ${session.trigger.name}. Capturing your mic and the call audio.`
+            : 'Capturing your mic and the call audio.');
         return;
     }
     // The flapping pair.

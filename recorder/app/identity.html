@@ -131,9 +131,7 @@
   <div class="field">
     <label for="names">Someone new? Full name(s) — one per line, or separated by commas</label>
     <textarea id="names" spellcheck="false" placeholder="Grace Hopper"></textarea>
-    <p class="hint">Full names, as they would be written elsewhere. Searching is
-      substring-based, so "Grace" is not found by a search for "Grace Hopper".
-      Leave everything empty if it was just you.</p>
+    <p class="hint">Just you on the call? Leave everything empty.</p>
   </div>
 
   <div class="field">
@@ -190,7 +188,15 @@
   // so 11:58pm and 12:02am the next morning read as today/yesterday rather
   // than both landing inside "under a day ago". Year appears only when it
   // isn't the current one — this dialog is not where anyone is hunting
-  // through last year's captures.
+  // through last year's captures. Weekday appears only inside the same
+  // week, for the same reason: it identifies which of the last few days a
+  // capture was on, and stops earning its space once the date itself does
+  // that job, so a year-old capture doesn't carry a stale-looking "Sun".
+  //
+  // "Started" prefixes the whole thing (follow-up to SAA-187): a bare time
+  // and duration leaves the reader guessing whether it is the start, the
+  // end, or when the dialog appeared. It is always the start — the prompt
+  // only exists after a capture has already stopped.
   function formatCaptureStem(stem, durationRaw) {
     const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/.exec(stem || '');
     if (!m) return stem || '';
@@ -210,13 +216,13 @@
     } else {
       const sameYear = d.getFullYear() === now.getFullYear();
       const dateStr = d.toLocaleDateString(undefined, {
-        weekday: 'short', day: 'numeric', month: 'short',
+        day: 'numeric', month: 'short',
         ...(sameYear ? {} : { year: 'numeric' }),
       });
       dateForm = `${dateStr}, ${time}`;
     }
     const duration = formatDurationCompact(durationRaw);
-    return duration ? `${dateForm} · ${duration}` : dateForm;
+    return `Started ${duration ? `${dateForm} · ${duration}` : dateForm}`;
   }
 
   const stem = params.get('stem') || '';
