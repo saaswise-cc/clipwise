@@ -140,6 +140,21 @@ for sig in [SIGINT, SIGTERM] {
 // stdout closing means the recorder is gone; nothing useful remains to do.
 signal(SIGPIPE, SIG_IGN)
 
+// Parent-death detection (SAA-152). The signal handling above only helps
+// while the recorder is alive to send one — a `kill -9` on the recorder runs
+// no cleanup there, and the 2026-09-12 finding is that a bare SIGTERM against
+// an already-orphaned instance was ignored. EVFILT_PROC/NOTE_EXIT (what
+// DispatchSourceProcess wraps) is posted by the kernel when the watched
+// process terminates by any means, including SIGKILL, so this does not
+// depend on signal delivery or the parent's cooperation at all.
+let parentPID = getppid()
+let parentWatch = DispatchSource.makeProcessSource(identifier: parentPID, eventMask: .exit, queue: .main)
+parentWatch.setEventHandler {
+    FileHandle.standardError.write(Data("parent_exited ppid=\(parentPID)\n".utf8))
+    exit(0)
+}
+parentWatch.resume()
+
 var active: [AudioObjectID: Proc] = [:]
 emit([("event", jsonString("ready")), ("poll_ms", "\(Int(POLL_SECONDS * 1000))")])
 

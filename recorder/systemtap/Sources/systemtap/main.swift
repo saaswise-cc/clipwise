@@ -246,15 +246,30 @@ err("system_tap_started wall_ns=\(wallStartNs) iso=\(iso.string(from: Date()))")
 err("output=\(outPath)")
 err("format sample_rate=\(Int(tap.format.mSampleRate)) channels=\(tap.format.mChannelsPerFrame) bits=\(tap.format.mBitsPerChannel) is_float=\(isFloat) is_packed=\(isPacked)")
 
-let sigSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-signal(SIGINT, SIG_IGN)
-sigSrc.setEventHandler {
+func performShutdown() {
     tap.stop()
     let wallEndNs = Int64(Date().timeIntervalSince1970 * 1e9)
     err("system_tap_stopped wall_ns=\(wallEndNs) bytes_written=\(tap.bytesWritten) duration_s=\(String(format: "%.3f", Double(wallEndNs - wallStartNs) / 1e9))")
     err("io_stats callbacks=\(tap.callbackCount) buffers_seen=\(tap.buffersSeen) short_writes=\(tap.shortWriteCount) write_errors=\(tap.writeErrorCount) last_errno=\(tap.lastWriteErrno)")
     exit(0)
 }
+
+let sigSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+signal(SIGINT, SIG_IGN)
+sigSrc.setEventHandler { performShutdown() }
 sigSrc.resume()
+
+// Parent-death detection (SAA-152). A `kill -9` on the recorder runs no
+// cleanup code there, so nothing can signal this process — it has to notice
+// independently. EVFILT_PROC/NOTE_EXIT (what DispatchSourceProcess wraps) is
+// posted by the kernel when the watched process terminates by any means,
+// including SIGKILL, so this does not depend on the parent's cooperation.
+let parentPID = getppid()
+let parentWatch = DispatchSource.makeProcessSource(identifier: parentPID, eventMask: .exit, queue: .main)
+parentWatch.setEventHandler {
+    err("parent_exited ppid=\(parentPID)")
+    performShutdown()
+}
+parentWatch.resume()
 
 RunLoop.main.run()

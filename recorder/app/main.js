@@ -2064,6 +2064,57 @@ function quitApp() {
     });
 }
 
+// --- launch sweep (SAA-152) -------------------------------------------------
+//
+// Parent-death detection in systemtap/miccap/micwatch only protects a stray
+// created after that fix ships. Anything orphaned earlier — or by a binary
+// built before the fix — is still sitting on disk at the next launch, so this
+// finds and ends those too.
+//
+// Two paths per binary, dev checkout and packaged bundle, because a stray can
+// predate a layout switch as easily as a rebuild — RECORDER_DIR/BUNDLED_BIN
+// are both already computed above regardless of which layout this instance
+// is running under.
+//
+// PPID 1 is the whole safety property: a child of a currently running
+// recorder has that recorder's own live pid as its parent, never 1, so this
+// can never reach into a running instance's own children. It runs before
+// anything below spawns its own children, so there is no race with those
+// either.
+const STRAY_BIN_PATHS = new Set([
+    path.join(RECORDER_DIR, 'systemtap', '.build', 'release', 'systemtap'),
+    path.join(BUNDLED_BIN, 'systemtap'),
+    path.join(RECORDER_DIR, 'miccap', '.build', 'release', 'miccap'),
+    path.join(BUNDLED_BIN, 'miccap'),
+    path.join(RECORDER_DIR, 'micwatch'),
+    path.join(BUNDLED_BIN, 'micwatch'),
+]);
+
+function sweepStrayChildren() {
+    let out;
+    try {
+        out = execFileSync('ps', ['-A', '-ww', '-o', 'pid=,ppid=,args='], { encoding: 'utf8' });
+    } catch (err) {
+        console.error(`launch sweep: ps failed: ${String(err)}`);
+        return;
+    }
+    for (const line of out.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const m = trimmed.match(/^(\d+)\s+(\d+)\s+(.*)$/);
+        if (!m) continue;
+        const pid = Number(m[1]);
+        const ppid = Number(m[2]);
+        if (ppid !== 1) continue;
+        const exe = m[3].split(' ')[0];
+        if (!STRAY_BIN_PATHS.has(exe)) continue;
+        console.error(`launch sweep: killing stray pid=${pid} ppid=${ppid} exe=${exe}`);
+        try { process.kill(pid, 'SIGKILL'); } catch (err) {
+            console.error(`launch sweep: kill ${pid} failed: ${String(err)}`);
+        }
+    }
+}
+
 // --- app boot -------------------------------------------------------------
 
 app.whenReady().then(() => {
@@ -2079,6 +2130,9 @@ app.whenReady().then(() => {
     tray = new Tray(iconFor('stopped'));
     setState('stopped');
     registerIdentityIpc();
+    // Before anything spawns its own children (SAA-152) — see
+    // sweepStrayChildren's comment for why that ordering matters.
+    sweepStrayChildren();
     // Last, and after the tray exists: a launch that has to recover a backlog
     // should still show a working menu bar immediately. Spawning is cheap —
     // the pass itself runs in another process — but ordering it here means a

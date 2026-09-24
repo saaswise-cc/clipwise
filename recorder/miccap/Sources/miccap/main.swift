@@ -398,9 +398,7 @@ err("format sample_rate=\(Int(f.mSampleRate)) channels=\(f.mChannelsPerFrame) "
     + "bits=\(f.mBitsPerChannel) is_float=\(isFloat) is_packed=\(isPacked) "
     + "is_non_interleaved=\(isNonInterleaved)")
 
-let sigSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-signal(SIGINT, SIG_IGN)
-sigSrc.setEventHandler {
+func performShutdown() {
     cap.stop()
     let wallEndNs = Int64(Date().timeIntervalSince1970 * 1e9)
     let dur = Double(wallEndNs - wallStartNs) / 1e9
@@ -416,6 +414,23 @@ sigSrc.setEventHandler {
     err(readBackFormat(outPath))
     exit(0)
 }
+
+let sigSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+signal(SIGINT, SIG_IGN)
+sigSrc.setEventHandler { performShutdown() }
 sigSrc.resume()
+
+// Parent-death detection (SAA-152). A `kill -9` on the recorder runs no
+// cleanup code there, so nothing can signal this process — it has to notice
+// independently. EVFILT_PROC/NOTE_EXIT (what DispatchSourceProcess wraps) is
+// posted by the kernel when the watched process terminates by any means,
+// including SIGKILL, so this does not depend on the parent's cooperation.
+let parentPID = getppid()
+let parentWatch = DispatchSource.makeProcessSource(identifier: parentPID, eventMask: .exit, queue: .main)
+parentWatch.setEventHandler {
+    err("parent_exited ppid=\(parentPID)")
+    performShutdown()
+}
+parentWatch.resume()
 
 RunLoop.main.run()
