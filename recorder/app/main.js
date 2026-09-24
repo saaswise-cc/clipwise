@@ -955,7 +955,7 @@ function notifyStateChange(prev, next) {
         // (SAA-94), and it only covers from this moment on (SAA-105) — both
         // would be over-claims in a notification the user is trusting.
         notify('Clipwise: recording started', session && session.trigger
-            ? `Detected ${session.trigger.name}. Capturing your mic and the call audio.`
+            ? `Detected ${displayNameForDetectedKey(session.trigger.key, session.trigger)}. Capturing your mic and the call audio.`
             : 'Capturing your mic and the call audio.');
         return;
     }
@@ -1151,7 +1151,7 @@ function promptForApp(ev, key) {
     // as a decline that silently becomes permanent. Recording a single call
     // without deciding anything is what "Not now" is for — start it manually
     // from the tray if this one call should still be recorded.
-    const title = `Clipwise: ${name} is using the microphone`;
+    const title = `Clipwise: ${displayNameForDetectedKey(key, { name })} is using the microphone`;
     const body = 'Record calls from this app?';
     if (!Notification.isSupported()) {
         notifyFallback(title, `${body} Choose from the Clipwise menu bar icon.`,
@@ -1219,6 +1219,10 @@ function answerDetectPrompt(key, choice) {
         name = (active && active.name) || (known && known.name) || key;
         console.error(`detect: answer "${choice}" for ${key} arrived after its prompt lapsed`);
     }
+    // name is what gets stored (setAppDecision, below) — the raw process-
+    // derived name, matching what detectApps itself carries. displayName is
+    // what the user reads: the same label preference as the tray (SAA-135).
+    const displayName = displayNameForDetectedKey(key, { name });
 
     if (choice === 'not_now') {
         console.error(`detect: "not now" for ${key} — nothing written`);
@@ -1231,7 +1235,7 @@ function answerDetectPrompt(key, choice) {
         // rather than in the prompt: the prompt fires as a call is starting,
         // which is the worst moment to ask anyone to read anything.
         notify('Clipwise: will not ask about this app',
-            `${name} will no longer offer to record. Turn it back on from the Clipwise menu bar.`);
+            `${displayName} will no longer offer to record. Turn it back on from the Clipwise menu bar.`);
         return;
     }
     if (choice === 'record') {
@@ -1244,7 +1248,7 @@ function answerDetectPrompt(key, choice) {
         // still going, so the click means what it said and the capture starts.
         if (detectActive.has(key)) {
             notify('Clipwise: starting now',
-                `That prompt had lapsed, but ${name} is still using the microphone — recording now.`);
+                `That prompt had lapsed, but ${displayName} is still using the microphone — recording now.`);
             startRecording();
             return;
         }
@@ -1252,7 +1256,7 @@ function answerDetectPrompt(key, choice) {
         // Nothing is recorded — there is nothing left to record — and the one
         // thing that must not happen is silence about it.
         notify('Clipwise: that prompt had lapsed',
-            `${name} is no longer using the microphone, so nothing was recorded. `
+            `${displayName} is no longer using the microphone, so nothing was recorded. `
             + 'Clipwise will record it automatically from now on.');
     }
 }
