@@ -41,8 +41,9 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
+import { isVoiceLabel } from "../pipeline/diarize.js";
 
 // Bumped 1 -> 2 for `scope` (SAA-153/SAA-169): the shape the recorder writes
 // changed, so per the header note in identity-answer.js this and that
@@ -356,12 +357,7 @@ export async function applySpeakerNames(
     return mapping;
   }
 
-  const wanted = new Map<string, string | null>([
-    [HOST_LABEL, host?.name ?? null],
-    [GUEST_LABEL, guests[0].name],
-  ]);
-
-  const speakers = await executor
+  let speakers = await executor
     .select({
       id: schema.speakers.id,
       label: schema.speakers.label,
@@ -369,6 +365,54 @@ export async function applySpeakerNames(
     })
     .from(schema.speakers)
     .where(eq(schema.speakers.recordingId, recordingId));
+
+  // Identity vs. diarization disagreement (SAA-194, addition 1), the
+  // "diarize already split `them` before this answer arrived" half. The
+  // answer above names exactly one guest — diarization's voice count is
+  // outranked by that confirmed answer, not the other way round: merge the
+  // Voice N rows back into a single `them` row so the naming below finds
+  // exactly what it would have found had diarize never run. The other half
+  // — identity already applied before diarize runs — is handled in
+  // pipeline/diarize.ts, which checks `them.displayName` before ever
+  // splitting.
+  //
+  // Merge into a `them` row that already exists rather than always
+  // inserting one: diarize.ts's own fallback for a segment with no diarized
+  // overlap re-points it to the nearest voice by time distance today, so in
+  // practice nothing is ever left on `them` — but that's diarize.ts's
+  // policy, not a guarantee this function should depend on. If it ever did
+  // leave `them` in place alongside the Voice N rows, unconditionally
+  // inserting a fresh one here would produce two `them` rows, and
+  // `speakers.find(s => s.label === "them")` below would silently pick
+  // whichever one Postgres returns first — the near-empty original, most
+  // likely — naming it while every reassigned segment stayed pointed at the
+  // other, unnamed one.
+  const voiceRows = speakers.filter((s) => isVoiceLabel(s.label));
+  if (voiceRows.length > 0) {
+    const voiceIds = voiceRows.map((s) => s.id);
+    const existingThem = speakers.find((s) => s.label === GUEST_LABEL);
+    const them =
+      existingThem ??
+      (await executor
+        .insert(schema.speakers)
+        .values({ recordingId, label: GUEST_LABEL })
+        .returning({ id: schema.speakers.id, label: schema.speakers.label, displayName: schema.speakers.displayName }))[0];
+    await executor
+      .update(schema.segments)
+      .set({ speakerId: them.id })
+      .where(inArray(schema.segments.speakerId, voiceIds));
+    await executor.delete(schema.speakers).where(inArray(schema.speakers.id, voiceIds));
+    process.stdout.write(
+      `identity: disagreement on recording=${recordingId} — the answer names exactly one guest, but diarization ` +
+        `had already split \`them\` into ${voiceRows.length} voice(s); merged back into ${existingThem ? "the existing" : "a freshly inserted"} \`them\` row\n`,
+    );
+    speakers = speakers.filter((s) => !isVoiceLabel(s.label) && s.id !== them.id).concat([them]);
+  }
+
+  const wanted = new Map<string, string | null>([
+    [HOST_LABEL, host?.name ?? null],
+    [GUEST_LABEL, guests[0].name],
+  ]);
 
   for (const [label, name] of wanted) {
     const speaker = speakers.find((s) => s.label === label);

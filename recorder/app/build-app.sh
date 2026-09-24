@@ -49,15 +49,27 @@ step "building helper binaries"
 (cd "$RECORDER_DIR" && swiftc -O micwatch.swift -o micwatch)
 swift build -c release --package-path "$RECORDER_DIR/systemtap"
 swift build -c release --package-path "$RECORDER_DIR/miccap"
+swift build -c release --package-path "$RECORDER_DIR/diarize"
 
 SYSTEMTAP_BIN="$RECORDER_DIR/systemtap/.build/release/systemtap"
 MICCAP_BIN="$RECORDER_DIR/miccap/.build/release/miccap"
 AUDIODEVS_BIN="$RECORDER_DIR/audiodevs"
 MICWATCH_BIN="$RECORDER_DIR/micwatch"
+DIARIZE_BIN="$RECORDER_DIR/diarize/.build/release/diarize"
 
-for b in "$SYSTEMTAP_BIN" "$MICCAP_BIN" "$AUDIODEVS_BIN" "$MICWATCH_BIN"; do
+for b in "$SYSTEMTAP_BIN" "$MICCAP_BIN" "$AUDIODEVS_BIN" "$MICWATCH_BIN" "$DIARIZE_BIN"; do
     [ -x "$b" ] || { echo "build-app: missing $b after build" >&2; exit 1; }
 done
+
+# SAA-194: the community-1 model files diarize loads at runtime. Fetched (and
+# checksum-verified against recorder/diarize/models/CHECKSUMS.sha256) rather
+# than committed — see fetch-models.sh's own header for why. Re-fetches only
+# when missing or when verification fails, so a build with the models already
+# present and intact does not touch the network.
+step "fetching speaker-diarization models"
+"$RECORDER_DIR/diarize/fetch-models.sh"
+DIARIZE_MODELS_DIR="$RECORDER_DIR/diarize/models/speaker-diarization"
+[ -d "$DIARIZE_MODELS_DIR" ] || { echo "build-app: missing $DIARIZE_MODELS_DIR after fetch-models.sh" >&2; exit 1; }
 
 # --- 2. the Electron runtime ----------------------------------------------
 #
@@ -105,7 +117,7 @@ else
   exit 1
 fi
 
-mkdir -p "$C/Resources/app" "$C/Resources/bin" "$C/Resources/tray"
+mkdir -p "$C/Resources/app" "$C/Resources/bin" "$C/Resources/tray" "$C/Resources/models"
 # The tray marks (SAA-130). main.js resolves these at Resources/tray when it is
 # running from a bundle, and falls back to a generated dot if one cannot be
 # read — but a bundle that ships without them is a bundle whose menu bar icon
@@ -130,6 +142,16 @@ install -m 755 "$AUDIODEVS_BIN" "$C/Resources/bin/audiodevs"
 # Call detection (SAA-113). A bundle without it still records on the hotkey;
 # main.js logs the absence and disables detection rather than failing to start.
 install -m 755 "$MICWATCH_BIN"  "$C/Resources/bin/micwatch"
+# Voice separation (SAA-194). A bundle without it still processes captures —
+# the pipeline's diarize step treats a missing binary as a skip, same as an
+# Intel Mac — but this fulfils the CC-BY-4.0 redistribution story and keeps
+# packaging parity with the other three helper binaries above.
+install -m 755 "$DIARIZE_BIN"   "$C/Resources/bin/diarize"
+# .mlmodelc directories are plain resource trees, not nested code — no
+# separate signing step; they're swept into the outer codesign call below
+# the same as the tray PNGs are.
+cp -R "$DIARIZE_MODELS_DIR" "$C/Resources/models/speaker-diarization"
+cp "$REPO_DIR/THIRD_PARTY_NOTICES" "$C/Resources/THIRD_PARTY_NOTICES"
 
 VERSION="$(/usr/bin/sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$APP_SRC/package.json" | head -1)"
 ELECTRON_VERSION="$(cat "$APP_SRC/node_modules/electron/dist/version")"

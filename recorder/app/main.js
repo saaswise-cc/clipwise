@@ -840,7 +840,11 @@ function renderTray() {
             { label: 'Dismiss failure', click: dismissPipelineFailure },
         );
     }
-    items.push({ type: 'separator' }, { label: 'Quit', click: quitApp });
+    items.push(
+        { type: 'separator' },
+        { label: 'About Clipwise', click: () => app.showAboutPanel() },
+        { label: 'Quit', click: quitApp },
+    );
     tray.setContextMenu(Menu.buildFromTemplate(items));
 }
 
@@ -2174,6 +2178,20 @@ function sweepStrayChildren() {
 }
 
 // --- app boot -------------------------------------------------------------
+
+// Credits the CC-BY-4.0 speaker-separation models require (SAA-194 §7) —
+// see THIRD_PARTY_NOTICES for the full text this is drawn from. Set once,
+// read whenever the tray's "About Clipwise" item opens the standard macOS
+// About window.
+app.setAboutPanelOptions({
+    applicationName: 'Clipwise',
+    credits:
+        'Speaker separation uses models derived from pyannote\'s speaker-diarization-community-1 ' +
+        'pipeline (CC BY 4.0), with embedding components from WeSpeaker and PLDA parameters from ' +
+        'Brno University of Technology / BUT Speech@FIT (CC BY 4.0), converted to Core ML by Fluid ' +
+        'Inference (github.com/FluidInference/FluidAudio, Apache 2.0). See THIRD_PARTY_NOTICES for ' +
+        'full attribution and license text.',
+});
 
 app.whenReady().then(() => {
     // SAA-105 EXPERIMENT, 2026-09-01 — the paired half of LSUIElement in

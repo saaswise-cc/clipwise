@@ -25,6 +25,7 @@ import { join, resolve } from "node:path";
 import { db } from "../db/index.js";
 import { ingestTranscript, type CaptureIdentity } from "../ingest/clipwise.js";
 import { readExtractionCompletion, runExtraction } from "../extract/extract.js";
+import { runDiarizationForCapture } from "./diarize.js";
 import {
   applyCalendarMatch,
   describeCalendarMatchApplication,
@@ -39,7 +40,7 @@ import {
 
 const SIDECAR_VERSION = 1;
 
-export type StepName = "match" | "transcribe" | "ingest" | "extract";
+export type StepName = "match" | "transcribe" | "ingest" | "diarize" | "extract";
 
 export type StepState =
   | "pending"
@@ -107,7 +108,7 @@ export class PipelineError extends Error {
   }
 }
 
-const STEP_ORDER: StepName[] = ["match", "transcribe", "ingest", "extract"];
+const STEP_ORDER: StepName[] = ["match", "transcribe", "ingest", "diarize", "extract"];
 
 function emptyStep(): StepRecord {
   return { state: "pending", started_at: null, ended_at: null, error: null, detail: null };
@@ -209,10 +210,21 @@ function loadSidecar(dir: string, stem: string, recordingId: string): Sidecar {
       match: emptyStep(),
       transcribe: emptyStep(),
       ingest: emptyStep(),
+      diarize: emptyStep(),
       extract: emptyStep(),
     },
   };
 }
+
+// A sidecar written before this step existed has no `diarize` key at all —
+// `sidecar.steps.diarize` reads as `undefined`, not a StepRecord, until the
+// first pipeline run past this change calls begin("diarize") on it. That's
+// safe on its own (begin/finish below spread `sidecar.steps[step]`, and
+// spreading undefined is a no-op), and recover.ts's looksInFlight() already
+// iterates `Object.values(doc.steps ?? {})` rather than indexing named keys,
+// so an old, shorter sidecar composes with both old and new code without
+// migration. Nothing else reads sidecar.steps.diarize before this file's own
+// begin("diarize") call does.
 
 function writeSidecar(dir: string, sidecar: Sidecar): void {
   sidecar.updated_at = new Date().toISOString();
@@ -438,6 +450,41 @@ export async function runCapturePipeline(opts: PipelineOptions): Promise<Pipelin
     log(`db recording = ${dbRecordingId}${reused ? " (reused existing row)" : ""}`);
   } catch (err) {
     return fail("ingest", err);
+  }
+
+  // --- diarize (SAA-194) ---
+  //
+  // Best-effort, same posture as "match": never calls fail("diarize", ...).
+  // Voice separation is an enhancement to a capture, not a precondition for
+  // one — a slow Mac, a missing binary (models not fetched), an Intel
+  // machine, or a genuine FluidAudio error all leave the recording exactly
+  // as it is today (a single `them` speaker), not blocked or discarded.
+  //
+  // After ingest, not before: ingest is what creates the `them` speaker row
+  // and points every tap-track segment at it, and diarize needs that row to
+  // already exist so it can re-point segments rather than create them.
+  // Before extract: extraction's transcript rendering has to see the final
+  // voice split, and its unresolved-identity guard reasoning must not run
+  // on stale segment-to-speaker assignments.
+  begin("diarize");
+  try {
+    const diarization = await runDiarizationForCapture(dir, stem, dbRecordingId);
+    finish("diarize", diarization.applied ? "ok" : "skipped", {
+      applied: diarization.applied,
+      reason: diarization.reason,
+      voices_found: diarization.voicesFound,
+      model_revision: diarization.modelRevision,
+      processing_time_seconds: diarization.processingTimeSeconds,
+      host_echo: diarization.hostEcho,
+    });
+    log(`diarize: ${diarization.applied ? "applied" : "skipped"} — ${diarization.reason}`);
+  } catch (err) {
+    // Defense in depth: runDiarizationForCapture returns rather than throws
+    // for every case it anticipates. Anything that reaches here is
+    // unanticipated, and still must not fail the capture.
+    const message = err instanceof Error ? err.message : String(err);
+    finish("diarize", "skipped", { error: message });
+    log(`diarize: skipped — ${message}`);
   }
 
   // --- extract ---

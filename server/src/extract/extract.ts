@@ -99,7 +99,20 @@ async function loadSegments(recordingId: string): Promise<Segment[]> {
       // track label otherwise. This is the line that decides whether a moment
       // reads "Jon Dwyer argues…" or "Me argues…": the model is given the
       // rendered transcript and nothing else about who spoke.
-      speakerLabel: sql<string | null>`coalesce(${schema.speakers.displayName}, ${schema.speakers.label})`,
+      //
+      // A "Voice N" label (SAA-194 — diarization splits `them` into per-
+      // voice rows, never named at this stage) collapses back to "them" for
+      // extraction only. displayName is always null on a Voice N row (see
+      // pipeline/diarize.ts), so this only ever fires in place of the raw
+      // label, never instead of a real name. The model must never see a
+      // voice split it isn't equipped to reason about yet — SAA-165's
+      // unresolved-identity guard already tells it "them" may be more than
+      // one person, and that's still the only fact it gets. Without this,
+      // the guard's own literal "me"/"them" vocabulary (both in the prompt
+      // text and in the speakers-field backstop filter below) would silently
+      // drop every legitimate "Voice 1" citation the model made from
+      // rendered lines it was never told the vocabulary for.
+      speakerLabel: sql<string | null>`coalesce(${schema.speakers.displayName}, case when ${schema.speakers.label} ~ '^Voice [0-9]+$' then 'them' else ${schema.speakers.label} end)`,
     })
     .from(schema.segments)
     .leftJoin(schema.speakers, eq(schema.segments.speakerId, schema.speakers.id))

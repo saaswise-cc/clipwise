@@ -1,6 +1,11 @@
 recorder/audiodevs
 recorder/systemtap/.build/
 recorder/miccap/.build/
+recorder/diarize/.build/
+# Fetched by fetch-models.sh (SAA-194), verified against the checked-in
+# CHECKSUMS.sha256 — the 21 MiB of model weights themselves don't belong in
+# git.
+recorder/diarize/models/speaker-diarization/
 recorder/app/node_modules/
 recorder/app/dist/
 recorder/diagnostics/audioinuse
