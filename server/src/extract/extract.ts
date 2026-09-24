@@ -480,6 +480,70 @@ export const CAPTURE_DURATION_SEC = sql`(
   ) AS t
 )`;
 
+// Promote a recording to `current_extraction_run`. The search gate
+// (routes/moments.ts:110) joins on
+//   moment.metadata.extraction_run = recording.metadata.current_extraction_run
+// so without this write, whatever moments a run just produced (zero or
+// otherwise) are unreachable via search_moments — regardless of source.
+//
+// Called at the very end of a real run, after collapse and embed, on
+// purpose: this is the only durable statement that says "this run
+// succeeded." If any earlier step fails, the recording stays pointed at
+// whatever run was previously current. The zero-segment short-circuit below
+// calls it immediately instead, because there is nothing else to wait on.
+//
+// Merge into existing metadata rather than replacing it — recordings may
+// carry other keys (transcript source paths, capture stamps, etc.) that this
+// update must not clobber.
+//
+// status/ended_at/duration_sec ride along on this same statement (SAA-134).
+// They belong to the same fact the promotion already asserts — the capture
+// finished processing — so there is no window in which a row claims a
+// terminal status without a current run, or the reverse.
+//
+// Deliberately NOT idempotent-guarded with coalesce on status: a re-extract
+// (or a first extract of a zero-segment capture) that reaches here succeeded,
+// and saying so again is correct. duration_sec and ended_at do coalesce,
+// because a value already measured should not be replaced by a null when the
+// source metadata is absent.
+async function promoteRecording(recordingId: string, runUuid: string): Promise<void> {
+  await db
+    .update(schema.recordings)
+    .set({
+      // Terminal status. "ready" matches the vocabulary transcripts already
+      // use (schema.ts:112, set at ingest) and reads as what promotion means:
+      // this recording's moments (zero or more) are now what search returns.
+      status: TERMINAL_STATUS,
+      // The measured capture length, read back from the manifest the ingest
+      // step already denormalised onto this row (ingest/clipwise.ts:352-360),
+      // not re-derived from segments. Segments stop at the last utterance;
+      // the tracks run to the end of the capture, and it is the capture this
+      // column describes. max() across tracks because the tap and mic stop a
+      // fraction of a second apart and the capture is not over until both are.
+      //
+      // Null for rows with no capture block — Fathom imports have no manifest
+      // and nothing measured a duration for them. Leaving it null is honest;
+      // inventing one from segment bounds would not be.
+      durationSec: sql`coalesce(${CAPTURE_DURATION_SEC}, ${schema.recordings.durationSec})`,
+      // Wall-clock end of the recording, not of the processing run: started_at
+      // came from the manifest, so started_at + measured duration is the same
+      // clock. A row whose duration is unknown keeps a null ended_at rather
+      // than borrowing "now", which would silently mean something else.
+      endedAt: sql`coalesce(
+        ${schema.recordings.startedAt} + make_interval(secs => ${CAPTURE_DURATION_SEC}),
+        ${schema.recordings.endedAt}
+      )`,
+      metadata: sql`coalesce(${schema.recordings.metadata}, '{}'::jsonb) || jsonb_build_object('current_extraction_run', ${runUuid}::text)`,
+    })
+    .where(eq(schema.recordings.id, recordingId));
+  console.log(
+    `extract: promoted current_extraction_run = ${runUuid} on recording ${recordingId}`,
+  );
+  console.log(
+    `extract: marked recording ${recordingId} status=ready (ended_at and duration_sec from capture manifest)`,
+  );
+}
+
 export async function runExtraction(
   recordingId: string,
   options: { applyCollapse?: boolean } = {},
@@ -493,7 +557,39 @@ export async function runExtraction(
   const recording = await loadRecording(recordingId);
   const segs = await loadSegments(recordingId);
   if (segs.length === 0) {
-    throw new Error(`recording ${recordingId} has zero segments — nothing to extract`);
+    // SAA-150: a capture with genuinely no speech is a legitimate outcome,
+    // not a failure — ingest now inserts it with zero segments (Option B)
+    // rather than refusing it, so extraction has to be able to finish one
+    // too. There is nothing to send to the model; promote straight to
+    // terminal status with zero moments, using the exact statement the
+    // normal path promotes with below, so completion means the same thing
+    // on both paths as far as recover.ts's isComplete() is concerned.
+    const runUuid = randomUUID();
+    await promoteRecording(recordingId, runUuid);
+    console.log(
+      `extract: recording ${recordingId} has zero segments — nothing to extract, promoted with 0 moments`,
+    );
+    return {
+      runUuid,
+      spans: [],
+      spansYieldingZeroMoments: [],
+      preCollapseMomentCount: 0,
+      momentsVisibleAfterCollapse: 0,
+      collapseGroupCount: 0,
+      momentsInCollapseGroups: 0,
+      collapseDroppedCount: 0,
+      collapseBackstops: {
+        outOfRangeDropped: 0,
+        collisionsDropped: 0,
+        groupsDiscarded: 0,
+        representativesReplaced: 0,
+      },
+      personnelAssessmentCount: 0,
+      outOfRangeCount: 0,
+      tilingGaps: 0,
+      tilingOverlaps: 0,
+      elapsedMs: Date.now() - t0,
+    };
   }
   const identityResolved = await loadIdentityResolved(recordingId);
   const attendeeNames = await loadAttendeeNames(recordingId);
@@ -677,70 +773,13 @@ export async function runExtraction(
 
   const finalPersonnelCount = await personnelCountForRun(recordingId, runUuid);
 
-  // Promote this run to `current_extraction_run` on the recording. The
-  // search gate (routes/moments.ts:110) joins on
-  //   moment.metadata.extraction_run = recording.metadata.current_extraction_run
-  // so without this write, every moment this run just produced is
-  // unreachable via search_moments — regardless of source.
-  //
-  // Done at the very end, after collapse and embed, on purpose: this is
-  // the only durable statement in the whole function that says "this run
+  // Done at the very end, after collapse and embed, on purpose: this is the
+  // only durable statement in the whole function that says "this run
   // succeeded." If any earlier step fails, the recording stays pointed at
   // whatever run was previously current, and the failed run's rows remain
-  // queryable outside the gate for inspection but do not become visible.
-  //
-  // Merge into existing metadata rather than replacing it — recordings
-  // may carry other keys (transcript source paths, capture stamps, etc.)
-  // that this update must not clobber.
-  //
-  // status/ended_at/duration_sec ride along on this same statement (SAA-134).
-  // They belong to the same fact the promotion already asserts — the capture
-  // finished processing — and until now nothing on the capture path wrote
-  // them at all, so every row read `pending` with both timestamps null
-  // whether it succeeded or died. Widening this `.set()` rather than adding
-  // a second write keeps "this run succeeded" a single statement: there is
-  // no window in which a row claims a terminal status without a current run,
-  // or the reverse.
-  //
-  // Deliberately NOT idempotent-guarded with coalesce on status: a re-extract
-  // that reaches here succeeded, and saying so again is correct. duration_sec
-  // and ended_at do coalesce, because a value already measured should not be
-  // replaced by a null when the source metadata is absent.
-  await db
-    .update(schema.recordings)
-    .set({
-      // Terminal status. "ready" matches the vocabulary transcripts already
-      // use (schema.ts:112, set at ingest) and reads as what promotion means:
-      // this recording's moments are now the ones search returns.
-      status: TERMINAL_STATUS,
-      // The measured capture length, read back from the manifest the ingest
-      // step already denormalised onto this row (ingest/clipwise.ts:352-360),
-      // not re-derived from segments. Segments stop at the last utterance;
-      // the tracks run to the end of the capture, and it is the capture this
-      // column describes. max() across tracks because the tap and mic stop a
-      // fraction of a second apart and the capture is not over until both are.
-      //
-      // Null for rows with no capture block — Fathom imports have no manifest
-      // and nothing measured a duration for them. Leaving it null is honest;
-      // inventing one from segment bounds would not be.
-      durationSec: sql`coalesce(${CAPTURE_DURATION_SEC}, ${schema.recordings.durationSec})`,
-      // Wall-clock end of the recording, not of the processing run: started_at
-      // came from the manifest, so started_at + measured duration is the same
-      // clock. A row whose duration is unknown keeps a null ended_at rather
-      // than borrowing "now", which would silently mean something else.
-      endedAt: sql`coalesce(
-        ${schema.recordings.startedAt} + make_interval(secs => ${CAPTURE_DURATION_SEC}),
-        ${schema.recordings.endedAt}
-      )`,
-      metadata: sql`coalesce(${schema.recordings.metadata}, '{}'::jsonb) || jsonb_build_object('current_extraction_run', ${runUuid}::text)`,
-    })
-    .where(eq(schema.recordings.id, recordingId));
-  console.log(
-    `extract: promoted current_extraction_run = ${runUuid} on recording ${recordingId}`,
-  );
-  console.log(
-    `extract: marked recording ${recordingId} status=ready (ended_at and duration_sec from capture manifest)`,
-  );
+  // queryable outside the gate for inspection but do not become visible. See
+  // promoteRecording's own comment for what the statement itself does.
+  await promoteRecording(recordingId, runUuid);
 
   return {
     runUuid,

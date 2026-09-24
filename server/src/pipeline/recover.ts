@@ -90,6 +90,22 @@ type Attempts = {
   first_attempt_at: string | null;
   last_attempt_at: string | null;
   last_error: string | null;
+  // This pass's outcome for this stem — recorder/app/main.js reads it after
+  // a recovery pass exits to decide whether to withdraw a stale tray failure
+  // for the one stem it triggered recovery for (SAA-183). Only "complete"
+  // (already was, before this pass) and "recovered" (this pass just finished
+  // it) mean isComplete() is true for this stem now; every other value —
+  // in_flight, budget_exhausted, cooling_down, failed — must not be read as
+  // a reason to withdraw anything. Set on every outcome, not only the ones
+  // that go through the attempt-budget bookkeeping below.
+  last_action: RecoveryOutcome["action"] | null;
+  // When last_action was set. Without this, a pass that aborts before
+  // reaching this stem at all (loadDbState throwing on a network error,
+  // SAA-156) leaves the file holding a PREVIOUS pass's action — a stem once
+  // "recovered" could then have a brand new failure wrongly cleared by a run
+  // that never looked at it. main.js compares this against when it started
+  // that recovery run and ignores anything older.
+  last_action_at: string | null;
 };
 
 function log(msg: string): void {
@@ -132,9 +148,14 @@ function attemptsPathFor(dir: string, stem: string): string {
 
 // The retry budget lives in its own file rather than in the pipeline sidecar.
 // The sidecar is a completion record this pass is not allowed to trust, and
-// putting a counter inside it would invite exactly that confusion. Losing this
-// file costs three more attempts and nothing else — it is a rate limiter, not
-// state anything depends on.
+// putting a counter inside it would invite exactly that confusion.
+//
+// No longer only a rate limiter: main.js now reads `last_action` off this
+// same file after a recovery pass exits (SAA-183, see the field's own
+// comment on Attempts above). Losing the file still costs nothing worse than
+// three more attempts and one missed tray withdrawal — main.js only ever
+// treats last_action as a reason to clear a failure, never as a reason to
+// show one, so an absent or stale file just leaves a failure displayed.
 function readAttempts(dir: string, stem: string, recordingId: string): Attempts {
   const path = attemptsPathFor(dir, stem);
   if (existsSync(path)) {
@@ -152,11 +173,34 @@ function readAttempts(dir: string, stem: string, recordingId: string): Attempts 
     first_attempt_at: null,
     last_attempt_at: null,
     last_error: null,
+    last_action: null,
+    last_action_at: null,
   };
 }
 
 function writeAttempts(dir: string, a: Attempts): void {
   writeFileSync(attemptsPathFor(dir, a.stem), JSON.stringify(a, null, 2) + "\n");
+}
+
+// Stamps this pass's outcome onto the stem's recovery file, for the outcomes
+// (complete, in_flight, budget_exhausted, cooling_down) that never otherwise
+// touch this file. Only updates a file that already exists — a stem that has
+// never been attempted has nothing for main.js to watch anyway (it can only
+// be watching a stem it just saw fail, which reaches the file-creating path
+// below at least once), and creating one here would mean every already-ready
+// recording in the store gets a recovery-<stem>.json manufactured on every
+// single launch, forever, for a mechanism that has no use for it.
+function recordAction(
+  dir: string,
+  stem: string,
+  recordingId: string,
+  action: RecoveryOutcome["action"],
+): void {
+  if (!existsSync(attemptsPathFor(dir, stem))) return;
+  const a = readAttempts(dir, stem, recordingId);
+  a.last_action = action;
+  a.last_action_at = new Date().toISOString();
+  writeAttempts(dir, a);
 }
 
 // Liveness only — never consulted for completion.
@@ -326,6 +370,7 @@ export async function runRecoveryPass(opts: {
   for (const c of candidates) {
     const s = state.get(c.recordingId);
     if (isComplete(s)) {
+      if (!dryRun) recordAction(dir, c.stem, c.recordingId, "complete");
       outcomes.push({
         stem: c.stem,
         recordingId: c.recordingId,
@@ -335,6 +380,7 @@ export async function runRecoveryPass(opts: {
       continue;
     }
     if (looksInFlight(dir, c.stem)) {
+      if (!dryRun) recordAction(dir, c.stem, c.recordingId, "in_flight");
       outcomes.push({
         stem: c.stem,
         recordingId: c.recordingId,
@@ -345,6 +391,7 @@ export async function runRecoveryPass(opts: {
     }
     const a = readAttempts(dir, c.stem, c.recordingId);
     if (a.attempts >= maxAttempts) {
+      if (!dryRun) recordAction(dir, c.stem, c.recordingId, "budget_exhausted");
       outcomes.push({
         stem: c.stem,
         recordingId: c.recordingId,
@@ -355,6 +402,7 @@ export async function runRecoveryPass(opts: {
     }
     const sinceLast = a.last_attempt_at ? Date.now() - Date.parse(a.last_attempt_at) : Infinity;
     if (Number.isFinite(sinceLast) && sinceLast >= 0 && sinceLast < RETRY_COOLDOWN_MS) {
+      if (!dryRun) recordAction(dir, c.stem, c.recordingId, "cooling_down");
       outcomes.push({
         stem: c.stem,
         recordingId: c.recordingId,
@@ -405,6 +453,8 @@ export async function runRecoveryPass(opts: {
     try {
       const result = await runCapturePipeline({ dir, stem: c.stem });
       a.last_error = null;
+      a.last_action = "recovered";
+      a.last_action_at = new Date().toISOString();
       writeAttempts(dir, a);
       outcomes.push({
         stem: c.stem,
@@ -418,6 +468,8 @@ export async function runRecoveryPass(opts: {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       a.last_error = message;
+      a.last_action = "failed";
+      a.last_action_at = new Date().toISOString();
       writeAttempts(dir, a);
       outcomes.push({
         stem: c.stem,

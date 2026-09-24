@@ -101,6 +101,22 @@ export type IngestClassification = {
   thresholds?: unknown;
 };
 
+// Read defensively off `tracks`, which stays `unknown` on IngestClassification
+// on purpose (see that type's own comment) — this mirrors classify-capture.ts's
+// TrackVerdict without importing it, the same boundary the type already keeps.
+// Used only to tell a denied permission apart from a genuinely empty capture
+// (SAA-150/SAA-183): "dead_denied" is the one verdict that means the track
+// was never captured at all, not that it carried no speech.
+function deniedTrackLabel(tracks: unknown): "tap" | "mic" | null {
+  if (!tracks || typeof tracks !== "object") return null;
+  for (const track of ["tap", "mic"] as const) {
+    const t = (tracks as Record<string, unknown>)[track];
+    const verdict = t && typeof t === "object" ? (t as Record<string, unknown>).verdict : undefined;
+    if (verdict === "dead_denied") return track;
+  }
+  return null;
+}
+
 export const CLIPWISE_SOURCE = "clipwise-recorder";
 
 export type IngestResult = {
@@ -153,8 +169,31 @@ export async function ingestTranscript(
 ): Promise<IngestResult> {
   const raw = readFileSync(transcriptPath, "utf8");
   const doc = JSON.parse(raw) as Transcript;
-  if (!Array.isArray(doc.segments) || doc.segments.length === 0) {
+  // A malformed or missing segments field is a shape error on the file
+  // itself — still refused, same as before. A transcript that parsed
+  // cleanly and legitimately has no segments (SAA-91's silence gating
+  // correctly finding no speech) is not refused any more (SAA-150): it
+  // proceeds below and lands as a real recording with zero segments.
+  if (!Array.isArray(doc.segments)) {
     throw new Error(`no segments in ${transcriptPath}`);
+  }
+
+  // An empty transcript is only accepted as a legitimate empty capture when
+  // nothing was denied. classifyOrNull (run-capture.ts) already refuses
+  // outright when BOTH tracks are dead_denied — this catches the case that
+  // slips past that check: one track denied, the other genuinely silent,
+  // which classifies as "partial" rather than "unusable" and reaches here.
+  // Without this, a permission problem would land as an ordinary quiet
+  // meeting with no record that anything was denied — worse than the
+  // failure it replaces, because it looks clean.
+  if (doc.segments.length === 0) {
+    const denied = deniedTrackLabel(classification?.tracks);
+    if (denied) {
+      throw new Error(
+        `${denied} permission was denied for this capture — refusing to ingest ` +
+          `an empty transcript as a legitimate silence (${transcriptPath})`,
+      );
+    }
   }
 
   // A track the classifier found no audio on produces segments anyway —
@@ -166,7 +205,15 @@ export async function ingestTranscript(
   const excludeLabels = new Set(classification?.excludedLabels ?? []);
   const kept = doc.segments.filter((s) => !excludeLabels.has(s.track));
   const dropped = doc.segments.filter((s) => excludeLabels.has(s.track));
-  if (kept.length === 0) {
+  // Only a real exclusion throws here. When doc.segments was already empty,
+  // kept is trivially empty too and this would otherwise misreport a
+  // genuinely empty transcript as "every segment excluded" — a different,
+  // wrong diagnosis. Scope is deliberately narrow: this does not extend to
+  // the all-excluded case below (segments existed but every one landed on a
+  // dead track), which stays a refusal — SAA-150 is about a transcript with
+  // nothing in it, not about deciding whether an all-excluded transcript is
+  // the same thing.
+  if (doc.segments.length > 0 && kept.length === 0) {
     throw new Error(
       `every segment in ${transcriptPath} belongs to a track with no audio ` +
         `(${[...excludeLabels].join(", ")}) — nothing to ingest`,
@@ -421,10 +468,15 @@ export async function ingestTranscript(
       orderIndex: idx,
     }));
 
-    const inserted = await tx
-      .insert(schema.segments)
-      .values(segmentRows)
-      .returning({ id: schema.segments.id });
+    // drizzle's .values() throws on an empty array rather than a no-op
+    // insert, and a zero-segment capture (SAA-150) legitimately produces one.
+    const inserted =
+      segmentRows.length > 0
+        ? await tx
+            .insert(schema.segments)
+            .values(segmentRows)
+            .returning({ id: schema.segments.id })
+        : [];
 
     // Attendee rows in the same transaction as the recording they describe:
     // a recording that exists with the answer already on disk should never be

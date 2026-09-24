@@ -1440,7 +1440,12 @@ function startPipeline(stem, opts = {}) {
             // three attempts per capture with a cooldown between them, so a
             // capture that fails for a reason retrying cannot fix stops on its
             // own rather than spinning.
-            startRecovery(`pipeline failed stem=${stem}`);
+            //
+            // watchStem is what withdraws the failure once recovery actually
+            // lands it (SAA-183) — see startRecovery's own comment for the
+            // exact condition. Recovery running, or even completing without
+            // reporting this stem complete, changes nothing here.
+            startRecovery(`pipeline failed stem=${stem}`, { watchStem: stem });
         }
         renderTray();
     });
@@ -1464,7 +1469,12 @@ function startPipeline(stem, opts = {}) {
 // pipeline run failing.
 let recoveryProc = null;
 
-function startRecovery(reason) {
+// Only these mean isComplete() is true for a stem right now — see
+// recover.ts's own comment on Attempts.last_action, which is what this is
+// read against.
+const RECOVERY_COMPLETE_ACTIONS = new Set(['complete', 'recovered']);
+
+function startRecovery(reason, opts = {}) {
     // One at a time. The pass is sequential and can take minutes on a backlog;
     // a second one would race it for the same captures and the same API quota.
     if (recoveryProc) {
@@ -1480,6 +1490,19 @@ function startRecovery(reason) {
         console.error(`recovery log ${logPath}: ${String(err)}`);
         return;
     }
+    // Recorded here, before spawn, not read from the recovery file's own
+    // last_action_at: a pass that aborts before reaching this stem at all
+    // (loadDbState throwing on a network error, SAA-156) leaves the file
+    // holding whatever a PREVIOUS pass wrote. Comparing against this instant
+    // is what stops that stale value from being read as "this pass cleared
+    // it" (SAA-183).
+    const triggeredAtMs = Date.now();
+    // stdout and stderr both go straight to the log fd, as before recovery
+    // was ever watched for anything: recovery is spawned detached specifically
+    // so it survives the app quitting mid-pass, and a piped stdout would leave
+    // it writing to a closed pipe (EPIPE) if that happens — a mid-write crash
+    // in exactly the process this exists to make crashes safe from. The
+    // withdrawal check below reads a file after the fact instead (SAA-183).
     const proc = spawn(TSX_BIN, [RECOVER_ENTRY, OUTDIR], {
         cwd: SERVER_DIR,
         env: { ...process.env, PATH: PIPELINE_PATH },
@@ -1503,6 +1526,31 @@ function startRecovery(reason) {
             );
         } catch {}
         if (recoveryProc === proc) recoveryProc = null;
+        // Read after the process is gone, not during — recovery.ts writes
+        // recovery-<stem>.json before this exits, so there is no race. Only
+        // withdraw a failure that is still this exact stem: Retry, a new
+        // capture, or a later recovery pass could have replaced `pipeline`
+        // with something else in the meantime.
+        if (opts.watchStem && pipeline && pipeline.stem === opts.watchStem && pipeline.state === 'failed') {
+            const recoveryFile = path.join(OUTDIR, `recovery-${opts.watchStem}.json`);
+            let record = null;
+            try {
+                record = JSON.parse(fs.readFileSync(recoveryFile, 'utf8'));
+            } catch {}
+            const actionAtMs = record && record.last_action_at ? Date.parse(record.last_action_at) : NaN;
+            // Stale-read guard: last_action must have been written by THIS
+            // pass, not left over from an earlier one this pass never got to
+            // (e.g. it aborted in loadDbState before reaching this stem).
+            if (
+                record &&
+                RECOVERY_COMPLETE_ACTIONS.has(record.last_action) &&
+                Number.isFinite(actionAtMs) &&
+                actionAtMs > triggeredAtMs
+            ) {
+                pipeline = null;
+                renderTray();
+            }
+        }
     });
 }
 
