@@ -47,10 +47,14 @@ type DiarizeVoice = {
   embedding: number[];
 };
 
+// voiceIndex is null for a diarized segment that exists but was excluded
+// (host echo, or under minimumVoiceSeconds — see main.swift). That's
+// different from no entry at all for a time range (a true diarization gap)
+// — assignVoice below treats the two differently.
 type DiarizeSegment = {
   start: number;
   end: number;
-  voiceIndex: number;
+  voiceIndex: number | null;
 };
 
 type DiarizeSidecar = {
@@ -92,33 +96,51 @@ function skip(reason: string, extra: Partial<DiarizationStepResult> = {}): Diari
 }
 
 // Reassign a `them` segment to the diarized voice with the greatest time
-// overlap. A segment with no overlap at all (a diarization gap under a
-// whisper segment — the mic and the tap don't share a VAD) goes to the
-// nearest diarized segment by time distance instead, so every `them`
-// segment always lands on some voice; nothing is left pointing at a row
-// that's about to be deleted.
+// overlap — real or excluded. A null result means "leave this segment on
+// `them`," which happens two ways:
+//  - its best overlap is with an excluded voice's time range (host echo,
+//    or under minimumVoiceSeconds): deliberate, not a fallback.
+//  - no diarized segment overlaps it at all (a true gap under a whisper
+//    segment — the mic and the tap don't share a VAD): falls back to the
+//    nearest diarized segment by time distance, but only among REAL
+//    (non-excluded) voices — snapping a gap onto an excluded voice's
+//    position isn't a place to fall back to either.
 function assignVoice(
   segStart: number,
   segEnd: number,
   diarized: DiarizeSegment[],
-): number {
+): number | null {
   let bestOverlap = 0;
+  // A separate `found` flag, not `bestVoice`'s own type, tracks "no
+  // overlapping segment yet": `d.voiceIndex` for an excluded segment is
+  // `null` in the type but arrives as `undefined` at runtime (Swift's
+  // JSONEncoder omits a nil Optional key rather than writing `null` —
+  // confirmed empirically, same issue fixed for hostEchoSourceLabel above),
+  // so `undefined` can't double as that sentinel without colliding with a
+  // real excluded-voice result.
+  let found = false;
   let bestVoice: number | null = null;
-  let bestDistance = Infinity;
-  let nearestVoice = diarized[0]?.voiceIndex ?? 1;
   for (const d of diarized) {
     const overlap = Math.min(segEnd, d.end) - Math.max(segStart, d.start);
     if (overlap > bestOverlap) {
       bestOverlap = overlap;
-      bestVoice = d.voiceIndex;
+      bestVoice = d.voiceIndex ?? null;
+      found = true;
     }
+  }
+  if (found) return bestVoice;
+
+  let bestDistance = Infinity;
+  let nearestVoice: number | null = null;
+  for (const d of diarized) {
+    if (d.voiceIndex == null) continue; // catches both null and an omitted-key undefined
     const distance = segStart >= d.end ? segStart - d.end : segEnd <= d.start ? d.start - segEnd : 0;
     if (distance < bestDistance) {
       bestDistance = distance;
       nearestVoice = d.voiceIndex;
     }
   }
-  return bestVoice ?? nearestVoice;
+  return nearestVoice;
 }
 
 export async function runDiarizationForCapture(
@@ -209,7 +231,7 @@ export async function runDiarizationForCapture(
     // Two-party gating (SAA-194 §5): a real 1:1 call must behave exactly as
     // today. Nothing is written — the single `them` row stands.
     return skip(
-      `${sidecar.voices.length} voice(s) survived the host-echo drop — treating as two-party, not splitting`,
+      `${sidecar.voices.length} voice(s) survived the host-echo and minimum-size drops — treating as two-party, not splitting`,
       { voicesFound: sidecar.voices.length, modelRevision: sidecar.modelRevision, processingTimeSeconds: sidecar.processingTimeSeconds, hostEcho },
     );
   }
@@ -252,17 +274,36 @@ export async function runDiarizationForCapture(
       .from(schema.segments)
       .where(eq(schema.segments.speakerId, them[0].id));
 
+    // A segment can legitimately stay on `them`: assignVoice returns null
+    // both for a genuinely excluded voice's time range (host echo, or under
+    // minimumVoiceSeconds — see main.swift's SegmentOut comment) and, if it
+    // ever happened, no diarized coverage anywhere. Track whether that
+    // happened at least once — it decides whether `them` is still needed
+    // below.
+    let anySegmentKeptOnThem = false;
     for (const seg of themSegments) {
       const voiceIndex = assignVoice(seg.startSec, seg.endSec, sidecar.segments);
+      if (voiceIndex === null) {
+        anySegmentKeptOnThem = true;
+        continue;
+      }
       const speakerId = speakerIdByVoice.get(voiceIndex);
-      if (!speakerId) continue; // unreachable: assignVoice only returns indices present in sidecar.voices
+      if (!speakerId) {
+        anySegmentKeptOnThem = true;
+        continue; // unreachable in practice: assignVoice only returns indices present in sidecar.voices
+      }
       await tx.update(schema.segments).set({ speakerId }).where(eq(schema.segments.id, seg.id));
     }
 
-    // The blanket `them` row now has zero segments — deleting it matches
-    // ingest's own stated invariant ("a `them` speaker with no segments
-    // would assert a participant who contributed nothing", clipwise.ts).
-    await tx.delete(schema.speakers).where(eq(schema.speakers.id, them[0].id));
+    // Only delete the blanket `them` row when nothing was deliberately kept
+    // on it (matches ingest's own stated invariant — "a `them` speaker with
+    // no segments would assert a participant who contributed nothing",
+    // clipwise.ts). Deleting it while a fragment/host-echo voice's segments
+    // are still pointed at it would orphan them to a null speakerId via the
+    // FK's ON DELETE SET NULL, not leave them on `them` as intended.
+    if (!anySegmentKeptOnThem) {
+      await tx.delete(schema.speakers).where(eq(schema.speakers.id, them[0].id));
+    }
   });
 
   return {

@@ -18,6 +18,7 @@
 // directory itself is populated ahead of time by fetch-models.sh, never by
 // this tool.
 
+import AVFoundation
 import FluidAudio
 import Foundation
 
@@ -86,6 +87,16 @@ let hostEchoCosineThreshold: Float = 0.55
 // entirely (voice-to-voice similarity, not segmentation/clustering).
 let diarizationClusteringThreshold: Double = 0.6
 
+// A diarized voice with less total speech than this is folded back onto
+// `them` rather than becoming its own Voice N (SAA-194, addition/fix
+// 2026-09-24 #2). Found empirically: the first 09-08 "4th voice" (7.3s)
+// looked like host echo only because Fathom's start-only timestamps
+// overlap whoever spoke during the host's own turns — a handful of short
+// interjections from someone else, misread as "100% Jon." 15s is well
+// above that scale (five ~1.5s interjections) while still comfortably
+// below any real participant's contribution to a multi-minute call.
+let minimumVoiceSeconds: Double = 15.0
+
 struct VoiceOut: Codable {
     let voiceIndex: Int
     let sourceLabel: String  // FluidAudio's own "S1"/"S2"/... — kept for traceability only
@@ -93,10 +104,17 @@ struct VoiceOut: Codable {
     let embedding: [Float]
 }
 
+// voiceIndex is nil for a diarized segment that exists (FluidAudio found
+// speech there) but was excluded from `voices` — either dropped as host
+// echo or folded back for being under minimumVoiceSeconds. That's a
+// different fact from "no diarized coverage here at all" (a true gap under
+// a whisper segment), and the caller (pipeline/diarize.ts) needs to tell
+// them apart: an excluded segment's time range must stay on `them`, not
+// get swept into the nearest surviving voice by its gap-filling fallback.
 struct SegmentOut: Codable {
     let start: Double
     let end: Double
-    let voiceIndex: Int
+    let voiceIndex: Int?
 }
 
 struct DiarizeSidecar: Codable {
@@ -155,6 +173,85 @@ func meanEmbeddings(_ segments: [TimedSpeakerSegment]) -> [String: (embedding: [
         out[label] = (sum.map { $0 / Float(weight) }, weight)
     }
     return out
+}
+
+// Mono Float32 samples straight off disk, at the file's own sample rate —
+// both tap and mic 16k wavs are already 16kHz mono by construction
+// (transcribe.py's ffmpeg downsample), matching what the offline pipeline
+// expects, so no resampling happens here.
+func readMonoFloatSamples(_ url: URL) throws -> (samples: [Float], sampleRate: Double) {
+    let file = try AVAudioFile(forReading: url)
+    let format = file.processingFormat
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(file.length)) else {
+        throw NSError(
+            domain: "diarize", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "could not allocate a read buffer for \(url.path)"])
+    }
+    try file.read(into: buffer)
+    guard let channelData = buffer.floatChannelData?[0] else {
+        throw NSError(
+            domain: "diarize", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "no float channel data after reading \(url.path)"])
+    }
+    return (Array(UnsafeBufferPointer(start: channelData, count: Int(buffer.frameLength))), format.sampleRate)
+}
+
+// Sorted, overlap-merged [start, end) intervals.
+func mergeIntervals(_ intervals: [(Double, Double)]) -> [(Double, Double)] {
+    guard !intervals.isEmpty else { return [] }
+    let sorted = intervals.sorted { $0.0 < $1.0 }
+    var merged = [sorted[0]]
+    for (s, e) in sorted.dropFirst() {
+        if s <= merged[merged.count - 1].1 {
+            merged[merged.count - 1].1 = max(merged[merged.count - 1].1, e)
+        } else {
+            merged.append((s, e))
+        }
+    }
+    return merged
+}
+
+// The complement of `intervals` within [0, duration) — the windows where
+// none of `intervals` covers.
+func complement(of intervals: [(Double, Double)], duration: Double) -> [(Double, Double)] {
+    var gaps: [(Double, Double)] = []
+    var cursor = 0.0
+    for (s, e) in mergeIntervals(intervals) {
+        if s > cursor { gaps.append((cursor, s)) }
+        cursor = max(cursor, e)
+    }
+    if cursor < duration { gaps.append((cursor, duration)) }
+    return gaps
+}
+
+func extractSamples(_ samples: [Float], sampleRate: Double, windows: [(Double, Double)]) -> [Float] {
+    var out: [Float] = []
+    for (s, e) in windows {
+        let startIndex = max(0, Int(s * sampleRate))
+        let endIndex = min(samples.count, Int(e * sampleRate))
+        guard endIndex > startIndex else { continue }
+        out.append(contentsOf: samples[startIndex..<endIndex])
+    }
+    return out
+}
+
+// A single embedding representing every voice found, combined rather than
+// picking one (SAA-194, addition/fix 2026-09-24 #3): on audio that should
+// be one speaker, any residual clustering fragmentation is blended back
+// together by weighting each fragment's contribution by how much of the
+// audio it actually covers, instead of gambling that the single largest
+// fragment is the clean one — which is exactly what picked a wrong 715s
+// mic-track cluster on 09-08 under the old "take the longest cluster" rule.
+func combinedEmbedding(_ voices: [String: (embedding: [Float], totalSeconds: Double)]) -> [Float]? {
+    guard let dim = voices.values.first?.embedding.count else { return nil }
+    var sum = [Float](repeating: 0, count: dim)
+    var weight = 0.0
+    for (_, voice) in voices {
+        for i in 0..<min(dim, voice.embedding.count) { sum[i] += voice.embedding[i] * Float(voice.totalSeconds) }
+        weight += voice.totalSeconds
+    }
+    guard weight > 0 else { return nil }
+    return sum.map { $0 / Float(weight) }
 }
 
 func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
@@ -232,21 +329,45 @@ do {
 
         let tapVoices = meanEmbeddings(tapResult.segments)
 
-        // Host echo (SAA-194 §4): the mic track is the host talking alone —
-        // diarize it too (cheap, same cost as the tap track) and take its
-        // dominant voice's embedding, weighted by speaking time so a stray
-        // VAD sliver can't outvote the host's own long segments.
+        // Host reference embedding (SAA-194 §4, fixed 2026-09-24): built
+        // ONLY from mic audio where the tap track has no diarized speech at
+        // all — nobody on the call is talking, so anything on the mic there
+        // is the host and only the host. This replaced diarizing the whole
+        // mic track and taking its longest cluster, which on 09-08 picked a
+        // 715s cluster out of 5 the mic track fragmented into — the mic
+        // track is not reliably one clean cluster over a long call, so nor
+        // was "the longest one" reliably the host.
         var hostEmbedding: [Float]? = nil
         if FileManager.default.fileExists(atPath: micPath) {
-            let micResult = try await manager.process(URL(fileURLWithPath: micPath))
-            let micVoices = meanEmbeddings(micResult.segments)
+            let tapSpeechIntervals = tapResult.segments.map {
+                (Double($0.startTimeSeconds), Double($0.endTimeSeconds))
+            }
+            let (micSamples, micSampleRate) = try readMonoFloatSamples(URL(fileURLWithPath: micPath))
+            let micDuration = Double(micSamples.count) / micSampleRate
+            let tapSilentWindows = complement(of: tapSpeechIntervals, duration: micDuration)
+            let restrictedSamples = extractSamples(micSamples, sampleRate: micSampleRate, windows: tapSilentWindows)
+            let restrictedSeconds = Double(restrictedSamples.count) / micSampleRate
             FileHandle.standardError.write(
-                "diarize: mic track diarized into \(micVoices.count) voice(s): "
-                    .appending(micVoices.map { "\($0.key)=\(String(format: "%.1f", $0.value.totalSeconds))s" }.joined(separator: ", "))
-                    .appending("\n")
+                "diarize: host reference — \(tapSilentWindows.count) tap-silent window(s), \(String(format: "%.1f", restrictedSeconds))s of mic audio\n"
                     .data(using: .utf8)!)
-            hostEmbedding = micVoices.max(by: { $0.value.totalSeconds < $1.value.totalSeconds })?.value
-                .embedding
+            // Below this, whatever diarization says about it is noise, not a
+            // usable host embedding — skip rather than guess.
+            if restrictedSeconds >= 3.0 {
+                let restrictedResult = try await manager.process(audio: restrictedSamples)
+                let restrictedVoices = meanEmbeddings(restrictedResult.segments)
+                FileHandle.standardError.write(
+                    "diarize: host reference audio diarized into \(restrictedVoices.count) voice(s): "
+                        .appending(restrictedVoices.map { "\($0.key)=\(String(format: "%.1f", $0.value.totalSeconds))s" }.joined(separator: ", "))
+                        .appending("\n")
+                        .data(using: .utf8)!)
+                // Combined, not "take the longest" (see combinedEmbedding's
+                // own comment) — the fix this whole block exists for.
+                hostEmbedding = combinedEmbedding(restrictedVoices)
+            } else {
+                FileHandle.standardError.write(
+                    "diarize: host reference — too little tap-silent mic audio, skipping host-echo check\n"
+                        .data(using: .utf8)!)
+            }
         }
 
         var hostEchoSourceLabel: String? = nil
@@ -255,7 +376,7 @@ do {
             for (label, voice) in tapVoices {
                 let similarity = cosineSimilarity(hostEmbedding, voice.embedding)
                 FileHandle.standardError.write(
-                    "diarize: host-echo check — tap voice \(label) vs host mic embedding: similarity=\(String(format: "%.3f", similarity))\n"
+                    "diarize: host-echo check — tap voice \(label) vs host reference embedding: similarity=\(String(format: "%.3f", similarity))\n"
                         .data(using: .utf8)!)
                 if similarity >= hostEchoCosineThreshold
                     && (hostEchoSimilarity == nil || similarity > hostEchoSimilarity!)
@@ -266,9 +387,26 @@ do {
             }
         }
 
+        // A voice is excluded — folded back onto `them`, no Voice N of its
+        // own — when it's the host echo, or when it falls under
+        // minimumVoiceSeconds regardless of host-echo status. Both are
+        // logged the same way: the distinction that matters downstream is
+        // "real voice" vs "not," not which rule excluded it.
+        var excludedReasons: [String: String] = [:]
+        if let hostEchoSourceLabel {
+            excludedReasons[hostEchoSourceLabel] = "host echo (similarity \(String(format: "%.3f", hostEchoSimilarity ?? 0)))"
+        }
+        for (label, voice) in tapVoices where voice.totalSeconds < minimumVoiceSeconds && excludedReasons[label] == nil {
+            excludedReasons[label] = "under minimumVoiceSeconds (\(String(format: "%.1f", voice.totalSeconds))s < \(minimumVoiceSeconds)s)"
+        }
+        for (label, reason) in excludedReasons {
+            FileHandle.standardError.write(
+                "diarize: voice \(label) excluded — \(reason); its segments stay on `them`\n".data(using: .utf8)!)
+        }
+
         // Stable, deterministic voiceIndex assignment (sorted by FluidAudio's
-        // own label) for every voice except the one dropped as host echo.
-        let survivingLabels = tapVoices.keys.filter { $0 != hostEchoSourceLabel }.sorted()
+        // own label) for every surviving (non-excluded) voice.
+        let survivingLabels = tapVoices.keys.filter { excludedReasons[$0] == nil }.sorted()
         var indexByLabel: [String: Int] = [:]
         for (i, label) in survivingLabels.enumerated() { indexByLabel[label] = i + 1 }
 
@@ -278,10 +416,15 @@ do {
                 voiceIndex: indexByLabel[label]!, sourceLabel: label,
                 totalSeconds: voice.totalSeconds, embedding: voice.embedding)
         }
-        let segmentsOut: [SegmentOut] = tapResult.segments.compactMap { seg in
-            guard let index = indexByLabel[seg.speakerId] else { return nil }  // the dropped host-echo voice
-            return SegmentOut(
-                start: Double(seg.startTimeSeconds), end: Double(seg.endTimeSeconds), voiceIndex: index)
+        // Every diarized segment is emitted, including excluded voices' —
+        // with voiceIndex nil for those, so the caller can tell "diarized
+        // but excluded, leave on them" apart from "no diarized coverage at
+        // all here" (a true gap, eligible for its own nearest-voice
+        // fallback). See SegmentOut's own comment.
+        let segmentsOut: [SegmentOut] = tapResult.segments.map { seg in
+            SegmentOut(
+                start: Double(seg.startTimeSeconds), end: Double(seg.endTimeSeconds),
+                voiceIndex: indexByLabel[seg.speakerId])
         }
 
         writeSidecar(
