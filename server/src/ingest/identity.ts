@@ -41,7 +41,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 
 // Bumped 1 -> 2 for `scope` (SAA-153/SAA-169): the shape the recorder writes
@@ -131,6 +131,47 @@ function clean(value: string | null | undefined): string | null {
 }
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+// True when the recording's stored metadata.identity already reflects THIS
+// answer (SAA-179) — a different fact from "the resulting attendee rows
+// exist." applyIdentity's own name-based skip (below) means a row that was
+// deliberately deleted looks identical, to that check, to one that was never
+// applied — the next pass re-inserts it either way. This is what a caller
+// checks first, before ever calling applyIdentity/applySpeakerNames/
+// applyScope, to tell "already handled" from "rows happen to be present."
+//
+// Raw string comparison on purpose: answered_at is round-tripped through
+// JSON, never through `new Date()`, so the stored and file values are either
+// the exact same string or they are a real answer to a different question
+// (unanswered, or re-answered).
+export function identityAlreadyApplied(
+  metadata: unknown,
+  answer: IdentityAnswer,
+): boolean {
+  const stored = (metadata as { identity?: IdentityAnswer } | null | undefined)?.identity;
+  const storedAt = stored?.answered_at;
+  const fileAt = answer.answered_at;
+  return Boolean(storedAt && fileAt && storedAt === fileAt);
+}
+
+// Stamps the answer onto recordings.metadata.identity — the provenance the
+// insert branch (ingest/clipwise.ts) has always written at row-creation time,
+// now written from the paths that apply an answer to a row that already
+// exists (SAA-179), so identityAlreadyApplied above has something to check
+// next time. Same merge pattern as extract.ts's promoteRecording: coalesce
+// plus jsonb_build_object, so unrelated metadata keys are left alone.
+export async function storeIdentityMetadata(
+  executor: typeof db | Tx,
+  recordingId: string,
+  answer: IdentityAnswer,
+): Promise<void> {
+  await executor
+    .update(schema.recordings)
+    .set({
+      metadata: sql`coalesce(${schema.recordings.metadata}, '{}'::jsonb) || jsonb_build_object('identity', ${JSON.stringify(answer)}::jsonb)`,
+    })
+    .where(eq(schema.recordings.id, recordingId));
+}
 
 // Insert the answer's rows onto a recording, skipping what is already there.
 //

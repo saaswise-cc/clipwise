@@ -44,7 +44,9 @@ import {
   describeMapping,
   describeRows,
   describeScope,
+  identityAlreadyApplied,
   readIdentityAnswer,
+  storeIdentityMetadata,
   type IdentityAnswer,
 } from "./identity.js";
 
@@ -335,18 +337,32 @@ export async function ingestTranscript(
     // the first ingest gets its attendee rows from the next run — a tray
     // retry, or the apply step the recorder spawns when an answer arrives
     // late — rather than needing the row to be inserted fresh.
+    //
+    // Gated on identityAlreadyApplied (SAA-179): this branch can run any
+    // number of times for the same recording (a retried pipeline, --force-
+    // extract), and applyIdentity's own name-based skip cannot tell "already
+    // applied" from "rows happen to already be present" — a deliberately
+    // deleted attendee row reads as the latter and comes back. Checking the
+    // stored answer first is what lets a delete stay deleted.
     if (identity) {
-      const applied = await applyIdentity(db, existing.id, identity);
-      const mapping = await applySpeakerNames(db, existing.id, identity);
-      const scope = await applyScope(db, existing.id, identity);
-      process.stdout.write(
-        `ingest: identity (existing row) inserted=${describeRows(applied.inserted)} ` +
-          `already_present=${describeRows(applied.skipped)}\n`,
-      );
-      process.stdout.write(
-        `ingest: speaker names (existing row) ${describeMapping(mapping)}\n`,
-      );
-      process.stdout.write(`ingest: scope (existing row) ${describeScope(scope)}\n`);
+      if (identityAlreadyApplied(existing.metadata, identity)) {
+        process.stdout.write(
+          `ingest: identity (existing row) already applied for stem=${stamp ?? "(unknown)"} — skipping\n`,
+        );
+      } else {
+        const applied = await applyIdentity(db, existing.id, identity);
+        const mapping = await applySpeakerNames(db, existing.id, identity);
+        const scope = await applyScope(db, existing.id, identity);
+        await storeIdentityMetadata(db, existing.id, identity);
+        process.stdout.write(
+          `ingest: identity (existing row) inserted=${describeRows(applied.inserted)} ` +
+            `already_present=${describeRows(applied.skipped)}\n`,
+        );
+        process.stdout.write(
+          `ingest: speaker names (existing row) ${describeMapping(mapping)}\n`,
+        );
+        process.stdout.write(`ingest: scope (existing row) ${describeScope(scope)}\n`);
+      }
     }
     return {
       recordingId: existing.id,

@@ -352,6 +352,17 @@ export async function runRecoveryPass(opts: {
         });
         continue;
       }
+      if (result.status === "already_applied") {
+        // SAA-179: stored metadata.identity.answered_at already matched the
+        // file's, so applyIdentityForCapture skipped before ever touching
+        // attendees/speakers/scope — this pass did nothing for this stem.
+        identityOutcomes.push({
+          stem: c.stem,
+          status: "already_applied",
+          detail: `recording=${result.recordingId} — stored answer already matches the file, skipped`,
+        });
+        continue;
+      }
       const gotNewRows = result.identity.inserted.length > 0;
       identityOutcomes.push({
         stem: c.stem,

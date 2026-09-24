@@ -36,6 +36,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { eq } from "drizzle-orm";
 
 import { db, pool, schema } from "../db/index.js";
 import { CLIPWISE_SOURCE } from "../ingest/clipwise.js";
@@ -47,7 +48,9 @@ import {
   describeRows,
   describeScope,
   findRecordingForCapture,
+  identityAlreadyApplied,
   readIdentityAnswer,
+  storeIdentityMetadata,
   type IdentityApplication,
   type ScopeApplication,
   type SpeakerMapping,
@@ -75,6 +78,11 @@ function readManifestRecordingId(dir: string, stem: string): string {
 export type ApplyIdentityCaptureResult =
   | { status: "no_answer" }
   | { status: "pending"; sourceId: string }
+  // Stored metadata.identity.answered_at already matches this file's — the
+  // skip identityAlreadyApplied exists for (SAA-179). Distinct from the
+  // "applied" case with empty inserted/skipped: that would still mean this
+  // call queried attendees/speakers/scope for nothing, every pass, forever.
+  | { status: "already_applied"; recordingId: string }
   | {
       status: "applied";
       recordingId: string;
@@ -88,7 +96,11 @@ export type ApplyIdentityCaptureResult =
 // per-manifest sweep. Safe to call repeatedly and unconditionally — every
 // write inside is already guarded against re-applying (applyIdentity's
 // takenNames check, applySpeakerNames' already-named skip, applyScope's
-// already-classified skip).
+// already-classified skip) — but SAA-179 is that those per-row guards are
+// not the same fact as "this answer was already handled": a row deleted
+// after being applied looks, to them, identical to one never applied, and
+// comes back on the next call. identityAlreadyApplied below is the guard
+// that actually means the latter.
 export async function applyIdentityForCapture(
   dir: string,
   stem: string,
@@ -116,9 +128,19 @@ export async function applyIdentityForCapture(
     return { status: "pending", sourceId };
   }
 
+  const [row] = await db
+    .select({ metadata: schema.recordings.metadata })
+    .from(schema.recordings)
+    .where(eq(schema.recordings.id, recordingId));
+  if (identityAlreadyApplied(row?.metadata, answer)) {
+    console.log(`apply-identity: already applied for stem=${stem} — skipping`);
+    return { status: "already_applied", recordingId };
+  }
+
   const identity = await applyIdentity(db, recordingId, answer);
   const speakerMapping = await applySpeakerNames(db, recordingId, answer);
   const scope = await applyScope(db, recordingId, answer);
+  await storeIdentityMetadata(db, recordingId, answer);
   return { status: "applied", recordingId, identity, speakerMapping, scope };
 }
 
@@ -151,6 +173,12 @@ async function main(): Promise<void> {
     process.stdout.write(
       `apply-identity: no recording yet for source_id=${result.sourceId} — ` +
         `ingest will read the answer when it gets there\n`,
+    );
+    return;
+  }
+  if (result.status === "already_applied") {
+    process.stdout.write(
+      `apply-identity: recording=${result.recordingId} already applied — skipping\n`,
     );
     return;
   }
