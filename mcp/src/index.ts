@@ -23,7 +23,7 @@ const DESC = {
   semanticQuery:
     "Semantic search. Free-text question or description; results are ranked by cosine similarity against moment embeddings. Best for interpretation-heavy queries (what did we decide about X, who pushed back on Y). Returns up to `limit` results with a per-result `similarity` score in [-1,1]. Results always fill up to the limit regardless of relevance because there is no distance floor — you MUST read the similarity score to judge whether a low-ranked result is actually a match, otherwise you will treat unrelated moments as answers. Mutually exclusive with `query` — pass one or the other, not both.",
   recordingId: "Restrict to a single recording (UUID).",
-  kind: 'Restrict to a specific moment kind (e.g. "decision", "objection").',
+  kind: 'Restrict to a specific moment kind (e.g. "decision", "commitment"). Case-insensitive. An unknown kind is refused with an error listing the kinds this account actually has, rather than silently returning zero results.',
   attendee:
     "Restrict to recordings this person was on. Case-insensitive substring match against the attendee's name — who was in the meeting, not who the moment talks about, so a call where they never came up still matches and a call where they were only mentioned does not. Composes with `query` or `semanticQuery` (both filters apply) and works on its own. Only recordings whose attendee list was captured can match; one with no attendee rows is invisible to this filter rather than an error.",
   limit: "Max results. Defaults to 50.",
@@ -32,9 +32,9 @@ const DESC = {
   index:
     "Recording-level enumeration instead of a moment search (SAA-85). Mutually exclusive with `query`/`semanticQuery` — pass this alone, optionally with `attendee`, `dateFrom`/`dateTo`, `scope` and `recordingId` to narrow which recordings are listed. Use this to answer \"what happened over this period\" or \"list every 1:1 with X\" — questions about which meetings existed, not what was said in them. Returns `recordings` instead of `moments`: each entry has the recording id (needed for get_transcript — otherwise a UUID is only discoverable by accident from a moment result), title, startedAt, durationSec, attendees (guests, not the host), momentCounts (an object keyed by moment kind, e.g. {\"decision\": 2, \"observation\": 5} — a kind with zero moments is simply absent, not present as 0) and totalMoments. Carries no moment title/summary text — this is an index, not a content view; follow up with a regular query scoped to a specific recordingId to read what was actually said. Still respects `truncated`/`totalMatches` and the personal/work `scope` default exactly like a moment search.",
   dateFrom:
-    "With `index`: only recordings started at or after this ISO 8601 datetime (e.g. \"2026-09-07T00:00:00Z\"). Combine with dateTo to bound a window; either alone is a valid half-open range.",
+    "Only recordings started at or after this ISO 8601 datetime (e.g. \"2026-09-07T00:00:00Z\") — bounds `index` results and moment-search results alike. Combine with dateTo to bound a window; either alone is a valid half-open range.",
   dateTo:
-    "With `index`: only recordings started at or before this ISO 8601 datetime. See dateFrom.",
+    "Only recordings started at or before this ISO 8601 datetime — bounds `index` results and moment-search results alike. See dateFrom.",
   getTranscriptTool:
     "Fetch the full transcript for a recording, with per-segment timestamps and speaker labels.",
   getTranscriptRecordingId: "The recording to fetch the transcript for (UUID).",

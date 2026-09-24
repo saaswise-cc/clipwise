@@ -13,6 +13,7 @@ import {
   lte,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import { cosineDistance } from "drizzle-orm/sql/functions/vector";
 import { z } from "zod";
@@ -107,6 +108,50 @@ momentsRouter.post(
   }),
 );
 
+// Bounds recordings.started_at. Shared by the index path and the
+// moment-search paths (SAA-85): search_moments' schema has always declared
+// dateFrom/dateTo, and the MCP client always forwarded them, but only the
+// index branch ever read them — a bounded content question (no query,
+// dateFrom/dateTo, scope, kind) silently ignored the dates and returned the
+// whole scope instead. One implementation, called from both places, rather
+// than a second copy that could drift from this one.
+function pushDateRangeConditions(
+  conditions: (SQL | undefined)[],
+  query: Pick<z.infer<typeof searchMomentsQuerySchema>, "dateFrom" | "dateTo">,
+): void {
+  if (query.dateFrom) {
+    conditions.push(gte(schema.recordings.startedAt, new Date(query.dateFrom)));
+  }
+  if (query.dateTo) {
+    conditions.push(lte(schema.recordings.startedAt, new Date(query.dateTo)));
+  }
+}
+
+// Case-insensitive, and refuses rather than silently returning zero rows
+// (SAA-85, the 2026-08-29 finding). The valid list is read from this
+// account's own moments rather than fixed in code: extraction's JSON schema
+// (extract.ts) currently allows only 7 kinds, but the database holds 13 —
+// hand-curated moments (POST /moments, above) take a free-text kind with no
+// enum at all, and older extraction runs used a wider vocabulary. A fixed
+// list sourced from today's extraction schema would reject those as
+// "unknown" even though they are real, already-used kinds — exactly the
+// false negative this fix exists to remove. The live list stays correct as
+// either source changes; a fixed list would need to be remembered and
+// updated by hand.
+async function assertKnownKind(accountId: string, kind: string): Promise<string> {
+  const normalized = kind.toLowerCase();
+  const rows = await db
+    .select({ kind: schema.moments.kind })
+    .from(schema.moments)
+    .where(eq(schema.moments.accountId, accountId))
+    .groupBy(schema.moments.kind);
+  const validKinds = rows.map((r) => r.kind).sort();
+  if (!validKinds.includes(normalized)) {
+    throw new HttpError(400, "unknown_kind", { kind, validKinds });
+  }
+  return normalized;
+}
+
 // Recording-level enumeration (SAA-85). Settled 2026-09-10: a filter within
 // search_moments rather than a separate list_recordings tool, returning
 // date, attendees, duration and moment counts by kind, with a date-range
@@ -129,12 +174,7 @@ async function runRecordingIndex(
   if (query.recordingId) {
     conditions.push(eq(schema.recordings.id, query.recordingId));
   }
-  if (query.dateFrom) {
-    conditions.push(gte(schema.recordings.startedAt, new Date(query.dateFrom)));
-  }
-  if (query.dateTo) {
-    conditions.push(lte(schema.recordings.startedAt, new Date(query.dateTo)));
-  }
+  pushDateRangeConditions(conditions, query);
 
   // Same scope filter and default as the moment-search path, and the same
   // reasoning (SAA-153): work by default, disclosed rather than silent,
@@ -320,8 +360,12 @@ momentsRouter.get(
     if (query.recordingId) {
       conditions.push(eq(schema.moments.recordingId, query.recordingId));
     }
+    // SAA-85: dateFrom/dateTo bound recordings.started_at here too, the same
+    // way the index path already does — see pushDateRangeConditions.
+    pushDateRangeConditions(conditions, query);
     if (query.kind) {
-      conditions.push(eq(schema.moments.kind, query.kind));
+      const normalizedKind = await assertKnownKind(accountId, query.kind);
+      conditions.push(eq(schema.moments.kind, normalizedKind));
     }
     // Personal-vs-work filter (SAA-153). Defaults to "work" when the
     // caller names no scope: it's the overwhelming majority of use, and
@@ -516,18 +560,32 @@ momentsRouter.get(
       // recording before a caller ever sees a second one, because moments
       // from one extraction run land within seconds of each other — a
       // query matching 9+ recordings returned all 50 from the newest 1-2.
-      // Round-robin by recording instead: rank each recording's own matches
-      // by recency (most recent first within that recording), then take
-      // every recording's rank-1 moment before any recording's rank-2, and
-      // so on. This is ordering, not scoring — no relevance model, nothing
-      // AD #13 would call fusion — so a single-recording query (one
-      // partition) degenerates to the original createdAt-desc order with
-      // nothing dropped, while a multi-recording query gets breadth without
-      // thinning out the recordings that actually have many matches (they
-      // keep contributing at every round-robin depth).
+      // Round-robin by recording instead: rank each recording's own matches,
+      // then take every recording's rank-1 moment before any recording's
+      // rank-2, and so on. This is ordering, not scoring — no relevance
+      // model, nothing AD #13 would call fusion — so a multi-recording query
+      // gets breadth without thinning out the recordings that actually have
+      // many matches (they keep contributing at every round-robin depth).
+      //
+      // SAA-85: the rank within a recording is start_sec ascending rather
+      // than createdAt descending — every moment in one recording comes from
+      // a single extraction run with near-identical createdAt, so recency
+      // ordered nothing meaningful within a call; start_sec is when it was
+      // actually said. But the cross-recording tiebreak still needs a
+      // recency signal of its own: with only start_sec to sort on, which
+      // recording's rank-1 moment comes first is arbitrary, so a truncated
+      // result would keep arbitrary recordings rather than the newest ones
+      // the way createdAt-desc always did. recordings.started_at desc
+      // restores that — newest recording first at each round-robin depth —
+      // and moments.start_sec asc is the final, purely cosmetic tiebreak
+      // (ranks within one recording are already distinct, so this only
+      // matters for two recordings sharing the same started_at). A
+      // single-recording query still degenerates to plain chronological
+      // order with nothing dropped.
       .orderBy(
-        sql`row_number() over (partition by ${schema.moments.recordingId} order by ${schema.moments.createdAt} desc)`,
-        desc(schema.moments.createdAt),
+        sql`row_number() over (partition by ${schema.moments.recordingId} order by ${schema.moments.startSec} asc)`,
+        desc(schema.recordings.startedAt),
+        asc(schema.moments.startSec),
       )
       .limit(limit);
 
