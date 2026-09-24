@@ -2066,10 +2066,14 @@ function quitApp() {
 
 // --- launch sweep (SAA-152) -------------------------------------------------
 //
-// Parent-death detection in systemtap/miccap/micwatch only protects a stray
-// created after that fix ships. Anything orphaned earlier — or by a binary
-// built before the fix — is still sitting on disk at the next launch, so this
-// finds and ends those too.
+// Parent-death detection in systemtap/miccap/micwatch/audiodevs only protects
+// a stray created after that fix ships. Anything orphaned earlier — or by a
+// binary built before the fix — is still sitting on disk at the next launch,
+// so this finds and ends those too. audiodevs was not one of the three named
+// when this issue was written — the three were only the ones observed, and
+// the scope is "ending the recorder ends its children," which audiodevs is
+// one of (spawned as the --poll stall detector alongside tap/mic — see
+// startRecording) and orphans exactly the same way, confirmed 2026-09-24.
 //
 // Two paths per binary, dev checkout and packaged bundle, because a stray can
 // predate a layout switch as easily as a rebuild — RECORDER_DIR/BUNDLED_BIN
@@ -2088,6 +2092,8 @@ const STRAY_BIN_PATHS = new Set([
     path.join(BUNDLED_BIN, 'miccap'),
     path.join(RECORDER_DIR, 'micwatch'),
     path.join(BUNDLED_BIN, 'micwatch'),
+    path.join(RECORDER_DIR, 'audiodevs'),
+    path.join(BUNDLED_BIN, 'audiodevs'),
 ]);
 
 function sweepStrayChildren() {

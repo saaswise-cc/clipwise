@@ -132,6 +132,19 @@ if mode == "--poll" {
     sigTerm.setEventHandler { exit(0) }
     sigInt.resume()
     sigTerm.resume()
+    // Parent-death detection (SAA-152). The signal handling above only helps
+    // while the recorder is alive to send one — a `kill -9` on the recorder
+    // runs no cleanup there. EVFILT_PROC/NOTE_EXIT (what DispatchSourceProcess
+    // wraps) is posted by the kernel when the watched process terminates by
+    // any means, including SIGKILL, so this does not depend on signal
+    // delivery or the parent's cooperation at all.
+    let parentPID = getppid()
+    let parentWatch = DispatchSource.makeProcessSource(identifier: parentPID, eventMask: .exit, queue: .main)
+    parentWatch.setEventHandler {
+        FileHandle.standardError.write(Data("parent_exited ppid=\(parentPID)\n".utf8))
+        exit(0)
+    }
+    parentWatch.resume()
     Thread.detachNewThread {
         while true {
             let line = snapshot()
