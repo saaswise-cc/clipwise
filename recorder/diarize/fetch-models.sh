@@ -13,6 +13,16 @@
 # from a known-good fetch (SAA-194, 2026-09-24). A mismatch fails loudly and
 # removes the bad directory rather than letting a corrupt or tampered fetch
 # get bundled into a build.
+#
+# THIRD_PARTY_NOTICES (repo root) names the exact files this currently
+# fetches — Segmentation.mlmodelc, Embedding.mlmodelc, FBank.mlmodelc,
+# PldaRho.mlmodelc, plda-parameters.json, xvector-transform.json — as a
+# subset of the CC-BY-4.0 scope in FluidAudio's own NOTICE.md (that scope
+# also lists a standalone PLDA.mlmodelc, which the current release doesn't
+# fetch; PLDA ships as PldaRho.mlmodelc + plda-parameters.json instead).
+# If this list ever changes — a FluidAudio update, a model layout change —
+# re-confirm THIRD_PARTY_NOTICES's file list against a fresh
+# speaker-diarization/provenance.json before shipping.
 
 set -euo pipefail
 
