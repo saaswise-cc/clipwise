@@ -28,6 +28,20 @@
 // has its attendees: applyIdentity/applySpeakerNames/applyScope are each
 // idempotent no-ops in that case.
 //
+// SAA-197: identity being answered late (the prompt closed and resumed from
+// the tray, possibly minutes or hours after) breaks SAA-129's founding
+// assumption that extraction always runs after identity, since extraction
+// reads speakers.display_name live at extraction time with no re-run of its
+// own. When this recording's current_extraction_run was already set before
+// this call — extraction already happened on the old, unnamed state — and
+// the answer names exactly one guest (the only case applySpeakerNames ever
+// writes a name), this re-runs extraction the same way apply-voice-names.ts
+// does, and for the same reason storeIdentityMetadata is deferred there: so
+// a crash mid-re-extract leaves this answer unrecorded and the next sweep
+// retries the whole thing. (A separate, narrower race — identity resolving
+// *during* an in-flight run rather than after one already finished — is
+// handled inside runExtraction itself, not here; see its own comment.)
+//
 // Usage:
 //   tsx src/pipeline/apply-identity.ts <capture_dir> --stem <stem>
 //
@@ -36,7 +50,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 import { db, pool, schema } from "../db/index.js";
 import { CLIPWISE_SOURCE } from "../ingest/clipwise.js";
@@ -44,6 +58,7 @@ import {
   applyIdentity,
   applyScope,
   applySpeakerNames,
+  attendeeRowsFrom,
   describeMapping,
   describeRows,
   describeScope,
@@ -55,6 +70,7 @@ import {
   type ScopeApplication,
   type SpeakerMapping,
 } from "../ingest/identity.js";
+import { runExtraction } from "../extract/extract.js";
 
 function usage(): never {
   process.stderr.write(
@@ -89,6 +105,7 @@ export type ApplyIdentityCaptureResult =
       identity: IdentityApplication;
       speakerMapping: SpeakerMapping;
       scope: ScopeApplication;
+      extractionRunUuid: string | null;
     };
 
 // The single entry point for "make this capture's recording match its
@@ -129,19 +146,55 @@ export async function applyIdentityForCapture(
   }
 
   const [row] = await db
-    .select({ metadata: schema.recordings.metadata })
+    .select({
+      metadata: schema.recordings.metadata,
+      currentRun: sql<string | null>`${schema.recordings.metadata}->>'current_extraction_run'`,
+    })
     .from(schema.recordings)
     .where(eq(schema.recordings.id, recordingId));
   if (identityAlreadyApplied(row?.metadata, answer)) {
     console.log(`apply-identity: already applied for stem=${stem} — skipping`);
     return { status: "already_applied", recordingId };
   }
+  // Read before applying anything below: whether extraction already ran on
+  // the old, unnamed state is a fact about the recording *before* this
+  // call, not after — applySpeakerNames below never sets it.
+  const extractionAlreadyRan = row?.currentRun != null;
 
   const identity = await applyIdentity(db, recordingId, answer);
   const speakerMapping = await applySpeakerNames(db, recordingId, answer);
   const scope = await applyScope(db, recordingId, answer);
-  await storeIdentityMetadata(db, recordingId, answer);
-  return { status: "applied", recordingId, identity, speakerMapping, scope };
+
+  // The only case applySpeakerNames ever writes a name in (SAA-129) — see
+  // its own guests.length !== 1 decline. Read from the answer, not from
+  // speakerMapping.applied: a sweep retry after a crash below finds the
+  // name already written by the crashed attempt and reports it skipped,
+  // not applied, but the answer's own content — and the need to retry —
+  // hasn't changed.
+  const namesOneGuest = attendeeRowsFrom(answer).filter((r) => !r.isHost).length === 1;
+
+  let extractionRunUuid: string | null = null;
+  if (namesOneGuest && extractionAlreadyRan) {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.log(
+        "apply-identity: name applied after extraction already ran, but ANTHROPIC_API_KEY is not set — moments not re-extracted",
+      );
+      await storeIdentityMetadata(db, recordingId, answer);
+    } else {
+      const extraction = await runExtraction(recordingId);
+      extractionRunUuid = extraction.runUuid;
+      // Recorded as applied only now that extraction has actually
+      // succeeded — not right after writing the speaker/attendee rows. If
+      // runExtraction throws above, this line is never reached, so
+      // identityAlreadyApplied stays false and the next sweep retries the
+      // whole thing, extraction included (same ordering as 41bfe50).
+      await storeIdentityMetadata(db, recordingId, answer);
+    }
+  } else {
+    await storeIdentityMetadata(db, recordingId, answer);
+  }
+
+  return { status: "applied", recordingId, identity, speakerMapping, scope, extractionRunUuid };
 }
 
 async function main(): Promise<void> {
@@ -189,6 +242,9 @@ async function main(): Promise<void> {
   );
   process.stdout.write(`apply-identity: speaker names ${describeMapping(result.speakerMapping)}\n`);
   process.stdout.write(`apply-identity: scope ${describeScope(result.scope)}\n`);
+  process.stdout.write(
+    `apply-identity: extraction ${result.extractionRunUuid ? `run=${result.extractionRunUuid}` : "not run"}\n`,
+  );
 }
 
 // Only when run as a CLI — recover.ts imports applyIdentityForCapture and

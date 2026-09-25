@@ -161,6 +161,23 @@ async function loadIdentityResolved(recordingId: string): Promise<boolean> {
   return row !== undefined;
 }
 
+// Every speaker's label -> display_name on this recording, as a stable
+// string for comparing two reads taken at different times (SAA-197). Used
+// to detect a rename that happened *during* a run — a 1:1's identity
+// resolving, or a group call's "Rename voices..." — neither of which
+// loadIdentityResolved's single boolean can catch on its own: it only
+// answers "is at least one speaker named," not "did the set of names
+// change." Sorted by label so row order from Postgres never produces a
+// spurious difference between two reads of the same underlying state.
+async function loadSpeakerFingerprint(recordingId: string): Promise<string> {
+  const rows = await db
+    .select({ label: schema.speakers.label, displayName: schema.speakers.displayName })
+    .from(schema.speakers)
+    .where(eq(schema.speakers.recordingId, recordingId))
+    .orderBy(asc(schema.speakers.label));
+  return JSON.stringify(rows);
+}
+
 // Ground truth for the roster the unresolved-identity guard hands the
 // model, so a spoken "John" can be checked against "Jon Dwyer" instead of
 // taken on faith (SAA-165).
@@ -587,7 +604,17 @@ async function promoteRecording(recordingId: string, runUuid: string): Promise<v
 
 export async function runExtraction(
   recordingId: string,
-  options: { applyCollapse?: boolean } = {},
+  options: {
+    applyCollapse?: boolean;
+    // Internal recursion guard (SAA-197) — never set this from outside.
+    // Set only by this function's own retry below, when a run's speaker
+    // fingerprint changed while it was in flight. Bounded to exactly one
+    // retry: the retry call takes its own fresh fingerprint at its own
+    // start (same code every call runs), so by construction it starts
+    // already matching "now," and retryForLateIdentity skips the check
+    // entirely on that call regardless of what happens after.
+    retryForLateIdentity?: boolean;
+  } = {},
 ): Promise<ExtractionResult> {
   const applyCollapseStep = options.applyCollapse ?? true;
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -637,6 +664,9 @@ export async function runExtraction(
   console.log(
     `extract: identity resolved for this recording: ${identityResolved} (attendees: ${attendeeNames.join(", ") || "none"})`,
   );
+  // SAA-197: same point in time loadSegments rendered speaker labels from —
+  // see the comparison near promoteRecording below.
+  const speakerFingerprintAtStart = await loadSpeakerFingerprint(recordingId);
   const rendered = renderTranscript(segs);
   const runUuid = randomUUID();
 
@@ -813,6 +843,28 @@ export async function runExtraction(
   );
 
   const finalPersonnelCount = await personnelCountForRun(recordingId, runUuid);
+
+  // SAA-197: a speaker's name can change while this run's pass 1/pass 2
+  // was already in flight — a 1:1's identity resolving, or a group call's
+  // "Rename voices..." (live, 2026-09-25: naming voices while a Weekly
+  // Initiative Sync's extract was still running started a second run, and
+  // whichever promoted last won). loadSegments rendered speaker labels
+  // once, at the top of this function, from whatever the fingerprint was
+  // *then* — that rendering can't be patched after the fact. If the
+  // fingerprint now differs from the one taken at the start, every moment
+  // this run produced still carries the old labels: don't promote it —
+  // exactly like a failed run, rows stay in the DB, queryable, just not
+  // current — and re-run once instead.
+  if (!options.retryForLateIdentity) {
+    const speakerFingerprintNow = await loadSpeakerFingerprint(recordingId);
+    if (speakerFingerprintNow !== speakerFingerprintAtStart) {
+      console.log(
+        `extract: speaker names changed mid-run for recording ${recordingId} (run ${runUuid}) — ` +
+          `this run's labels are stale, re-running once instead of promoting`,
+      );
+      return runExtraction(recordingId, { ...options, retryForLateIdentity: true });
+    }
+  }
 
   // Done at the very end, after collapse and embed, on purpose: this is the
   // only durable statement in the whole function that says "this run

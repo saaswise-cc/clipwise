@@ -388,7 +388,8 @@ export async function runRecoveryPass(opts: {
         detail:
           `inserted=${describeRows(result.identity.inserted)} ` +
           `speaker_names=${describeMapping(result.speakerMapping)} ` +
-          `scope=${describeScope(result.scope)}`,
+          `scope=${describeScope(result.scope)} ` +
+          `extraction=${result.extractionRunUuid ?? "not run"}`,
       });
     }
   }
