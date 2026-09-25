@@ -348,68 +348,93 @@ async function runPass2(
     ? MOMENT_EXTRACTION_SYSTEM
     : `${MOMENT_EXTRACTION_SYSTEM}\n\n${unresolvedIdentityGuard(attendeeNames)}`;
 
-  const resp = await client.messages.create({
-    model: MODEL,
-    max_tokens: 8000,
-    system,
-    tools: [tool as never],
-    tool_choice: { type: "tool", name: "emit_moments" },
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text:
-              "Full transcript for reference (each turn prefixed [#N MM:SS] Speaker):\n\n" +
-              transcriptRendered,
-            cache_control: { type: "ephemeral" },
-          },
-          {
-            type: "text",
-            text:
-              `Extract moments from the following span only.\n\n` +
-              `Span label: ${span.label}\n` +
-              `Segment range: #${span.startSegmentIndex} through #${span.endSegmentIndex}\n` +
-              `Wall-clock range: ${spanStart.toFixed(0)}s to ${spanEnd.toFixed(0)}s\n\n` +
-              `Emit moments via the emit_moments tool. If the span is pure filler, emit an empty array.`,
-          },
-        ],
-      },
-    ],
-  });
-  const use = resp.content.find((b) => b.type === "tool_use");
-  if (!use || use.type !== "tool_use") throw new Error("pass2: no tool_use in response");
-  const out = (use.input as { moments: unknown[] }).moments;
-  return out.map((m) => {
-    const r = m as {
-      kind: string;
-      title: string;
-      summary: string;
-      start_sec: number;
-      end_sec: number;
-      is_personnel_assessment: boolean;
-      speakers: string[];
-    };
-    // Backstop for the metadata field specifically (SAA-165): the prompt
-    // above tells the model to use only the raw track labels here when
-    // identity isn't resolved, but this is a structured field we can
-    // enforce in code rather than trust to compliance — drop anything
-    // that isn't literally "me" or "them" instead of storing a name the
-    // mapping never verified.
-    const speakers = identityResolved
-      ? (r.speakers ?? [])
-      : (r.speakers ?? []).filter((s) => s === "me" || s === "them");
-    return {
-      kind: r.kind,
-      title: r.title,
-      summary: r.summary,
-      startSec: r.start_sec,
-      endSec: r.end_sec,
-      speakers,
-      isPersonnelAssessment: r.is_personnel_assessment === true,
-    };
-  });
+  // SAA-193: the tool_use input's `moments` field has been observed in
+  // production to come back not-an-array — the schema above requests one,
+  // but tool_choice does not enforce it. Retry a bounded number of times
+  // rather than fail on the first bad shape: on 2026-09-23 the identical
+  // span data succeeded on an unrelated re-run 81s later. Never return []
+  // or skip the span — that would silently drop every moment in it.
+  const MAX_ATTEMPTS = 3;
+  let lastShapeProblem: string | null = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const resp = await client.messages.create({
+      model: MODEL,
+      max_tokens: 8000,
+      system,
+      tools: [tool as never],
+      tool_choice: { type: "tool", name: "emit_moments" },
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "Full transcript for reference (each turn prefixed [#N MM:SS] Speaker):\n\n" +
+                transcriptRendered,
+              cache_control: { type: "ephemeral" },
+            },
+            {
+              type: "text",
+              text:
+                `Extract moments from the following span only.\n\n` +
+                `Span label: ${span.label}\n` +
+                `Segment range: #${span.startSegmentIndex} through #${span.endSegmentIndex}\n` +
+                `Wall-clock range: ${spanStart.toFixed(0)}s to ${spanEnd.toFixed(0)}s\n\n` +
+                `Emit moments via the emit_moments tool. If the span is pure filler, emit an empty array.`,
+            },
+          ],
+        },
+      ],
+    });
+    const use = resp.content.find((b) => b.type === "tool_use");
+    if (use && use.type === "tool_use") {
+      const out = (use.input as { moments?: unknown }).moments;
+      if (Array.isArray(out)) {
+        return out.map((m) => {
+          const r = m as {
+            kind: string;
+            title: string;
+            summary: string;
+            start_sec: number;
+            end_sec: number;
+            is_personnel_assessment: boolean;
+            speakers: string[];
+          };
+          // Backstop for the metadata field specifically (SAA-165): the
+          // prompt above tells the model to use only the raw track labels
+          // here when identity isn't resolved, but this is a structured
+          // field we can enforce in code rather than trust to compliance —
+          // drop anything that isn't literally "me" or "them" instead of
+          // storing a name the mapping never verified.
+          const speakers = identityResolved
+            ? (r.speakers ?? [])
+            : (r.speakers ?? []).filter((s) => s === "me" || s === "them");
+          return {
+            kind: r.kind,
+            title: r.title,
+            summary: r.summary,
+            startSec: r.start_sec,
+            endSec: r.end_sec,
+            speakers,
+            isPersonnelAssessment: r.is_personnel_assessment === true,
+          };
+        });
+      }
+      lastShapeProblem = `moments field was ${out === null ? "null" : typeof out}, not an array`;
+      console.warn(
+        `extract: pass2 span "${span.label}" attempt ${attempt}/${MAX_ATTEMPTS} bad input: ${JSON.stringify(use.input).slice(0, 2000)}`,
+      );
+    } else {
+      lastShapeProblem = "no tool_use block in response";
+    }
+    console.warn(
+      `extract: pass2 span "${span.label}" attempt ${attempt}/${MAX_ATTEMPTS} — ${lastShapeProblem}${attempt < MAX_ATTEMPTS ? ", retrying" : ""}`,
+    );
+  }
+  throw new Error(
+    `pass2: span "${span.label}" — model reply had an unusable moments shape after ${MAX_ATTEMPTS} attempts (last: ${lastShapeProblem})`,
+  );
 }
 
 export type ExtractionResult = {

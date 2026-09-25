@@ -22,6 +22,7 @@ import {
   readVoiceNamesAnswer,
   storeVoiceNamesMetadata,
   voiceNamesAlreadyApplied,
+  type VoiceNamesAnswer,
   type VoiceNamingApplication,
 } from "../ingest/voice-names.js";
 import { runExtraction } from "../extract/extract.js";
@@ -31,6 +32,24 @@ function usage(): never {
     "usage: tsx src/pipeline/apply-voice-names.ts <capture_dir> --stem <stem>\n",
   );
   process.exit(2);
+}
+
+// Does this answer, taken on its own, name or clear at least one voice?
+// Read from the answer rather than from applyVoiceNames' applied/skipped
+// result so it gives the same yes/no on a retry after a crash as it did on
+// the attempt that crashed — an entry the DB already carries (from that
+// earlier attempt) reports as "skipped" the second time, not "applied",
+// but the answer's own content hasn't changed. "Not sure" only counts as
+// clearing when answer.rename is set (an active clear of a previous name);
+// an ordinary "not sure" on first naming leaves nothing to extract.
+function answerNamesOrClearsAVoice(answer: VoiceNamesAnswer): boolean {
+  const entries = answer.voices ?? [];
+  if (entries.length === 0) return false;
+  const isRename = answer.rename === true;
+  return entries.some((e) => {
+    const name = typeof e.name === "string" ? e.name.trim() : "";
+    return name.length > 0 || isRename;
+  });
 }
 
 function readManifestRecordingId(dir: string, stem: string): string {
@@ -89,24 +108,42 @@ export async function applyVoiceNamesForCapture(
   }
 
   const naming = await applyVoiceNames(db, recordingId, answer);
-  await storeVoiceNamesMetadata(db, recordingId, answer);
 
   // Re-run moment generation so the names reach a real set of moments
   // (Stage 0: re-extraction adds a fresh, currently-visible batch rather
   // than deleting anything — the same machinery the pipeline itself uses,
   // applyCollapse defaulted true as it always is).
+  //
+  // Gated on the answer's own content (does it name or clear at least one
+  // voice), not on naming.applied.length: a retry after runExtraction
+  // throws below re-runs applyVoiceNames against speakers that already
+  // carry the new name from the crashed attempt, so those entries land in
+  // `skipped` rather than `applied` even though extraction still needs to
+  // (re)run for them. Reading the answer directly instead of the result
+  // of applying it covers that retry, and the "rename to Not sure" clear
+  // the same way, with no special-casing.
   let extractionRunUuid: string | null = null;
-  if (naming.applied.length > 0) {
+  if (answerNamesOrClearsAVoice(answer)) {
     if (!process.env.ANTHROPIC_API_KEY) {
       console.log(
         "apply-voice-names: names applied, but ANTHROPIC_API_KEY is not set — moments not re-extracted",
       );
+      await storeVoiceNamesMetadata(db, recordingId, answer);
     } else {
       const extraction = await runExtraction(recordingId);
       extractionRunUuid = extraction.runUuid;
+      // Recorded as applied only now that extraction has actually
+      // succeeded — not right after writing the speakers rows. If
+      // runExtraction throws above, this line is never reached, so
+      // voiceNamesAlreadyApplied stays false and the next sweep
+      // (recover.ts, unconditional on every pass) retries the whole
+      // thing, extraction included (SAA-193's crash left exactly this
+      // gap: names renamed, moments stale, never retried).
+      await storeVoiceNamesMetadata(db, recordingId, answer);
     }
   } else {
     console.log("apply-voice-names: nothing newly named — moments not re-extracted");
+    await storeVoiceNamesMetadata(db, recordingId, answer);
   }
 
   return { status: "applied", recordingId, naming, extractionRunUuid };
