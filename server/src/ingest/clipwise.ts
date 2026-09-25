@@ -27,10 +27,14 @@
 // per-segment texts and is derivable from the segments rows; the /transcript
 // endpoint sends it when the caller has it, but not sending it is valid.
 //
-// end_sec is written from Whisper's offsets.to verbatim. It is
-// indistinguishable from the next segment's start on 141/141 tap pairs
-// and 87/88 mic pairs from the 08-07 rehearsal — same defect SAA-79
-// records on the Fathom side. Do not synthesize, do not null.
+// end_sec is s.end_ms / 1000, and end_ms is no longer Whisper's offsets.to
+// verbatim: recorder/transcribe.py's measure_segment_ends (SAA-147, SAA-149)
+// replaces it with the point speech actually stops, found by scanning the
+// audio from the segment's start rather than trusting offsets.to, which is
+// often just the next segment's start relative to a large VAD-gated search
+// window. The original whisper value survives alongside it as
+// end_ms_reported for audit, but is not what reaches this column. Do not
+// synthesize, do not null.
 
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
