@@ -20,7 +20,7 @@ const {
     IDENTITY_WINDOW, contentHeightFor, knownGuestNames, mergeGuestNames,
     buildAnswerDoc, writeAnswer,
     buildVoiceNamesDoc, writeVoiceNamesAnswer, readNamingData, pendingVoiceNamingStems,
-    readVoiceNamesAnswer, mostRecentNamedStem,
+    readVoiceNamesAnswer, mostRecentNamedStem, mostRecentCaptureStem,
 } = require('./identity-answer.js');
 const { stopMessageFor } = require('./voice-naming-wait.js');
 const { loadAppScope, scopeForKey } = require('./app-scope.js');
@@ -817,6 +817,18 @@ function stemRelativeTime(stem) {
     return `${d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} ${time}`;
 }
 
+// "<Mon> <day>" for a stem, e.g. "Sep 14" — the "Fix speaker names…" tray
+// item names the call by date only (SAA-195), not time: it identifies which
+// call is being corrected, and a call has at most one named-voices answer,
+// so the date alone is unambiguous.
+function stemDateLabel(stem) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/.exec(stem || '');
+    if (!m) return stem || '';
+    const d = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
+    if (Number.isNaN(d.getTime())) return stem;
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
 // Reopens step 2 directly for a capture whose naming was left for later
 // (SAA-195, tray click). Outside identityQueue entirely — that queue is for
 // captures whose pipeline just finished, and this one's already has; the
@@ -935,6 +947,22 @@ function reopenVoiceNaming(stem, opts = {}) {
     });
 }
 
+// Opens the THIRD_PARTY_NOTICES file bundled inside the packaged app
+// (Contents/Resources/THIRD_PARTY_NOTICES, copied there by build-app.sh —
+// see that script's THIRD_PARTY_NOTICES line), not the repo's copy: the
+// running app should point at the file it actually shipped with, which for
+// an unbuilt/unpackaged run is process.resourcesPath itself. A menu bar
+// item must never be a dead end (SAA-195's rule, applied here too) — a
+// missing file notifies rather than doing nothing.
+function openAcknowledgements() {
+    const noticesPath = path.join(process.resourcesPath, 'THIRD_PARTY_NOTICES');
+    shell.openPath(noticesPath).then((err) => {
+        if (err) {
+            notify('Clipwise: could not open acknowledgements', `${noticesPath}: ${err}`);
+        }
+    });
+}
+
 function renderTray() {
     const label = LABEL[state];
     const pipelineNote = pipeline && PIPELINE_NOTE[pipeline.state]
@@ -1017,22 +1045,29 @@ function renderTray() {
             });
         }
     }
-    // "Rename voices…" (SAA-195): the most recent named call only, never a
-    // list of past ones. Independent of the pending block above — a call
+    // "Fix speaker names…" (SAA-195): the most recent named call only, never
+    // a list of past ones. Independent of the pending block above — a call
     // can only appear in one or the other, never both, since
     // mostRecentNamedStem requires a saved voice-names answer and
     // pendingVoiceNamingStems excludes any stem that has one.
+    //
+    // Shown only while that named call is also the most recent recording —
+    // hidden once any newer capture exists. The item corrects one specific
+    // recording's speaker names and re-extracts its moments; once a newer
+    // call has been captured, "Fix speaker names…" with no call named in
+    // the item itself would be ambiguous about which recording it acts on.
     const renameStem = mostRecentNamedStem(OUTDIR);
-    if (renameStem) {
+    if (renameStem && renameStem === mostRecentCaptureStem(OUTDIR)) {
         items.push({ type: 'separator' });
         items.push({
-            label: `Rename voices… — ${stemRelativeTime(renameStem)}`,
+            label: `Fix speaker names — ${stemDateLabel(renameStem)} call`,
             click: () => reopenVoiceNaming(renameStem, { rename: true }),
         });
     }
     items.push(
         { type: 'separator' },
         { label: 'About Clipwise', click: () => app.showAboutPanel() },
+        { label: 'Acknowledgements…', click: openAcknowledgements },
         { label: 'Quit', click: quitApp },
     );
     tray.setContextMenu(Menu.buildFromTemplate(items));
@@ -2550,18 +2585,15 @@ function sweepStrayChildren() {
 
 // --- app boot -------------------------------------------------------------
 
-// Credits the CC-BY-4.0 speaker-separation models require (SAA-194 §7) —
-// see THIRD_PARTY_NOTICES for the full text this is drawn from. Set once,
-// read whenever the tray's "About Clipwise" item opens the standard macOS
-// About window.
+// The standard macOS About window, opened by the tray's "About Clipwise"
+// item. Third-party model credits (SAA-194 §7) moved out of here and into
+// their own "Acknowledgements…" item below, which opens the bundled
+// THIRD_PARTY_NOTICES file directly — full attribution text belongs in that
+// file, not crammed into the About panel's one-line description.
 app.setAboutPanelOptions({
     applicationName: 'Clipwise',
-    credits:
-        'Speaker separation uses models derived from pyannote\'s speaker-diarization-community-1 ' +
-        'pipeline (CC BY 4.0), with embedding components from WeSpeaker and PLDA parameters from ' +
-        'Brno University of Technology / BUT Speech@FIT (CC BY 4.0), converted to Core ML by Fluid ' +
-        'Inference (github.com/FluidInference/FluidAudio, Apache 2.0). See THIRD_PARTY_NOTICES for ' +
-        'full attribution and license text.',
+    applicationVersion: app.getVersion(),
+    credits: 'Meeting recordings captured on your Mac, intelligence surfaced through Claude.',
 });
 
 app.whenReady().then(() => {

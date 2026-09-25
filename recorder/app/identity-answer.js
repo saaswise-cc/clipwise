@@ -269,6 +269,28 @@ function mostRecentNamedStem(dir) {
     return stems[stems.length - 1];
 }
 
+// The newest capture on disk, named or not — every capture writes a
+// manifest, so this is "the most recent recording" independent of voice
+// naming state. Used to decide whether the "Rename voices…" item's
+// recording is still the latest one (SAA-195): stems sort lexicographically
+// in chronological order, same convention as mostRecentNamedStem above.
+function mostRecentCaptureStem(dir) {
+    let files;
+    try {
+        files = fs.readdirSync(dir);
+    } catch {
+        return null;
+    }
+    const stems = [];
+    for (const file of files) {
+        const m = /^manifest-(.+)\.json$/.exec(file);
+        if (m) stems.push(m[1]);
+    }
+    if (stems.length === 0) return null;
+    stems.sort();
+    return stems[stems.length - 1];
+}
+
 module.exports = {
     IDENTITY_VERSION,
     IDENTITY_WINDOW,
@@ -285,4 +307,5 @@ module.exports = {
     pendingVoiceNamingStems,
     readVoiceNamesAnswer,
     mostRecentNamedStem,
+    mostRecentCaptureStem,
 };
