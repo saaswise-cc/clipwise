@@ -11,11 +11,11 @@
      never splits a call diarize already knows has one confirmed guest, so no
      naming data would ever arrive to wait for.
 
-     Dismissing this window is a real answer with a real consequence, same as
-     before. In step 1, a close is treated exactly as Skip: the recording
-     stays unidentified. In step 2, a close (or the Later button) leaves the
-     voices unnamed for now — a menu bar item offers to come back
-     (SAA-195, SAA-197). Neither ever reopens itself automatically.
+     Skip is a real answer with a real consequence: the recording stays
+     unidentified for good. Closing the window itself is different — in
+     either step it is Later, not Skip: the capture stays unanswered and a
+     menu bar item offers to come back (SAA-195, SAA-197). Neither ever
+     reopens itself automatically.
 
      Loaded from file:// with nodeIntegration on, same reasoning as before:
      ships inside the bundle, loads no remote content. Step 2 additionally
@@ -224,6 +224,28 @@
   } else {
     document.getElementById('known-field').style.display = 'none';
   }
+
+  // Mirrors main.js's own names.length === 1 branch (identity:submit) so
+  // the button never promises a step 2 that won't happen, or vice versa
+  // (SAA-197). Dedup only needs to match mergeGuestNames' case-insensitive
+  // rule closely enough to get the count right, not reproduce it exactly.
+  function updateStep1ButtonLabel() {
+    if (document.getElementById('step2').style.display !== 'none') return;
+    const selected = Array.from(knownEl.querySelectorAll('input:checked')).map((c) => c.value);
+    const typed = document.getElementById('names').value.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+    const seen = new Set();
+    let count = 0;
+    for (const name of [...selected, ...typed]) {
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      count++;
+    }
+    document.getElementById('save').textContent = count === 1 ? 'Save' : 'Next';
+  }
+  knownEl.addEventListener('change', updateStep1ButtonLabel);
+  document.getElementById('names').addEventListener('input', updateStep1ButtonLabel);
+  updateStep1ButtonLabel();
 
   const scopeEl = document.getElementById('scope');
   const inferredScope = params.get('inferredScope');

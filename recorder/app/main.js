@@ -19,6 +19,8 @@ const path = require('path');
 const {
     IDENTITY_WINDOW, contentHeightFor, knownGuestNames, mergeGuestNames,
     buildAnswerDoc, writeAnswer,
+    writeLaterMarker, readLaterMarker, deleteLaterMarker,
+    pendingIdentityStems, recentPendingIdentityStems,
     buildVoiceNamesDoc, writeVoiceNamesAnswer, readNamingData, pendingVoiceNamingStems,
     readVoiceNamesAnswer, mostRecentNamedStem, mostRecentCaptureStem,
 } = require('./identity-answer.js');
@@ -146,29 +148,45 @@ const SERVER_DIR = BUILD_INFO
 
 // --- log ------------------------------------------------------------------
 //
-// Everything this process reports about itself goes to stderr, and a
-// double-clicked app has no stderr — launchd sends it nowhere a person can
+// Everything this process reports about itself goes to stdout/stderr, and a
+// double-clicked app has neither — launchd sends them nowhere a person can
 // read. That is the whole diagnostic surface of the recorder disappearing at
 // exactly the point it stops being launched from a terminal, which is what
 // packaging is for. Every notification-delivery line, every child spawn
-// failure and every pipeline error is in there.
+// failure and every pipeline error is in there — console.log too (SAA-197):
+// a live run needs everything it printed to be diagnosable afterwards, not
+// only the error-level half. (This replaced an error-only, single-ever-
+// growing-file version of the same idea.)
+//
+// In the recordings folder, not SUPPORT_DIR's root: it sits beside the
+// captures and sidecars it explains. One file per day (recorder-
+// YYYY-MM-DD.log, local date, append) rather than one file that grows
+// forever, so a single day's run is readable without external log rotation.
 //
 // Only when packaged. A terminal run already shows this, and writing a file
 // nobody asked for would be a change to how development works.
-const LOG_PATH = path.join(SUPPORT_DIR, 'recorder.log');
+function recorderLogPathFor(d = new Date()) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return path.join(OUTDIR, `recorder-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.log`);
+}
 if (BUILD_INFO) {
+    const toStdout = console.log.bind(console);
     const toStderr = console.error.bind(console);
-    console.error = (...args) => {
-        toStderr(...args);
+    const appendToLogFile = (line) => {
         try {
-            fs.mkdirSync(SUPPORT_DIR, { recursive: true });
-            fs.appendFileSync(
-                LOG_PATH,
-                `${new Date().toISOString()} ${args.map(a => String(a)).join(' ')}\n`,
-            );
+            fs.mkdirSync(OUTDIR, { recursive: true });
+            fs.appendFileSync(recorderLogPathFor(), `${new Date().toISOString()} ${line}\n`);
         } catch {
             // A log that cannot be written is not worth losing a capture over.
         }
+    };
+    console.log = (...args) => {
+        toStdout(...args);
+        appendToLogFile(args.map(a => String(a)).join(' '));
+    };
+    console.error = (...args) => {
+        toStderr(...args);
+        appendToLogFile(args.map(a => String(a)).join(' '));
     };
     console.error(
         `[clipwise-recorder] launched from bundle — built ${BUILD_INFO.built_at} ` +
@@ -844,6 +862,95 @@ function stemDateLabel(stem) {
 // every failure path below now either proceeds with a safe fallback (no
 // identity-<stem>.json — an empty guest list, so only "Someone else…" and
 // "Not sure" are offered) or shows a notification. None fail silently.
+// Reopens step 1 directly for a capture whose identity prompt was deferred
+// by closing the window (SAA-197's "Who was on the <date> call…" tray item).
+// Built as its own prompt from the later-marker's saved fields, exactly the
+// window promptForIdentity would have shown at stop — not a special reduced
+// path, since self/known-names/etc. are read fresh from disk the same way.
+// Answering it goes through the ordinary identity:submit handler unchanged,
+// which is what gives this its step 1 -> step 2 continuity for free: if
+// voices-<stem>.json already exists by the time this is answered, the
+// existing beginNamingDataWait poll picks it up on its very first tick and
+// shows step 2 in the same window, same as it would have at stop.
+//
+// A menu bar item must never be a dead end (SAA-195's rule, applied here
+// too): a missing or unreadable marker notifies rather than doing nothing.
+function reopenIdentityPrompt(stem) {
+    if (identityWindow) {
+        try { identityWindow.win.show(); app.focus({ steal: true }); } catch {}
+        return;
+    }
+    const marker = readLaterMarker(OUTDIR, stem);
+    if (!marker) {
+        console.error(`identity: no later-marker for ${stem} — nothing to reopen`);
+        notify('Clipwise: could not reopen prompt',
+            `Who was on ${stem} could not be reopened — the deferred answer is missing.`);
+        return;
+    }
+    const capture = { ...marker, stem, token: randomUUID() };
+
+    let win;
+    try {
+        win = new BrowserWindow({
+            useContentSize: true,
+            width: IDENTITY_WINDOW.width,
+            height: IDENTITY_WINDOW.maxHeight,
+            show: false,
+            resizable: false,
+            minimizable: false,
+            maximizable: false,
+            fullscreenable: false,
+            alwaysOnTop: true,
+            title: 'Who was on this call?',
+            webPreferences: { nodeIntegration: true, contextIsolation: false },
+        });
+    } catch (err) {
+        console.error(`identity: could not reopen the prompt: ${String(err)}`);
+        notify('Clipwise: could not reopen prompt', `Who was on ${stem} could not be reopened.`);
+        return;
+    }
+    identityWindow = { win, capture, shown: false, step: 1, resolved: false, fromQueue: false, pollTimer: null };
+    const reveal = () => {
+        if (!identityWindow || identityWindow.win !== win || identityWindow.shown) return;
+        identityWindow.shown = true;
+        win.show();
+        try { app.focus({ steal: true }); } catch {}
+    };
+    identityWindow.reveal = reveal;
+    win.once('ready-to-show', () => setTimeout(reveal, IDENTITY_REVEAL_GRACE_MS));
+    win.once('closed', () => {
+        // Same treatment as the original prompt's own close handler — still
+        // Later, not Skip, and re-deferrable indefinitely: the marker this
+        // reopen read is simply rewritten (deferIdentityPrompt is a plain
+        // overwrite), not consumed. Unlike that handler this window was
+        // never on identityQueue, but a genuinely queued capture that has
+        // been waiting behind this one should still get its turn now.
+        if (identityWindow && identityWindow.win === win && !identityWindow.resolved) {
+            console.error(`[clipwise-recorder] identity ${stem}: closed during step 1 — treated as Later`);
+            deferIdentityPrompt(identityWindow.capture);
+            resolveIdentityWindow();
+        }
+        identityWindow = null;
+        pumpIdentityQueue();
+    });
+    win.loadFile(IDENTITY_HTML, {
+        query: {
+            token: capture.token,
+            stem,
+            self: readSelfName() || '',
+            knownNames: JSON.stringify(knownGuestNames(OUTDIR)),
+            inferredScope: capture.inferredScope === 'work' || capture.inferredScope === 'personal'
+                ? capture.inferredScope : '',
+            duration: Number.isFinite(capture.durationMs) ? String(capture.durationMs) : '',
+        },
+    }).catch((err) => {
+        console.error(`identity: prompt failed to reopen: ${String(err)}`);
+        notify('Clipwise: could not reopen prompt', `Who was on ${stem} could not be reopened.`);
+        identityWindow = null;
+        try { win.close(); } catch {}
+    });
+}
+
 function reopenVoiceNaming(stem, opts = {}) {
     if (identityWindow) {
         // Only one identity window is ever shown at a time today. Bringing
@@ -1028,12 +1135,38 @@ function renderTray() {
             { label: 'Dismiss failure', click: dismissPipelineFailure },
         );
     }
+    // Identity step left for later (SAA-197) by closing the window — one
+    // item per capture, same file-on-disk derivation as the voice-naming
+    // block below. Capped to the 3 most recent calls from the last 7 days
+    // (recentPendingIdentityStems): a call prompted for weeks ago and never
+    // answered is not a "who was on this call" question worth asking today.
+    // Older markers are untouched on disk — recovery can still apply a late
+    // identity-<stem>.json answer whenever one arrives; this only bounds
+    // what the tray lists.
+    const pendingIdentitySet = new Set(pendingIdentityStems(OUTDIR));
+    const recentPendingIdentity = recentPendingIdentityStems(OUTDIR);
+    if (recentPendingIdentity.length > 0) {
+        items.push({ type: 'separator' });
+        for (const stem of recentPendingIdentity) {
+            items.push({
+                label: `Who was on the ${stemDateLabel(stem)} call…`,
+                click: () => reopenIdentityPrompt(stem),
+            });
+        }
+    }
     // Naming step left for later (SAA-195), one item per capture — derived
     // from files on disk (pendingVoiceNamingStems), the same way the failed-
     // pipeline block above is derived from `pipeline` rather than a
     // separate store, and for the same reason: this has to survive a quit
     // and relaunch, not just live in memory.
-    const pendingVoiceNaming = pendingVoiceNamingStems(OUTDIR);
+    //
+    // Excludes any stem still pending on identity (the block above): naming
+    // voices before knowing who was on the call isn't useful, and the two
+    // items together would be confusing about which to answer first (SAA-197
+    // decision). It becomes visible again once identity is answered or
+    // explicitly skipped — both clear the identity pending marker.
+    const pendingVoiceNaming = pendingVoiceNamingStems(OUTDIR)
+        .filter((stem) => !pendingIdentitySet.has(stem));
     if (pendingVoiceNaming.length > 0) {
         items.push({ type: 'separator' });
         for (const stem of pendingVoiceNaming) {
@@ -1938,6 +2071,23 @@ function promptForIdentity(capture) {
     pumpIdentityQueue();
 }
 
+// Records that step 1 was closed without an answer (SAA-197). `capture`
+// carries exactly the fields promptForIdentity itself needs to reopen the
+// same prompt later — everything else (self, known names) is read fresh
+// from disk when it does. Failure just means the tray item won't appear;
+// the capture is unaffected either way, so this only logs.
+function deferIdentityPrompt(capture) {
+    try {
+        writeLaterMarker(OUTDIR, capture);
+        // Without this the tray item only appears at the next unrelated
+        // refresh (SAA-197 fix, 2026-09-25) — observed live: it didn't show
+        // until the pipeline's extract step happened to trigger one.
+        renderTray();
+    } catch (err) {
+        console.error(`identity: could not defer ${capture.stem}: ${String(err)}`);
+    }
+}
+
 // Ends this window's turn for good: stops its naming-data poll if one is
 // running, and — only when it came off identityQueue — advances past it, so
 // the queue can offer the next different capture. A window reopened from
@@ -2063,10 +2213,12 @@ function pumpIdentityQueue() {
     win.once('closed', () => {
         // SAA-197: closing via the window's own controls used to reopen the
         // same capture immediately — this queue never advanced, because
-        // only Save/Skip/Later did that. Treated now exactly as Skip (step
-        // 1) or Later (step 2) whenever the window closes without having
-        // been resolved by one of those already, so a native close is a
-        // real answer, same as before, and never a silent reopen.
+        // only Save/Skip/Later did that. Treated now as Later, both at step
+        // 1 (a marker written so a tray item can offer it again — see
+        // deferIdentityPrompt) and step 2 (unchanged: driven entirely by
+        // voices-<stem>.json existing without voice-names-<stem>.json,
+        // nothing to write) — a native close is a real, resumable answer,
+        // never a silent reopen and never Skip's permanence.
         if (identityWindow && identityWindow.win === win && !identityWindow.resolved) {
             const capture = identityWindow.capture;
             if (identityWindow.step === 2) {
@@ -2074,7 +2226,8 @@ function pumpIdentityQueue() {
                     `[clipwise-recorder] identity ${capture.stem}: closed during step 2 — treated as Later`);
             } else {
                 console.error(
-                    `[clipwise-recorder] identity ${capture.stem}: closed — treated as Skip, recording is unidentified`);
+                    `[clipwise-recorder] identity ${capture.stem}: closed during step 1 — treated as Later`);
+                deferIdentityPrompt(capture);
             }
             resolveIdentityWindow();
         }
@@ -2174,6 +2327,11 @@ function registerIdentityIpc() {
             return;
         }
         startApplyIdentity(capture.stem);
+        // Answered now, deferred or not (SAA-197) — a marker left from an
+        // earlier close no longer describes this capture's state. No-op
+        // when there was never one.
+        deleteLaterMarker(OUTDIR, capture.stem);
+        renderTray();
 
         if (names.length === 1) {
             // One-guest rule (SAA-194 §5, SAA-195): diarize never splits a
@@ -2227,6 +2385,12 @@ function registerIdentityIpc() {
         const capture = currentCapture(payload && payload.token);
         if (!capture) return;
         console.error(`[clipwise-recorder] identity ${capture.stem}: skipped — recording is unidentified`);
+        // Skip's own meaning is unchanged (SAA-197) — nothing is written
+        // here, same as before. This only clears a marker a previous close
+        // may have left, so a reopened-then-skipped capture stops showing
+        // as pending rather than lingering in the tray forever.
+        deleteLaterMarker(OUTDIR, capture.stem);
+        renderTray();
         finishIdentityWindow();
     });
 

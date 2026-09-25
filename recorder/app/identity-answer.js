@@ -165,6 +165,102 @@ function writeAnswer(dir, doc) {
     return finalPath;
 }
 
+// --- step 1 deferred: "Later" (SAA-197) -------------------------------------
+//
+// Closing the prompt's window without Save or Skip is Later, not Skip — the
+// capture stays unanswered, but unlike Skip it comes back as a tray item
+// rather than being dropped for good. Skip itself writes nothing (unchanged,
+// SAA-197 is explicit that it keeps its current meaning), so a marker is the
+// only way to tell "closed without answering" apart from "skipped" once both
+// have left identity-<stem>.json unwritten — same reasoning as voices-<stem>
+// vs voice-names-<stem> one step over. Written from exactly the fields
+// promptForIdentity needs to reopen the same prompt (stem, recordingId,
+// inferredScope, durationMs) — everything else (self, known names) is read
+// fresh from disk when it reopens, the same as the first time.
+function laterMarkerPathFor(dir, stem) {
+    return path.join(dir, `identity-later-${stem}.json`);
+}
+
+function writeLaterMarker(dir, capture) {
+    const finalPath = laterMarkerPathFor(dir, capture.stem);
+    const tmpPath = `${finalPath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(capture, null, 2) + '\n');
+    fs.renameSync(tmpPath, finalPath);
+    return finalPath;
+}
+
+function readLaterMarker(dir, stem) {
+    try {
+        return JSON.parse(fs.readFileSync(laterMarkerPathFor(dir, stem), 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+// Called once identity-<stem>.json exists (Save) or the window resolves as a
+// genuine Skip — either way this capture is no longer pending, whether or
+// not it was ever deferred. A no-op when there is nothing to remove.
+function deleteLaterMarker(dir, stem) {
+    try {
+        fs.unlinkSync(laterMarkerPathFor(dir, stem));
+    } catch {
+        // Nothing to remove — the common case, since most captures are never
+        // deferred at all.
+    }
+}
+
+// A capture is waiting on step 1 when it was deferred (a marker exists) and
+// nobody has answered since (no identity-<stem>.json) — same shape as
+// pendingVoiceNamingStems just above one step earlier. Ascending, oldest
+// first, same convention.
+function pendingIdentityStems(dir) {
+    let files;
+    try {
+        files = fs.readdirSync(dir);
+    } catch {
+        return [];
+    }
+    const stems = [];
+    for (const file of files) {
+        const m = /^identity-later-(.+)\.json$/.exec(file);
+        if (!m) continue;
+        const stem = m[1];
+        if (files.includes(`identity-${stem}.json`)) continue; // already answered
+        stems.push(stem);
+    }
+    stems.sort();
+    return stems;
+}
+
+const IDENTITY_STEM_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/;
+
+function stemTimestampMs(stem) {
+    const m = IDENTITY_STEM_PATTERN.exec(stem || '');
+    if (!m) return null;
+    const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
+    return Number.isNaN(t) ? null : t;
+}
+
+// The tray's actual display list: pendingIdentityStems, narrowed to the
+// DEFAULT_MAX_ITEMS most recent calls from the last DEFAULT_WINDOW_MS —
+// a capture prompted for weeks ago and never answered is not a "who was on
+// this call" question worth asking today. Older markers are left on disk
+// untouched (nothing here deletes one) — recovery can still pick up a late
+// identity-<stem>.json answer whenever it arrives; this only controls what
+// the tray lists. `now` is a parameter, not Date.now() inline, so this is
+// exercisable without mocking the clock.
+function recentPendingIdentityStems(dir, opts = {}) {
+    const now = opts.now ?? Date.now();
+    const maxItems = opts.maxItems ?? 3;
+    const windowMs = opts.windowMs ?? 7 * 24 * 60 * 60 * 1000;
+    const cutoff = now - windowMs;
+    const recent = pendingIdentityStems(dir).filter((stem) => {
+        const t = stemTimestampMs(stem);
+        return t !== null && t >= cutoff;
+    });
+    return recent.slice(-maxItems);
+}
+
 // --- step 2: naming the voices (SAA-195) -----------------------------------
 
 const VOICE_NAMES_VERSION = 1;
@@ -300,6 +396,11 @@ module.exports = {
     mergeGuestNames,
     buildAnswerDoc,
     writeAnswer,
+    writeLaterMarker,
+    readLaterMarker,
+    deleteLaterMarker,
+    pendingIdentityStems,
+    recentPendingIdentityStems,
     VOICE_NAMES_VERSION,
     buildVoiceNamesDoc,
     writeVoiceNamesAnswer,
