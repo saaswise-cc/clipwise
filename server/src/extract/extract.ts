@@ -846,15 +846,15 @@ export async function runExtraction(
 
   // SAA-197: a speaker's name can change while this run's pass 1/pass 2
   // was already in flight — a 1:1's identity resolving, or a group call's
-  // "Rename voices..." (live, 2026-09-25: naming voices while a Weekly
-  // Initiative Sync's extract was still running started a second run, and
-  // whichever promoted last won). loadSegments rendered speaker labels
-  // once, at the top of this function, from whatever the fingerprint was
-  // *then* — that rendering can't be patched after the fact. If the
-  // fingerprint now differs from the one taken at the start, every moment
-  // this run produced still carries the old labels: don't promote it —
-  // exactly like a failed run, rows stay in the DB, queryable, just not
-  // current — and re-run once instead.
+  // "Rename voices...". Unguarded, that produces two concurrent runs for
+  // the same recording, one built on stale labels, and whichever promotes
+  // last wins regardless of which one is correct. loadSegments rendered
+  // speaker labels once, at the top of this function, from whatever the
+  // fingerprint was *then* — that rendering can't be patched after the
+  // fact. If the fingerprint now differs from the one taken at the start,
+  // every moment this run produced still carries the old labels: don't
+  // promote it — exactly like a failed run, rows stay in the DB,
+  // queryable, just not current — and re-run once instead.
   if (!options.retryForLateIdentity) {
     const speakerFingerprintNow = await loadSpeakerFingerprint(recordingId);
     if (speakerFingerprintNow !== speakerFingerprintAtStart) {
