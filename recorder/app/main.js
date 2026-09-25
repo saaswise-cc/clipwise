@@ -19,6 +19,7 @@ const path = require('path');
 const {
     IDENTITY_WINDOW, contentHeightFor, knownGuestNames, mergeGuestNames,
     buildAnswerDoc, writeAnswer,
+    buildVoiceNamesDoc, writeVoiceNamesAnswer, readNamingData, pendingVoiceNamingStems,
 } = require('./identity-answer.js');
 const { loadAppScope, scopeForKey } = require('./app-scope.js');
 
@@ -180,6 +181,17 @@ const RECOVER_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'recover.ts');
 // Applies an identity answer to a capture that has already been ingested. The
 // ordinary case never needs it — see startApplyIdentity.
 const APPLY_IDENTITY_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'apply-identity.ts');
+// Applies a voice-naming answer (SAA-195), same reasoning one step later —
+// see startApplyVoiceNames.
+const APPLY_VOICE_NAMES_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'apply-voice-names.ts');
+// How often the naming window polls for diarize's naming data while step 2
+// is in its waiting state (SAA-195). Diarize itself is fast (single-digit
+// seconds), but it runs after transcribe and ingest, which together have
+// taken 37-82s on the two captures this was measured against — so what
+// this window actually waits through is the whole preceding pipeline, not
+// just diarize. 3s keeps the wait itself cheap without polling pointlessly
+// often.
+const VOICE_NAMING_POLL_MS = 3000;
 
 // The identity prompt's page, and the file that remembers what the person
 // answering is called. The name is asked for once and reused; it is never
@@ -775,6 +787,110 @@ function detectedAppsMenu() {
     };
 }
 
+// Compact relative time for a stem, for the tray item's label — same
+// escalating precision as identity.html's own formatCaptureStem, kept
+// separate rather than shared: that one runs in the renderer and measures
+// duration too, this one is main-process-only and just needs "when."
+function stemRelativeTime(stem) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/.exec(stem || '');
+    if (!m) return stem || '';
+    const d = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
+    if (Number.isNaN(d.getTime())) return stem;
+    const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    const now = new Date();
+    const midnight = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+    const daysAgo = Math.round((midnight(now) - midnight(d)) / 86400000);
+    if (daysAgo <= 0) return time;
+    if (daysAgo === 1) return `Yesterday ${time}`;
+    if (daysAgo <= 6) return `${d.toLocaleDateString(undefined, { weekday: 'short' })} ${time}`;
+    return `${d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} ${time}`;
+}
+
+// Reopens step 2 directly for a capture whose naming was left for later
+// (SAA-195, tray click). Outside identityQueue entirely — that queue is for
+// captures whose pipeline just finished, and this one's already has; the
+// data it needs (the guest roster from step 1, the naming data from
+// diarize) is already sitting on disk, so there is no waiting state to
+// show.
+function reopenVoiceNaming(stem) {
+    if (identityWindow) {
+        // Only one identity window is ever shown at a time today. Bringing
+        // the existing one forward is a plainer answer than queueing a
+        // second concurrent window would be.
+        try { identityWindow.win.show(); app.focus({ steal: true }); } catch {}
+        return;
+    }
+    let recordingId = null;
+    let guestNames = [];
+    try {
+        const doc = JSON.parse(fs.readFileSync(path.join(OUTDIR, `identity-${stem}.json`), 'utf8'));
+        recordingId = doc.recording_id || null;
+        guestNames = (doc.guests || []).map((g) => g.name).filter(Boolean);
+    } catch (err) {
+        console.error(`voice-names: could not read identity-${stem}.json to reopen naming: ${String(err)}`);
+        return;
+    }
+    const namingData = readNamingData(OUTDIR, stem);
+    if (!namingData) {
+        console.error(`voice-names: no naming data for ${stem} — nothing to reopen`);
+        return;
+    }
+
+    let win;
+    try {
+        win = new BrowserWindow({
+            useContentSize: true,
+            width: IDENTITY_WINDOW.width,
+            height: IDENTITY_WINDOW.maxHeight,
+            show: false,
+            resizable: false,
+            minimizable: false,
+            maximizable: false,
+            fullscreenable: false,
+            alwaysOnTop: true,
+            title: "Who's speaking?",
+            webPreferences: { nodeIntegration: true, contextIsolation: false },
+        });
+    } catch (err) {
+        console.error(`voice-names: could not reopen the naming window: ${String(err)}`);
+        return;
+    }
+    identityWindow = {
+        win, capture: { stem, token: randomUUID(), recordingId },
+        step: 2, resolved: false, fromQueue: false, pollTimer: null, shown: false,
+    };
+    const reveal = () => {
+        if (!identityWindow || identityWindow.win !== win || identityWindow.shown) return;
+        identityWindow.shown = true;
+        win.show();
+        try { app.focus({ steal: true }); } catch {}
+    };
+    identityWindow.reveal = reveal;
+    win.once('ready-to-show', () => setTimeout(reveal, IDENTITY_REVEAL_GRACE_MS));
+    win.once('closed', () => {
+        // SAA-197 applies here too: a native close is Later, never a
+        // silent reopen. No pumpIdentityQueue() call — this window was
+        // never on that queue.
+        if (identityWindow && identityWindow.win === win && !identityWindow.resolved) {
+            console.error(`[clipwise-recorder] identity ${stem}: closed during step 2 — treated as Later`);
+            resolveIdentityWindow();
+        }
+        identityWindow = null;
+    });
+    win.loadFile(IDENTITY_HTML, {
+        query: {
+            token: identityWindow.capture.token,
+            stem,
+            startStep: '2',
+            startNames: JSON.stringify(guestNames),
+            namingData: JSON.stringify(namingData),
+        },
+    }).catch((err) => {
+        console.error(`voice-names: naming window failed to load: ${String(err)}`);
+        try { win.close(); } catch {}
+    });
+}
+
 function renderTray() {
     const label = LABEL[state];
     const pipelineNote = pipeline && PIPELINE_NOTE[pipeline.state]
@@ -839,6 +955,23 @@ function renderTray() {
             { label: `Retry processing (${pipeline.stem})`, click: retryPipeline },
             { label: 'Dismiss failure', click: dismissPipelineFailure },
         );
+    }
+    // Naming step left for later (SAA-195), one item per capture — derived
+    // from files on disk (pendingVoiceNamingStems), the same way the failed-
+    // pipeline block above is derived from `pipeline` rather than a
+    // separate store, and for the same reason: this has to survive a quit
+    // and relaunch, not just live in memory.
+    const pendingVoiceNaming = pendingVoiceNamingStems(OUTDIR);
+    if (pendingVoiceNaming.length > 0) {
+        items.push({ type: 'separator' });
+        for (const stem of pendingVoiceNaming) {
+            const data = readNamingData(OUTDIR, stem);
+            const count = data && Array.isArray(data.voices) ? data.voices.length : 0;
+            items.push({
+                label: `Name ${count} voice${count === 1 ? '' : 's'}… — ${stemRelativeTime(stem)}`,
+                click: () => reopenVoiceNaming(stem),
+            });
+        }
     }
     items.push(
         { type: 'separator' },
@@ -1648,6 +1781,42 @@ function startApplyIdentity(stem) {
     }
 }
 
+// Same shape as startApplyIdentity, one step later (SAA-195): spawned on
+// every voice-naming save, not only late ones, because this process cannot
+// know whether recover.ts's sweep would otherwise be the only thing that
+// ever reads the answer. Re-extraction (inside apply-voice-names.ts) makes
+// this slower than startApplyIdentity's spawn — logged to its own file for
+// the same reason.
+function startApplyVoiceNames(stem) {
+    const logPath = path.join(OUTDIR, `voice-names-${stem}.log`);
+    let fd;
+    try {
+        fd = fs.openSync(logPath, 'a');
+        fs.writeSync(fd, `\n[clipwise-recorder] ${new Date().toISOString()} apply-voice-names stem=${stem}\n`);
+    } catch (err) {
+        console.error(`voice-names log ${logPath}: ${String(err)}`);
+        return;
+    }
+    try {
+        const proc = spawn(TSX_BIN, [APPLY_VOICE_NAMES_ENTRY, OUTDIR, '--stem', stem], {
+            cwd: SERVER_DIR,
+            env: { ...process.env, PATH: PIPELINE_PATH },
+            stdio: ['ignore', fd, fd],
+            detached: true,
+        });
+        proc.unref();
+        proc.once('error', (err) => {
+            try {
+                fs.appendFileSync(logPath, `[clipwise-recorder] spawn failed: ${String(err)}\n`);
+            } catch {}
+        });
+    } catch (err) {
+        console.error(`voice-names: apply spawn failed: ${String(err)}`);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
 // Asked once, then reused. Kept beside the recordings rather than in the
 // capture directory: it is a fact about the person, not about one capture.
 function readSelfName() {
@@ -1675,6 +1844,21 @@ function promptForIdentity(capture) {
     if (!capture || !capture.stem) return;
     identityQueue.push({ ...capture, token: randomUUID() });
     pumpIdentityQueue();
+}
+
+// Ends this window's turn for good: stops its naming-data poll if one is
+// running, and — only when it came off identityQueue — advances past it, so
+// the queue can offer the next different capture. A window reopened from
+// the tray (reopenVoiceNaming) never touched the queue and must not shift
+// it; that path's own `fromQueue: false` is what this checks.
+function resolveIdentityWindow() {
+    if (!identityWindow) return;
+    identityWindow.resolved = true;
+    if (identityWindow.pollTimer) {
+        clearInterval(identityWindow.pollTimer);
+        identityWindow.pollTimer = null;
+    }
+    if (identityWindow.fromQueue) identityQueue.shift();
 }
 
 function pumpIdentityQueue() {
@@ -1719,7 +1903,7 @@ function pumpIdentityQueue() {
         identityQueue.shift();
         return;
     }
-    identityWindow = { win, capture, shown: false };
+    identityWindow = { win, capture, shown: false, step: 1, resolved: false, fromQueue: true, pollTimer: null };
     // Shown once, by whichever comes first: the page's own height message, or
     // a deadline. The deadline is what stops a broken measurement from leaving
     // the prompt invisible — a window nobody can see is worse than one sized
@@ -1736,6 +1920,23 @@ function pumpIdentityQueue() {
     identityWindow.reveal = reveal;
     win.once('ready-to-show', () => setTimeout(reveal, IDENTITY_REVEAL_GRACE_MS));
     win.once('closed', () => {
+        // SAA-197: closing via the window's own controls used to reopen the
+        // same capture immediately — this queue never advanced, because
+        // only Save/Skip/Later did that. Treated now exactly as Skip (step
+        // 1) or Later (step 2) whenever the window closes without having
+        // been resolved by one of those already, so a native close is a
+        // real answer, same as before, and never a silent reopen.
+        if (identityWindow && identityWindow.win === win && !identityWindow.resolved) {
+            const capture = identityWindow.capture;
+            if (identityWindow.step === 2) {
+                console.error(
+                    `[clipwise-recorder] identity ${capture.stem}: closed during step 2 — treated as Later`);
+            } else {
+                console.error(
+                    `[clipwise-recorder] identity ${capture.stem}: closed — treated as Skip, recording is unidentified`);
+            }
+            resolveIdentityWindow();
+        }
         identityWindow = null;
         pumpIdentityQueue();
     });
@@ -1766,15 +1967,23 @@ function pumpIdentityQueue() {
     });
 }
 
-// Closes the window for `token` if it is the one on screen, and takes that
-// capture off the queue. Returns the capture, or null when the message came
-// from a window that has already been dealt with.
-function claimIdentityPrompt(token) {
+// Validates that `token` names the window currently on screen and returns
+// its capture, without resolving anything — unlike the old
+// claimIdentityPrompt, a step 1 submission with more than one guest must
+// leave the window and the queue exactly where they are while step 2 takes
+// over the same window.
+function currentCapture(token) {
     if (!identityWindow || identityWindow.capture.token !== token) return null;
-    const capture = identityWindow.capture;
-    identityQueue.shift();
+    return identityWindow.capture;
+}
+
+// Terminal for this capture: resolves the queue/poll bookkeeping, then
+// closes the window. Every path that ends this capture's turn — the
+// one-guest short-circuit, a step 2 save, Skip, Later — goes through this,
+// so exactly one thing ever advances the queue for it.
+function finishIdentityWindow() {
+    resolveIdentityWindow();
     try { identityWindow.win.close(); } catch {}
-    return capture;
 }
 
 function registerIdentityIpc() {
@@ -1795,7 +2004,7 @@ function registerIdentityIpc() {
     });
 
     ipcMain.on('identity:submit', (_event, payload) => {
-        const capture = claimIdentityPrompt(payload && payload.token);
+        const capture = currentCapture(payload && payload.token);
         if (!capture) return;
         // SAA-169: guests are known names the person checked off, plus
         // anyone typed into the "someone new" field — merged and deduped in
@@ -1820,15 +2029,72 @@ function registerIdentityIpc() {
             console.error(`identity: could not write the answer for ${capture.stem}: ${String(err)}`);
             notify('Clipwise: identity not saved',
                 `Who was on ${capture.stem} could not be written — the recording is unidentified.`);
+            finishIdentityWindow();
             return;
         }
         startApplyIdentity(capture.stem);
+
+        if (names.length === 1) {
+            // One-guest rule (SAA-194 §5, SAA-195): diarize never splits a
+            // call whose `them` row this answer is about to name, so there
+            // is no step 2 — no naming data will ever arrive to wait for.
+            finishIdentityWindow();
+            return;
+        }
+
+        // Step 2: the window stays open. identity.html switches itself to
+        // the waiting view; this starts polling for the naming data diarize
+        // (well after transcribe and ingest) will eventually produce.
+        identityWindow.step = 2;
+        identityWindow.win.webContents.send('identity:show-step2', { guestNames: names });
+        identityWindow.pollTimer = setInterval(() => {
+            const data = readNamingData(OUTDIR, capture.stem);
+            if (!data) return;
+            clearInterval(identityWindow.pollTimer);
+            identityWindow.pollTimer = null;
+            identityWindow.win.webContents.send('identity:step2-ready', data);
+        }, VOICE_NAMING_POLL_MS);
+    });
+
+    ipcMain.on('identity:submit-voices', (_event, payload) => {
+        const capture = currentCapture(payload && payload.token);
+        if (!capture) return;
+        const doc = buildVoiceNamesDoc({
+            stem: capture.stem,
+            recordingId: capture.recordingId,
+            voices: Array.isArray(payload.voices) ? payload.voices : [],
+        });
+        try {
+            const finalPath = writeVoiceNamesAnswer(OUTDIR, doc);
+            console.error(
+                `[clipwise-recorder] voice-names ${capture.stem}: ` +
+                `${JSON.stringify(doc.voices)} -> ${finalPath}`);
+        } catch (err) {
+            console.error(`voice-names: could not write the answer for ${capture.stem}: ${String(err)}`);
+            notify('Clipwise: voice names not saved',
+                `Naming the voices on ${capture.stem} could not be written.`);
+            finishIdentityWindow();
+            return;
+        }
+        startApplyVoiceNames(capture.stem);
+        finishIdentityWindow();
+        // The tray's "Name N voices…" item for this stem should disappear
+        // now, not at the next unrelated tray refresh.
+        renderTray();
     });
 
     ipcMain.on('identity:skip', (_event, payload) => {
-        const capture = claimIdentityPrompt(payload && payload.token);
+        const capture = currentCapture(payload && payload.token);
         if (!capture) return;
         console.error(`[clipwise-recorder] identity ${capture.stem}: skipped — recording is unidentified`);
+        finishIdentityWindow();
+    });
+
+    ipcMain.on('identity:later', (_event, payload) => {
+        const capture = currentCapture(payload && payload.token);
+        if (!capture) return;
+        console.error(`[clipwise-recorder] identity ${capture.stem}: voice naming left for later`);
+        finishIdentityWindow();
     });
 }
 

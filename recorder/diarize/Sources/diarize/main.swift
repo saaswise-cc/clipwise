@@ -97,11 +97,25 @@ let diarizationClusteringThreshold: Double = 0.6
 // below any real participant's contribution to a multi-minute call.
 let minimumVoiceSeconds: Double = 15.0
 
+// Clip selection for naming (SAA-195): up to this many clips per voice, each
+// within this length range, single-voice only — no overlap with another
+// surviving voice's speech, and no overlap with any mic-track speech at all
+// (so the clip is never colored by the host also talking underneath it).
+let maxClipsPerVoice = 3
+let minClipSeconds: Double = 4.0
+let maxClipSeconds: Double = 6.0
+
+struct ClipRange: Codable {
+    let start: Double
+    let end: Double
+}
+
 struct VoiceOut: Codable {
     let voiceIndex: Int
     let sourceLabel: String  // FluidAudio's own "S1"/"S2"/... — kept for traceability only
     let totalSeconds: Double
     let embedding: [Float]
+    let clipRanges: [ClipRange]
 }
 
 // voiceIndex is nil for a diarized segment that exists (FluidAudio found
@@ -267,6 +281,68 @@ func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     return denom > 0 ? dot / denom : 0
 }
 
+// Subtract `others` (already sorted or not — doesn't matter) from a single
+// [start, end) window, returning the pieces of it that survive.
+func subtractIntervals(_ window: (Double, Double), _ others: [(Double, Double)]) -> [(Double, Double)] {
+    var pieces = [window]
+    for other in others {
+        var next: [(Double, Double)] = []
+        for (s, e) in pieces {
+            let os = max(s, other.0)
+            let oe = min(e, other.1)
+            guard os < oe else {
+                next.append((s, e))  // no overlap with this one
+                continue
+            }
+            if s < os { next.append((s, os)) }
+            if oe < e { next.append((oe, e)) }
+        }
+        pieces = next
+    }
+    return pieces
+}
+
+// Up to `maxClipsPerVoice` clean windows of `minClipSeconds`...`maxClipSeconds`
+// for one voice: single-voice only (no overlap with any other surviving
+// voice's segments) and no overlap with any mic-track speech at all
+// (micSpeechRanges), longest clean stretch first (SAA-195).
+//
+// Consecutive segments of the SAME voice separated by a short gap are
+// merged into one "run" first — otherwise a 2s segment right next to
+// another 2.5s segment of the same voice, obviously one continuous turn,
+// would each be too short to qualify alone.
+func selectClips(
+    ownSegments: [(Double, Double)],
+    otherVoiceSegments: [(Double, Double)],
+    micSpeechRanges: [(Double, Double)]
+) -> [ClipRange] {
+    let mergeGapSeconds = 0.5
+    let sorted = ownSegments.sorted { $0.0 < $1.0 }
+    var runs: [(Double, Double)] = []
+    for (s, e) in sorted {
+        if let last = runs.last, s - last.1 <= mergeGapSeconds {
+            runs[runs.count - 1].1 = max(last.1, e)
+        } else {
+            runs.append((s, e))
+        }
+    }
+
+    var candidates: [(clip: (Double, Double), cleanLength: Double)] = []
+    for run in runs {
+        for clean in subtractIntervals(run, otherVoiceSegments + micSpeechRanges) {
+            let cleanLength = clean.1 - clean.0
+            guard cleanLength >= minClipSeconds else { continue }
+            let clipEnd = cleanLength > maxClipSeconds ? clean.0 + maxClipSeconds : clean.1
+            candidates.append((clip: (clean.0, clipEnd), cleanLength: cleanLength))
+        }
+    }
+    // Longest clean stretch first — ranked by the ORIGINAL clean length, not
+    // the (possibly trimmed) clip length, so a 20s clean run outranks a
+    // barely-4s one even though both get trimmed to at most 6s.
+    candidates.sort { $0.cleanLength > $1.cleanLength }
+    return candidates.prefix(maxClipsPerVoice).map { ClipRange(start: $0.clip.0, end: $0.clip.1) }
+}
+
 // No Task{}/DispatchSemaphore wrapper here — this file is literally
 // main.swift, which Swift treats as an implicit async context at the top
 // level (SE-0343), so `try await` works directly. An earlier version of
@@ -387,6 +463,22 @@ do {
             }
         }
 
+        // Mic speech ranges for clip selection (SAA-195), independent of and
+        // separate from the host-reference computation above: a full,
+        // ordinary diarization of the whole mic track. Its cluster identity
+        // doesn't matter here — this is deliberately not repeating the
+        // "pick the right cluster" problem the host reference had, since all
+        // that's needed is "was anyone speaking on mic at all during this
+        // window," for which every segment counts regardless of speaker.
+        var micSpeechRanges: [(Double, Double)] = []
+        if FileManager.default.fileExists(atPath: micPath) {
+            let micResult = try await manager.process(URL(fileURLWithPath: micPath))
+            micSpeechRanges = micResult.segments.map { (Double($0.startTimeSeconds), Double($0.endTimeSeconds)) }
+            FileHandle.standardError.write(
+                "diarize: mic speech ranges for clip selection — \(micSpeechRanges.count) segment(s)\n"
+                    .data(using: .utf8)!)
+        }
+
         // A voice is excluded — folded back onto `them`, no Voice N of its
         // own — when it's the host echo, or when it falls under
         // minimumVoiceSeconds regardless of host-echo status. Both are
@@ -410,11 +502,26 @@ do {
         var indexByLabel: [String: Int] = [:]
         for (i, label) in survivingLabels.enumerated() { indexByLabel[label] = i + 1 }
 
+        var segmentsByLabel: [String: [(Double, Double)]] = [:]
+        for seg in tapResult.segments {
+            segmentsByLabel[seg.speakerId, default: []].append(
+                (Double(seg.startTimeSeconds), Double(seg.endTimeSeconds)))
+        }
+
         let voicesOut: [VoiceOut] = survivingLabels.map { label in
             let voice = tapVoices[label]!
+            let ownSegments = segmentsByLabel[label] ?? []
+            let otherSegments = survivingLabels
+                .filter { $0 != label }
+                .flatMap { segmentsByLabel[$0] ?? [] }
+            let clipRanges = selectClips(
+                ownSegments: ownSegments, otherVoiceSegments: otherSegments,
+                micSpeechRanges: micSpeechRanges)
+            FileHandle.standardError.write(
+                "diarize: voice \(label) — \(clipRanges.count) clip(s) selected for naming\n".data(using: .utf8)!)
             return VoiceOut(
                 voiceIndex: indexByLabel[label]!, sourceLabel: label,
-                totalSeconds: voice.totalSeconds, embedding: voice.embedding)
+                totalSeconds: voice.totalSeconds, embedding: voice.embedding, clipRanges: clipRanges)
         }
         // Every diarized segment is emitted, including excluded voices' —
         // with voiceIndex nil for those, so the caller can tell "diarized

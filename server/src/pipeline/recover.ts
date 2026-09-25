@@ -36,7 +36,9 @@ import { db, pool, schema } from "../db/index.js";
 import { CLIPWISE_SOURCE } from "../ingest/clipwise.js";
 import { TERMINAL_STATUS } from "../extract/extract.js";
 import { applyIdentityForCapture } from "./apply-identity.js";
+import { applyVoiceNamesForCapture } from "./apply-voice-names.js";
 import { describeMapping, describeRows, describeScope } from "../ingest/identity.js";
+import { describeVoiceNaming } from "../ingest/voice-names.js";
 import { runCapturePipeline, type Sidecar } from "./run-capture.js";
 
 // How many times a single capture may be picked up before this pass stops
@@ -312,11 +314,27 @@ export type IdentityRecoveryOutcome = {
   detail: string;
 };
 
+// SAA-195, same reasoning as SAA-173 above one layer later: the recorder
+// spawns apply-voice-names.ts once when the naming window saves, but
+// cannot know that spawn actually ran to completion, and a voice-names
+// answer can arrive before diarize has even produced Voice N rows for it
+// to name. This runs unconditionally, for every manifest, same as the
+// identity loop — cheap and idempotent when there's nothing new to do.
+export type VoiceNamesRecoveryOutcome = {
+  stem: string;
+  status: "no_answer" | "pending" | "applied" | "already_applied";
+  detail: string;
+};
+
 export async function runRecoveryPass(opts: {
   dir: string;
   maxAttempts?: number;
   dryRun?: boolean;
-}): Promise<{ processing: RecoveryOutcome[]; identity: IdentityRecoveryOutcome[] }> {
+}): Promise<{
+  processing: RecoveryOutcome[];
+  identity: IdentityRecoveryOutcome[];
+  voiceNames: VoiceNamesRecoveryOutcome[];
+}> {
   const dir = resolve(opts.dir);
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const dryRun = opts.dryRun ?? false;
@@ -371,6 +389,47 @@ export async function runRecoveryPass(opts: {
           `inserted=${describeRows(result.identity.inserted)} ` +
           `speaker_names=${describeMapping(result.speakerMapping)} ` +
           `scope=${describeScope(result.scope)}`,
+      });
+    }
+  }
+
+  const voiceNamesOutcomes: VoiceNamesRecoveryOutcome[] = [];
+  if (!dryRun) {
+    for (const c of candidates) {
+      let result;
+      try {
+        result = await applyVoiceNamesForCapture(dir, c.stem);
+      } catch (err) {
+        voiceNamesOutcomes.push({
+          stem: c.stem,
+          status: "no_answer",
+          detail: `error reading/applying voice names: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        continue;
+      }
+      if (result.status === "no_answer") continue;
+      if (result.status === "pending") {
+        voiceNamesOutcomes.push({
+          stem: c.stem,
+          status: "pending",
+          detail: `no recording yet for source_id=${result.sourceId}`,
+        });
+        continue;
+      }
+      if (result.status === "already_applied") {
+        voiceNamesOutcomes.push({
+          stem: c.stem,
+          status: "already_applied",
+          detail: `recording=${result.recordingId} — stored answer already matches the file, skipped`,
+        });
+        continue;
+      }
+      voiceNamesOutcomes.push({
+        stem: c.stem,
+        status: result.naming.applied.length > 0 ? "applied" : "already_applied",
+        detail:
+          `${describeVoiceNaming(result.naming)} ` +
+          `extraction=${result.extractionRunUuid ?? "not run"}`,
       });
     }
   }
@@ -494,7 +553,7 @@ export async function runRecoveryPass(opts: {
     }
   }
 
-  return { processing: outcomes, identity: identityOutcomes };
+  return { processing: outcomes, identity: identityOutcomes, voiceNames: voiceNamesOutcomes };
 }
 
 async function main(): Promise<void> {
@@ -523,7 +582,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const { processing, identity } = await runRecoveryPass({ dir, maxAttempts, dryRun });
+  const { processing, identity, voiceNames } = await runRecoveryPass({ dir, maxAttempts, dryRun });
 
   process.stdout.write("\n=== identity recovery (SAA-173) ===\n");
   if (identity.length === 0) {
@@ -534,6 +593,16 @@ async function main(): Promise<void> {
   }
   const identityApplied = identity.filter((o) => o.status === "applied").length;
   process.stdout.write(`\nidentity applied=${identityApplied} total_checked=${identity.length}\n`);
+
+  process.stdout.write("\n=== voice names recovery (SAA-195) ===\n");
+  if (voiceNames.length === 0) {
+    process.stdout.write("(dry run — skipped)\n");
+  }
+  for (const o of voiceNames) {
+    process.stdout.write(`${o.status.padEnd(16)} ${o.stem}  ${o.detail}\n`);
+  }
+  const voiceNamesApplied = voiceNames.filter((o) => o.status === "applied").length;
+  process.stdout.write(`\nvoice names applied=${voiceNamesApplied} total_checked=${voiceNames.length}\n`);
 
   process.stdout.write("\n=== recovery pass ===\n");
   for (const o of processing) {

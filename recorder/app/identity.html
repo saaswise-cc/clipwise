@@ -2,32 +2,25 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<!-- The identity prompt (SAA-114). Shown after a capture stops, asking who was
-     on the call; the answer becomes attendee rows. Also carries (SAA-153) a
-     personal/work choice, and (SAA-169) a pick-list of known guests so a
-     repeat attendee is selected rather than retyped — a typo at this prompt
-     used to mint a permanent second person with no mechanism that would ever
-     surface it.
+<!-- The identity prompt (SAA-114), now two steps in one window (SAA-195).
+     Step 1, "Who was on this call?", is unchanged in substance — see its own
+     comments below. Step 2, "Who's speaking?", follows it once diarize has
+     split the call into more than one voice; it fills in on its own once the
+     naming data exists, since diarize runs well after this window already
+     opened. If step 1 names exactly one guest, there is no step 2 — SAA-194
+     never splits a call diarize already knows has one confirmed guest, so no
+     naming data would ever arrive to wait for.
 
-     Loaded from file:// with nodeIntegration on. That is a deliberate,
-     bounded choice: this page is shipped inside the bundle, loads no remote
-     content, and the only thing it sends is the text typed into it (or the
-     names checked off) and which scope button is active. A preload bridge
-     would be the same calls behind one more file. Nothing here ever puts a
-     typed or known name into the DOM as markup beyond a checkbox label — the
-     name goes to the main process and no further.
+     Dismissing this window is a real answer with a real consequence, same as
+     before. In step 1, a close is treated exactly as Skip: the recording
+     stays unidentified. In step 2, a close (or the Later button) leaves the
+     voices unnamed for now — a menu bar item offers to come back
+     (SAA-195, SAA-197). Neither ever reopens itself automatically.
 
-     Dismissing this window is a real answer with a real consequence: the
-     recording stays unidentified and unclassified. It is never the capture
-     that is lost.
-
-     Names ask for full names, and say so, because the filter that reads them
-     back is a case-insensitive substring match (SAA-127): a stored "Mike" is
-     unreachable by a search for "Michael Lynch", while a stored full name
-     answers both. The imported rows already spell names in full, so a short
-     form here would also make the two sources disagree. The known-names list
-     is exactly the full names typed at this prompt before (identity-answer.js:
-     knownGuestNames), so it already carries that convention. -->
+     Loaded from file:// with nodeIntegration on, same reasoning as before:
+     ships inside the bundle, loads no remote content. Step 2 additionally
+     plays local clip files via new Audio(), which is the same trust
+     boundary — a local file this same machine's capture just wrote. -->
 <title>Who was on this call?</title>
 <style>
   :root {
@@ -58,10 +51,6 @@
     color: var(--fg);
     background: var(--bg);
     user-select: none;
-    /* Column with a scrolling middle and a pinned button row. The window is
-       sized to fit this page, but the layout does not depend on that having
-       worked: at any height the buttons keep their place at the bottom and the
-       fields give up the space instead. */
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -72,7 +61,7 @@
   .reason { color: var(--muted); font-size: 12px; margin: 0 0 6px; }
   .capture { color: var(--muted); font-size: 11px; margin: 0 0 12px; }
   label { display: block; font-size: 11px; color: var(--muted); margin: 0 0 4px; }
-  textarea, input {
+  textarea, input, select {
     width: 100%;
     font: inherit;
     color: var(--fg);
@@ -83,7 +72,7 @@
     user-select: text;
   }
   textarea { height: 62px; resize: none; }
-  textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .field { margin-bottom: 10px; }
   .hint { color: var(--muted); font-size: 11px; margin: 4px 0 0; }
   .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
@@ -97,10 +86,8 @@
   }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: 0.5; }
 
-  /* Known-guest picker (SAA-169): a plain checklist, not a fancy combobox —
-     there is no bundler here to pull one in, and a checklist needs none of
-     the "is this a new entry or a match" ambiguity a type-ahead would add. */
   #known { max-height: 108px; overflow-y: auto; border: 1px solid var(--field-border);
     border-radius: 6px; background: var(--field-bg); padding: 2px 0; }
   #known label { display: flex; align-items: center; gap: 6px; font-size: 12px;
@@ -109,61 +96,75 @@
   #known input[type="checkbox"] { width: auto; }
   #known.empty { display: none; }
 
-  /* Scope toggle (SAA-153): two buttons acting as one control, "work"
-     pre-selected — see identity-answer.js's note on why. */
   .segmented { display: flex; border: 1px solid var(--field-border); border-radius: 6px; overflow: hidden; }
   .segmented button { flex: 1 1 0; border: none; border-radius: 0; }
   .segmented button + button { border-left: 1px solid var(--field-border); }
   .segmented button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  /* Step 2: one card per voice. */
+  #waiting { color: var(--muted); font-size: 12px; padding: 10px 0; }
+  .voice-card {
+    border: 1px solid var(--field-border);
+    border-radius: 8px;
+    background: var(--field-bg);
+    padding: 10px;
+    margin-bottom: 10px;
+  }
+  .voice-card .play-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .voice-card .play-row button { padding: 4px 10px; }
+  .voice-card .lines { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+  .voice-card .lines div { margin: 2px 0; }
+  .voice-card .someone-else { margin-top: 6px; display: none; }
+  .voice-card .someone-else.shown { display: block; }
 </style>
 </head>
 <body>
-  <h1>Who was on this call?</h1>
-  <p class="reason">Names here let you search for this recording by who was on it.</p>
+  <h1 id="title">Who was on this call?</h1>
+  <p class="reason" id="reason">Names here let you search for this recording by who was on it.</p>
   <p class="capture" id="capture"></p>
 
   <div id="fields">
-  <div class="field" id="known-field">
-    <label>Who else — check anyone already known</label>
-    <div id="known"></div>
-  </div>
+    <div id="step1">
+      <div class="field" id="known-field">
+        <label>Who else — check anyone already known</label>
+        <div id="known"></div>
+      </div>
 
-  <div class="field">
-    <label for="names">Someone new? Full name(s) — one per line, or separated by commas</label>
-    <textarea id="names" spellcheck="false" placeholder="Grace Hopper"></textarea>
-    <p class="hint">Just you on the call? Leave everything empty.</p>
-  </div>
+      <div class="field">
+        <label for="names">Someone new? Full name(s) — one per line, or separated by commas</label>
+        <textarea id="names" spellcheck="false" placeholder="Grace Hopper"></textarea>
+        <p class="hint">Just you on the call? Leave everything empty.</p>
+      </div>
 
-  <div class="field">
-    <label for="self">You (host) — your full name</label>
-    <input id="self" spellcheck="false" placeholder="Ada Lovelace — asked once, remembered after">
-  </div>
+      <div class="field">
+        <label for="self">You (host) — your full name</label>
+        <input id="self" spellcheck="false" placeholder="Ada Lovelace — asked once, remembered after">
+      </div>
 
-  <div class="field">
-    <label id="scope-label">Personal or work?</label>
-    <div class="segmented" id="scope" role="group">
-      <button type="button" data-value="work">Work</button>
-      <button type="button" data-value="personal">Personal</button>
+      <div class="field">
+        <label id="scope-label">Personal or work?</label>
+        <div class="segmented" id="scope" role="group">
+          <button type="button" data-value="work">Work</button>
+          <button type="button" data-value="personal">Personal</button>
+        </div>
+      </div>
     </div>
-  </div>
 
+    <div id="step2" style="display:none">
+      <div id="waiting">Finding voices on the call…</div>
+      <div id="voices"></div>
+    </div>
   </div>
 
   <div id="actions" class="row">
     <button id="skip">Skip</button>
-    <button id="save" class="primary">Save</button>
+    <button id="save" class="primary">Next</button>
   </div>
 
 <script>
   const { ipcRenderer } = require('electron');
   const params = new URLSearchParams(window.location.search);
 
-  // Compact duration for this line only (SAA-187) — "23 min" / "9 sec".
-  // Deliberately not formatElapsed's job in main.js: that one serves a
-  // notification with room to spell the unit out, this one shares a line
-  // with the time and has to earn its space. Sub-minute resolution matters
-  // here specifically because a real meeting and a stray capture differ in
-  // seconds, not just minutes.
   function formatDurationCompact(raw) {
     if (raw === null || raw === undefined || raw === '') return null;
     const n = Number(raw);
@@ -173,30 +174,6 @@
     return `${Math.round(totalSeconds / 60)} min`;
   }
 
-  // The stem is a UTC timestamp (utcStamp() in main.js), and this dialog
-  // always runs on the machine that just recorded — moments after capture,
-  // never read back later on another machine — so formatting it in the
-  // local zone here is correct in a way it would not be for a stored title
-  // read elsewhere (SAA-135's blocker on that is about the stored row, not
-  // this dialog). Kept on the element as `title` rather than dropped, so
-  // the raw stem is still one hover away for diagnosis.
-  //
-  // Date precision escalates with distance (SAA-187) instead of always
-  // carrying a word like "Today": that word is true on nearly every showing
-  // of this dialog and a full date on a twenty-minute-old capture reads like
-  // a filing system. Compared as local calendar days, not raw elapsed hours,
-  // so 11:58pm and 12:02am the next morning read as today/yesterday rather
-  // than both landing inside "under a day ago". Year appears only when it
-  // isn't the current one — this dialog is not where anyone is hunting
-  // through last year's captures. Weekday appears only inside the same
-  // week, for the same reason: it identifies which of the last few days a
-  // capture was on, and stops earning its space once the date itself does
-  // that job, so a year-old capture doesn't carry a stale-looking "Sun".
-  //
-  // "Started" prefixes the whole thing (follow-up to SAA-187): a bare time
-  // and duration leaves the reader guessing whether it is the start, the
-  // end, or when the dialog appeared. It is always the start — the prompt
-  // only exists after a capture has already stopped.
   function formatCaptureStem(stem, durationRaw) {
     const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/.exec(stem || '');
     if (!m) return stem || '';
@@ -231,17 +208,8 @@
   captureEl.title = stem;
   document.getElementById('self').value = params.get('self') || '';
 
-  // SAA-169: render the known-names checklist before anything measures the
-  // page, so the height sent below already accounts for it. Hide the field
-  // entirely rather than leave an empty box when nobody has been named at
-  // this prompt before — a fresh install, or every name so far having gone
-  // through the "someone new" field only.
   let knownNames = [];
-  try {
-    knownNames = JSON.parse(params.get('knownNames') || '[]');
-  } catch {
-    knownNames = [];
-  }
+  try { knownNames = JSON.parse(params.get('knownNames') || '[]'); } catch { knownNames = []; }
   const knownEl = document.getElementById('known');
   if (Array.isArray(knownNames) && knownNames.length > 0) {
     for (const name of knownNames) {
@@ -257,17 +225,6 @@
     document.getElementById('known-field').style.display = 'none';
   }
 
-  // SAA-170: pre-selected from the detected app when there is one — shown,
-  // not silent (see identity-answer.js's note on why this is never fully
-  // automatic). Click toggles which button carries .active; that is the
-  // only state read on save, so overriding the inference is exactly
-  // clicking the other button, same as choosing it from scratch.
-  //
-  // Neither button starts active when there is no inference (a manual
-  // start, or an app with no entry) — SAA-170 deliberately stopped
-  // defaulting to "work" here, because a value indistinguishable from a
-  // deliberate choice is worse than an honestly unset one now that a real
-  // per-capture signal exists for the common case.
   const scopeEl = document.getElementById('scope');
   const inferredScope = params.get('inferredScope');
   if (inferredScope === 'work' || inferredScope === 'personal') {
@@ -280,34 +237,16 @@
     for (const b of scopeEl.querySelectorAll('button')) b.classList.remove('active');
     button.classList.add('active');
   });
-  // null when neither button is active — no inference and nothing clicked.
-  // main.js writes that through as an unset scope rather than guessing.
   function selectedScope() {
     const active = scopeEl.querySelector('button.active');
     if (!active) return null;
     return active.dataset.value === 'personal' ? 'personal' : 'work';
   }
 
-  // Tell the main process how tall this page actually is, so the window is
-  // sized to the copy rather than the copy trimmed to fit the window. Measured
-  // rather than declared because the two drift: the height that fit before
-  // 7dae4a9 cut the buttons off after it.
-  //
-  // Measured with the layout's own constraints lifted. The column is capped at
-  // the viewport by design, so asking it how tall it is while it is capped
-  // returns the window height back — the first attempt at this reported 280px
-  // for a page that needs more, and clipped the host field instead of the
-  // buttons. Unconstrain, read the body's border box, put it back: the page is
-  // never painted in the loosened state because this runs before the window is
-  // shown.
   function measuredHeight() {
     const body = document.body;
     const fields = document.getElementById('fields');
-    const prev = {
-      height: body.style.height,
-      overflow: fields.style.overflow,
-      flex: fields.style.flex,
-    };
+    const prev = { height: body.style.height, overflow: fields.style.overflow, flex: fields.style.flex };
     body.style.height = 'auto';
     fields.style.overflow = 'visible';
     fields.style.flex = '0 0 auto';
@@ -317,31 +256,197 @@
     fields.style.flex = prev.flex;
     return h;
   }
+  function resize() {
+    ipcRenderer.send('identity:resize', { token: params.get('token'), height: measuredHeight() });
+  }
   window.measuredHeight = measuredHeight;
-  ipcRenderer.send('identity:resize', { token: params.get('token'), height: measuredHeight() });
+
+  // --- step 2 state ----------------------------------------------------
+  // guestNames: the names step 2's choices are drawn from — either what
+  // step 1 just submitted (the ordinary flow), or, when reopened from the
+  // tray for a capture already past step 1, the names carried in via the
+  // startNames query param.
+  let guestNames = [];
+  try { guestNames = JSON.parse(params.get('startNames') || '[]'); } catch { guestNames = []; }
+  // voiceIndex -> chosen name (string) | null ("Not sure")
+  const voiceChoices = new Map();
+  // voiceIndex -> which clip index Play is currently on
+  const clipIndexByVoice = new Map();
+  let currentAudio = null;
+
+  function stopAudio() {
+    if (currentAudio) { try { currentAudio.pause(); } catch {} currentAudio = null; }
+  }
+
+  function playClip(voiceIndex, clipPaths) {
+    stopAudio();
+    const i = clipIndexByVoice.get(voiceIndex) || 0;
+    const path = clipPaths[i % clipPaths.length];
+    currentAudio = new Audio('file://' + path);
+    currentAudio.play().catch((err) => console.error('identity: clip playback failed', err));
+    clipIndexByVoice.set(voiceIndex, i + 1);
+  }
+
+  // Choosing a name another voice already has moves it (SAA-195): scan every
+  // other voice row and reset one that already carries the name just chosen
+  // back to "Not sure", so no two voices ever share a name.
+  function reconcileChoice(voiceIndex, name) {
+    voiceChoices.set(voiceIndex, name);
+    if (!name) return;
+    for (const [otherIndex, otherName] of voiceChoices) {
+      if (otherIndex === voiceIndex) continue;
+      if (otherName && otherName.toLowerCase() === name.toLowerCase()) {
+        voiceChoices.set(otherIndex, null);
+        const select = document.querySelector(`.voice-card[data-voice="${otherIndex}"] select`);
+        const someoneElse = document.querySelector(`.voice-card[data-voice="${otherIndex}"] .someone-else`);
+        if (select) select.value = '__not_sure__';
+        if (someoneElse) { someoneElse.classList.remove('shown'); someoneElse.querySelector('input').value = ''; }
+      }
+    }
+  }
+
+  function renderVoices(namingData) {
+    document.getElementById('waiting').style.display = 'none';
+    const container = document.getElementById('voices');
+    container.innerHTML = '';
+    for (const voice of namingData.voices) {
+      voiceChoices.set(voice.voiceIndex, null);
+      const card = document.createElement('div');
+      card.className = 'voice-card';
+      card.dataset.voice = String(voice.voiceIndex);
+
+      const playRow = document.createElement('div');
+      playRow.className = 'play-row';
+      const playButton = document.createElement('button');
+      playButton.type = 'button';
+      playButton.textContent = '▶ Play';
+      playButton.disabled = !voice.clipPaths || voice.clipPaths.length === 0;
+      playButton.addEventListener('click', () => {
+        playClip(voice.voiceIndex, voice.clipPaths);
+        playButton.textContent = '▶ Play another';
+      });
+      playRow.appendChild(playButton);
+      card.appendChild(playRow);
+
+      const lines = document.createElement('div');
+      lines.className = 'lines';
+      for (const line of voice.lines || []) {
+        const d = document.createElement('div');
+        d.textContent = '“' + (line.text || '').trim() + '”';
+        lines.appendChild(d);
+      }
+      card.appendChild(lines);
+
+      const select = document.createElement('select');
+      const notSureOpt = document.createElement('option');
+      notSureOpt.value = '__not_sure__';
+      notSureOpt.textContent = 'Not sure';
+      select.appendChild(notSureOpt);
+      for (const name of guestNames) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+      }
+      const someoneElseOpt = document.createElement('option');
+      someoneElseOpt.value = '__someone_else__';
+      someoneElseOpt.textContent = 'Someone else…';
+      select.appendChild(someoneElseOpt);
+      select.value = '__not_sure__';
+
+      const someoneElseField = document.createElement('div');
+      someoneElseField.className = 'someone-else';
+      const someoneElseInput = document.createElement('input');
+      someoneElseInput.type = 'text';
+      someoneElseInput.spellcheck = false;
+      someoneElseInput.placeholder = 'Full name';
+      someoneElseField.appendChild(someoneElseInput);
+
+      select.addEventListener('change', () => {
+        if (select.value === '__someone_else__') {
+          someoneElseField.classList.add('shown');
+          reconcileChoice(voice.voiceIndex, someoneElseInput.value.trim() || null);
+          someoneElseInput.focus();
+        } else {
+          someoneElseField.classList.remove('shown');
+          reconcileChoice(voice.voiceIndex, select.value === '__not_sure__' ? null : select.value);
+        }
+      });
+      someoneElseInput.addEventListener('input', () => {
+        reconcileChoice(voice.voiceIndex, someoneElseInput.value.trim() || null);
+      });
+
+      card.appendChild(select);
+      card.appendChild(someoneElseField);
+      container.appendChild(card);
+    }
+    resize();
+  }
+
+  function showStep2Waiting() {
+    document.getElementById('title').textContent = "Who's speaking?";
+    document.getElementById('reason').textContent = 'Play a clip, then pick a name for each voice.';
+    document.getElementById('step1').style.display = 'none';
+    document.getElementById('step2').style.display = 'block';
+    document.getElementById('waiting').style.display = 'block';
+    document.getElementById('skip').textContent = 'Later';
+    document.getElementById('save').textContent = 'Save';
+    resize();
+  }
+
+  // Sent right after a step 1 submit that named anything other than
+  // exactly one guest — this window's own turn continues into step 2
+  // rather than closing.
+  ipcRenderer.on('identity:show-step2', (_event, payload) => {
+    guestNames = Array.isArray(payload && payload.guestNames) ? payload.guestNames : [];
+    showStep2Waiting();
+  });
+  ipcRenderer.on('identity:step2-ready', (_event, namingData) => renderVoices(namingData));
 
   function save() {
-    const selectedNames = Array.from(knownEl.querySelectorAll('input:checked')).map((c) => c.value);
-    ipcRenderer.send('identity:submit', {
-      token: params.get('token'),
-      selectedNames,
-      newNames: document.getElementById('names').value,
-      self: document.getElementById('self').value,
-      scope: selectedScope(),
-    });
+    if (document.getElementById('step2').style.display === 'none') {
+      // Step 1.
+      const selectedNames = Array.from(knownEl.querySelectorAll('input:checked')).map((c) => c.value);
+      ipcRenderer.send('identity:submit', {
+        token: params.get('token'),
+        selectedNames,
+        newNames: document.getElementById('names').value,
+        self: document.getElementById('self').value,
+        scope: selectedScope(),
+      });
+    } else {
+      // Step 2.
+      const voices = Array.from(voiceChoices.entries()).map(([voiceIndex, name]) => ({ voiceIndex, name }));
+      ipcRenderer.send('identity:submit-voices', { token: params.get('token'), voices });
+    }
   }
   function skip() {
-    ipcRenderer.send('identity:skip', { token: params.get('token') });
+    if (document.getElementById('step2').style.display === 'none') {
+      ipcRenderer.send('identity:skip', { token: params.get('token') });
+    } else {
+      ipcRenderer.send('identity:later', { token: params.get('token') });
+    }
   }
 
   document.getElementById('save').addEventListener('click', save);
   document.getElementById('skip').addEventListener('click', skip);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') skip();
-    // Enter submits from either field; Shift+Enter keeps its meaning in the
-    // textarea, which is where a second name goes.
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
+    if (e.key === 'Enter' && !e.shiftKey && document.activeElement.tagName !== 'TEXTAREA') { e.preventDefault(); save(); }
   });
+
+  // Reopened from the tray directly onto step 2 (SAA-195, SAA-197): step 1
+  // already happened for this capture, so skip straight to the waiting/
+  // ready state with whatever naming data already exists on disk.
+  const startStep = params.get('startStep');
+  if (startStep === '2') {
+    showStep2Waiting();
+    let namingData = null;
+    try { namingData = JSON.parse(params.get('namingData') || 'null'); } catch { namingData = null; }
+    if (namingData) renderVoices(namingData);
+  }
+
+  ipcRenderer.send('identity:resize', { token: params.get('token'), height: measuredHeight() });
 </script>
 </body>
 </html>

@@ -21,6 +21,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
+import { generateVoiceNamingData, type ClipRange } from "./voice-clips.js";
 
 // Not imported from ingest/identity.ts, which declares the same two
 // strings: identity.ts imports isVoiceLabel from this file for its
@@ -45,6 +46,7 @@ type DiarizeVoice = {
   sourceLabel: string;
   totalSeconds: number;
   embedding: number[];
+  clipRanges: ClipRange[];
 };
 
 // voiceIndex is null for a diarized segment that exists but was excluded
@@ -253,6 +255,11 @@ export async function runDiarizationForCapture(
     );
   }
 
+  // Populated inside the transaction, read after it commits — by
+  // generateVoiceNamingData, which needs each voice's real speakers.id and
+  // must not run until the split it depends on has actually landed.
+  let speakerIdByVoiceOut = new Map<number, string>();
+
   await db.transaction(async (tx) => {
     // Voice embeddings (sidecar.voices[*].embedding) stay on the Mac, in
     // diarize-<stem>.json, and go no further (SAA-194, addition 2). `db`
@@ -304,7 +311,23 @@ export async function runDiarizationForCapture(
     if (!anySegmentKeptOnThem) {
       await tx.delete(schema.speakers).where(eq(schema.speakers.id, them[0].id));
     }
+
+    speakerIdByVoiceOut = speakerIdByVoice;
   });
+
+  // Best-effort, same posture as the diarize tool call above: a naming-data
+  // failure (ffmpeg missing, disk full, whatever) must not undo the split
+  // that already committed above, and must not fail the capture (SAA-195).
+  try {
+    await generateVoiceNamingData(
+      dir, stem,
+      sidecar.voices.map((v) => ({ voiceIndex: v.voiceIndex, clipRanges: v.clipRanges })),
+      speakerIdByVoiceOut,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(`diarize: naming data generation failed (split still applied): ${message}`);
+  }
 
   return {
     applied: true,

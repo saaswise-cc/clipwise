@@ -165,6 +165,73 @@ function writeAnswer(dir, doc) {
     return finalPath;
 }
 
+// --- step 2: naming the voices (SAA-195) -----------------------------------
+
+const VOICE_NAMES_VERSION = 1;
+
+// `voices` is [{ voiceIndex, name }], name null/absent for "Not sure" —
+// SAA-165's correct-or-absent rule again, same as guests above: never a
+// fallback name of any kind.
+function buildVoiceNamesDoc({ stem, recordingId, voices, answeredAt }) {
+    return {
+        voice_names_version: VOICE_NAMES_VERSION,
+        recording_id: recordingId,
+        stem,
+        answered_at: answeredAt || new Date().toISOString(),
+        voices: (voices || []).map(v => ({
+            voiceIndex: v.voiceIndex,
+            name: v.name || null,
+        })),
+    };
+}
+
+// Same write-to-temp-then-rename durability as writeAnswer above, and a
+// different filename (voice-names-<stem>.json, not identity-<stem>.json) so
+// the two answers — who was on the call, and who's speaking — never collide
+// and either can arrive without the other existing yet.
+function writeVoiceNamesAnswer(dir, doc) {
+    const finalPath = path.join(dir, `voice-names-${doc.stem}.json`);
+    const tmpPath = `${finalPath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(doc, null, 2) + '\n');
+    fs.renameSync(tmpPath, finalPath);
+    return finalPath;
+}
+
+// The naming-data file the server writes (voice-clips.ts) once diarize
+// splits a recording — clip paths and longest lines per voice. Read here,
+// not derived: main.js has no database access, the same reason
+// identity-<stem>.json exists as a file rather than a query.
+function readNamingData(dir, stem) {
+    const p = path.join(dir, `voices-${stem}.json`);
+    try {
+        return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+// A capture has voices waiting to be named when the server produced naming
+// data for it and nobody has answered yet. Both facts are files on disk —
+// main.js has no other way to know either one.
+function pendingVoiceNamingStems(dir) {
+    let files;
+    try {
+        files = fs.readdirSync(dir);
+    } catch {
+        return [];
+    }
+    const stems = [];
+    for (const file of files) {
+        const m = /^voices-(.+)\.json$/.exec(file);
+        if (!m) continue;
+        const stem = m[1];
+        if (files.includes(`voice-names-${stem}.json`)) continue; // already answered
+        stems.push(stem);
+    }
+    stems.sort();
+    return stems;
+}
+
 module.exports = {
     IDENTITY_VERSION,
     IDENTITY_WINDOW,
@@ -174,4 +241,9 @@ module.exports = {
     mergeGuestNames,
     buildAnswerDoc,
     writeAnswer,
+    VOICE_NAMES_VERSION,
+    buildVoiceNamesDoc,
+    writeVoiceNamesAnswer,
+    readNamingData,
+    pendingVoiceNamingStems,
 };

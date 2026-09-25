@@ -88,7 +88,10 @@ type Segment = {
   speakerLabel: string | null;
 };
 
-async function loadSegments(recordingId: string): Promise<Segment[]> {
+// Exported for SAA-195's own check (a named voice's displayName must pass
+// through unchanged; only an unnamed "Voice N" collapses to "them") to call
+// the real function rather than a re-implementation of its query.
+export async function loadSegments(recordingId: string): Promise<Segment[]> {
   const rows = await db
     .select({
       orderIndex: schema.segments.orderIndex,
