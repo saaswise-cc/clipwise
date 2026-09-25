@@ -268,6 +268,11 @@
   // startNames query param.
   let guestNames = [];
   try { guestNames = JSON.parse(params.get('startNames') || '[]'); } catch { guestNames = []; }
+  // The names already saved for this call, for "Rename voices…" — keys are
+  // voiceIndex as strings (JSON object keys), values the current name or
+  // null. Empty for ordinary first-time naming.
+  let currentNames = {};
+  try { currentNames = JSON.parse(params.get('currentNames') || '{}'); } catch { currentNames = {}; }
   // voiceIndex -> chosen name (string) | null ("Not sure")
   const voiceChoices = new Map();
   // voiceIndex -> which clip index Play is currently on
@@ -310,7 +315,13 @@
     const container = document.getElementById('voices');
     container.innerHTML = '';
     for (const voice of namingData.voices) {
-      voiceChoices.set(voice.voiceIndex, null);
+      // "Rename voices…" pre-fill: the name this voice already has, or null
+      // if it's still unnamed. Ordinary first-time naming never has an
+      // entry here, so this is always null then.
+      const existingName = Object.prototype.hasOwnProperty.call(currentNames, voice.voiceIndex)
+        ? currentNames[voice.voiceIndex]
+        : null;
+      voiceChoices.set(voice.voiceIndex, existingName);
       const card = document.createElement('div');
       card.className = 'voice-card';
       card.dataset.voice = String(voice.voiceIndex);
@@ -352,7 +363,6 @@
       someoneElseOpt.value = '__someone_else__';
       someoneElseOpt.textContent = 'Someone else…';
       select.appendChild(someoneElseOpt);
-      select.value = '__not_sure__';
 
       const someoneElseField = document.createElement('div');
       someoneElseField.className = 'someone-else';
@@ -361,6 +371,18 @@
       someoneElseInput.spellcheck = false;
       someoneElseInput.placeholder = 'Full name';
       someoneElseField.appendChild(someoneElseInput);
+
+      // Pre-fill from the existing name (Rename), or default to "Not sure"
+      // (ordinary first-time naming, existingName always null).
+      if (existingName && guestNames.some((n) => n.toLowerCase() === existingName.toLowerCase())) {
+        select.value = existingName;
+      } else if (existingName) {
+        select.value = '__someone_else__';
+        someoneElseField.classList.add('shown');
+        someoneElseInput.value = existingName;
+      } else {
+        select.value = '__not_sure__';
+      }
 
       select.addEventListener('change', () => {
         if (select.value === '__someone_else__') {
@@ -402,6 +424,24 @@
     showStep2Waiting();
   });
   ipcRenderer.on('identity:step2-ready', (_event, namingData) => renderVoices(namingData));
+
+  // The main process decided to stop waiting (SAA-195 fix, 2026-09-25):
+  // nothing to name, or diarize/the pipeline failed before it could run.
+  // Shown for a few seconds, then main.js closes this window on its own —
+  // nothing here needs to act further, just stop looking like it's still
+  // waiting.
+  ipcRenderer.on('identity:step2-stopped', (_event, payload) => {
+    document.getElementById('waiting').style.display = 'none';
+    document.getElementById('voices').innerHTML = '';
+    const message = document.createElement('div');
+    message.id = 'waiting';
+    message.style.display = 'block';
+    message.textContent = (payload && payload.message) || "Couldn't separate the voices on this call.";
+    document.getElementById('step2').appendChild(message);
+    document.getElementById('save').disabled = true;
+    document.getElementById('skip').disabled = true;
+    resize();
+  });
 
   function save() {
     if (document.getElementById('step2').style.display === 'none') {

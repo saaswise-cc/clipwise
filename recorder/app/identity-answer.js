@@ -171,8 +171,12 @@ const VOICE_NAMES_VERSION = 1;
 
 // `voices` is [{ voiceIndex, name }], name null/absent for "Not sure" —
 // SAA-165's correct-or-absent rule again, same as guests above: never a
-// fallback name of any kind.
-function buildVoiceNamesDoc({ stem, recordingId, voices, answeredAt }) {
+// fallback name of any kind. `rename` is set only by the "Rename voices…"
+// reopen (the most recent named call only) — server/src/ingest/voice-
+// names.ts's applyVoiceNames reads it to decide whether an already-named
+// voice may be overwritten or cleared; ordinary first-time naming never
+// sets it.
+function buildVoiceNamesDoc({ stem, recordingId, voices, answeredAt, rename }) {
     return {
         voice_names_version: VOICE_NAMES_VERSION,
         recording_id: recordingId,
@@ -182,6 +186,7 @@ function buildVoiceNamesDoc({ stem, recordingId, voices, answeredAt }) {
             voiceIndex: v.voiceIndex,
             name: v.name || null,
         })),
+        ...(rename ? { rename: true } : {}),
     };
 }
 
@@ -203,6 +208,18 @@ function writeVoiceNamesAnswer(dir, doc) {
 // identity-<stem>.json exists as a file rather than a query.
 function readNamingData(dir, stem) {
     const p = path.join(dir, `voices-${stem}.json`);
+    try {
+        return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+// The answer already on file for a capture, if any — read here so the
+// "Rename voices…" reopen can pre-select each voice's current name rather
+// than starting from "Not sure" again.
+function readVoiceNamesAnswer(dir, stem) {
+    const p = path.join(dir, `voice-names-${stem}.json`);
     try {
         return JSON.parse(fs.readFileSync(p, 'utf8'));
     } catch {
@@ -232,6 +249,26 @@ function pendingVoiceNamingStems(dir) {
     return stems;
 }
 
+// The newest capture that already has a saved voice-names answer — the one
+// and only "Rename voices…" candidate (SAA-195: only one call gets this
+// item, never a list of past calls).
+function mostRecentNamedStem(dir) {
+    let files;
+    try {
+        files = fs.readdirSync(dir);
+    } catch {
+        return null;
+    }
+    const stems = [];
+    for (const file of files) {
+        const m = /^voice-names-(.+)\.json$/.exec(file);
+        if (m) stems.push(m[1]);
+    }
+    if (stems.length === 0) return null;
+    stems.sort();
+    return stems[stems.length - 1];
+}
+
 module.exports = {
     IDENTITY_VERSION,
     IDENTITY_WINDOW,
@@ -246,4 +283,6 @@ module.exports = {
     writeVoiceNamesAnswer,
     readNamingData,
     pendingVoiceNamingStems,
+    readVoiceNamesAnswer,
+    mostRecentNamedStem,
 };

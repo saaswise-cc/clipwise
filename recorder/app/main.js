@@ -20,7 +20,9 @@ const {
     IDENTITY_WINDOW, contentHeightFor, knownGuestNames, mergeGuestNames,
     buildAnswerDoc, writeAnswer,
     buildVoiceNamesDoc, writeVoiceNamesAnswer, readNamingData, pendingVoiceNamingStems,
+    readVoiceNamesAnswer, mostRecentNamedStem,
 } = require('./identity-answer.js');
+const { stopMessageFor } = require('./voice-naming-wait.js');
 const { loadAppScope, scopeForKey } = require('./app-scope.js');
 
 // --- constants ------------------------------------------------------------
@@ -192,6 +194,15 @@ const APPLY_VOICE_NAMES_ENTRY = path.join(SERVER_DIR, 'src', 'pipeline', 'apply-
 // just diarize. 3s keeps the wait itself cheap without polling pointlessly
 // often.
 const VOICE_NAMING_POLL_MS = 3000;
+// Hard cap on step 2's wait (SAA-195 fix, 2026-09-25): past this, waiting
+// stops being a reasonable thing to ask of an open window. Treated exactly
+// as Later — silent, no message, since giving up is a patience limit, not
+// a fact about the call. If diarize finishes after this, its naming-data
+// file just sits on disk until the "Name N voices…" tray item picks it up.
+const VOICE_NAMING_WAIT_CAP_MS = 15 * 60 * 1000;
+// How long a stop message ("nothing to name" / "couldn't separate") stays
+// on screen before the window closes itself.
+const VOICE_NAMING_STOP_MESSAGE_MS = 5000;
 
 // The identity prompt's page, and the file that remembers what the person
 // answering is called. The name is asked for once and reused; it is never
@@ -812,7 +823,16 @@ function stemRelativeTime(stem) {
 // data it needs (the guest roster from step 1, the naming data from
 // diarize) is already sitting on disk, so there is no waiting state to
 // show.
-function reopenVoiceNaming(stem) {
+// opts.rename: true reopens the most recent named call's answer for
+// correction (SAA-195's "Rename voices…" item) rather than a first-time
+// naming — pre-fills each voice's current name and tags the eventual save
+// so applyVoiceNames knows it may overwrite (see voice-names.ts).
+//
+// A menu bar item must never be a dead end (SAA-195 fix, 2026-09-25):
+// every failure path below now either proceeds with a safe fallback (no
+// identity-<stem>.json — an empty guest list, so only "Someone else…" and
+// "Not sure" are offered) or shows a notification. None fail silently.
+function reopenVoiceNaming(stem, opts = {}) {
     if (identityWindow) {
         // Only one identity window is ever shown at a time today. Bringing
         // the existing one forward is a plainer answer than queueing a
@@ -822,18 +842,37 @@ function reopenVoiceNaming(stem) {
     }
     let recordingId = null;
     let guestNames = [];
-    try {
-        const doc = JSON.parse(fs.readFileSync(path.join(OUTDIR, `identity-${stem}.json`), 'utf8'));
-        recordingId = doc.recording_id || null;
-        guestNames = (doc.guests || []).map((g) => g.name).filter(Boolean);
-    } catch (err) {
-        console.error(`voice-names: could not read identity-${stem}.json to reopen naming: ${String(err)}`);
-        return;
+    const identityPath = path.join(OUTDIR, `identity-${stem}.json`);
+    if (fs.existsSync(identityPath)) {
+        try {
+            const doc = JSON.parse(fs.readFileSync(identityPath, 'utf8'));
+            recordingId = doc.recording_id || null;
+            guestNames = (doc.guests || []).map((g) => g.name).filter(Boolean);
+        } catch (err) {
+            console.error(`voice-names: identity-${stem}.json exists but could not be read: ${String(err)}`);
+            notify('Clipwise: could not reopen naming',
+                `Naming the voices on ${stem} could not be reopened — the identity answer is unreadable.`);
+            return;
+        }
     }
+    // else: identity was skipped for this capture. Proceeds with an empty
+    // guestNames rather than failing — step 2 still works, just with no
+    // roster to pick from.
+
     const namingData = readNamingData(OUTDIR, stem);
     if (!namingData) {
         console.error(`voice-names: no naming data for ${stem} — nothing to reopen`);
+        notify('Clipwise: could not reopen naming',
+            `Naming the voices on ${stem} could not be reopened — the naming data is missing.`);
         return;
+    }
+
+    let currentNames = {};
+    if (opts.rename) {
+        const existing = readVoiceNamesAnswer(OUTDIR, stem);
+        if (existing && Array.isArray(existing.voices)) {
+            for (const v of existing.voices) currentNames[v.voiceIndex] = v.name || null;
+        }
     }
 
     let win;
@@ -853,11 +892,13 @@ function reopenVoiceNaming(stem) {
         });
     } catch (err) {
         console.error(`voice-names: could not reopen the naming window: ${String(err)}`);
+        notify('Clipwise: could not reopen naming', `Naming the voices on ${stem} could not be reopened.`);
         return;
     }
     identityWindow = {
         win, capture: { stem, token: randomUUID(), recordingId },
         step: 2, resolved: false, fromQueue: false, pollTimer: null, shown: false,
+        isRename: Boolean(opts.rename),
     };
     const reveal = () => {
         if (!identityWindow || identityWindow.win !== win || identityWindow.shown) return;
@@ -884,9 +925,12 @@ function reopenVoiceNaming(stem) {
             startStep: '2',
             startNames: JSON.stringify(guestNames),
             namingData: JSON.stringify(namingData),
+            currentNames: JSON.stringify(currentNames),
         },
     }).catch((err) => {
         console.error(`voice-names: naming window failed to load: ${String(err)}`);
+        notify('Clipwise: could not reopen naming', `Naming the voices on ${stem} could not be reopened.`);
+        identityWindow = null;
         try { win.close(); } catch {}
     });
 }
@@ -972,6 +1016,19 @@ function renderTray() {
                 click: () => reopenVoiceNaming(stem),
             });
         }
+    }
+    // "Rename voices…" (SAA-195): the most recent named call only, never a
+    // list of past ones. Independent of the pending block above — a call
+    // can only appear in one or the other, never both, since
+    // mostRecentNamedStem requires a saved voice-names answer and
+    // pendingVoiceNamingStems excludes any stem that has one.
+    const renameStem = mostRecentNamedStem(OUTDIR);
+    if (renameStem) {
+        items.push({ type: 'separator' });
+        items.push({
+            label: `Rename voices… — ${stemRelativeTime(renameStem)}`,
+            click: () => reopenVoiceNaming(renameStem, { rename: true }),
+        });
     }
     items.push(
         { type: 'separator' },
@@ -1861,6 +1918,55 @@ function resolveIdentityWindow() {
     if (identityWindow.fromQueue) identityQueue.shift();
 }
 
+// The pipeline's own per-step record (run-capture.ts's pipeline-<stem>.json)
+// — read directly, no database access, same reason every other file this
+// process reads is a file.
+function readPipelineSidecar(dir, stem) {
+    try {
+        return JSON.parse(fs.readFileSync(path.join(dir, `pipeline-${stem}.json`), 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+// Step 2's wait, with a stop (SAA-195 fix, 2026-09-25). Every tick: naming
+// data found -> show it. Otherwise, stopMessageFor (voice-naming-wait.js —
+// see its own comment for exactly which pipeline-record fields it reads)
+// decides whether to give up and why.
+function beginNamingDataWait(capture) {
+    const startedAt = Date.now();
+    identityWindow.pollTimer = setInterval(() => {
+        if (!identityWindow || identityWindow.capture.token !== capture.token) return;
+
+        const data = readNamingData(OUTDIR, capture.stem);
+        if (data) {
+            clearInterval(identityWindow.pollTimer);
+            identityWindow.pollTimer = null;
+            identityWindow.win.webContents.send('identity:step2-ready', data);
+            return;
+        }
+
+        const sidecar = readPipelineSidecar(OUTDIR, capture.stem);
+        const stopMessage = stopMessageFor(sidecar);
+
+        if (stopMessage) {
+            clearInterval(identityWindow.pollTimer);
+            identityWindow.pollTimer = null;
+            identityWindow.win.webContents.send('identity:step2-stopped', { message: stopMessage });
+            setTimeout(() => {
+                if (identityWindow && identityWindow.capture.token === capture.token) finishIdentityWindow();
+            }, VOICE_NAMING_STOP_MESSAGE_MS);
+            return;
+        }
+
+        if (Date.now() - startedAt > VOICE_NAMING_WAIT_CAP_MS) {
+            clearInterval(identityWindow.pollTimer);
+            identityWindow.pollTimer = null;
+            finishIdentityWindow();
+        }
+    }, VOICE_NAMING_POLL_MS);
+}
+
 function pumpIdentityQueue() {
     if (identityWindow || identityQueue.length === 0) return;
     const capture = identityQueue[0];
@@ -2047,13 +2153,7 @@ function registerIdentityIpc() {
         // (well after transcribe and ingest) will eventually produce.
         identityWindow.step = 2;
         identityWindow.win.webContents.send('identity:show-step2', { guestNames: names });
-        identityWindow.pollTimer = setInterval(() => {
-            const data = readNamingData(OUTDIR, capture.stem);
-            if (!data) return;
-            clearInterval(identityWindow.pollTimer);
-            identityWindow.pollTimer = null;
-            identityWindow.win.webContents.send('identity:step2-ready', data);
-        }, VOICE_NAMING_POLL_MS);
+        beginNamingDataWait(capture);
     });
 
     ipcMain.on('identity:submit-voices', (_event, payload) => {
@@ -2063,6 +2163,11 @@ function registerIdentityIpc() {
             stem: capture.stem,
             recordingId: capture.recordingId,
             voices: Array.isArray(payload.voices) ? payload.voices : [],
+            // A new answered_at every save (buildVoiceNamesDoc's default),
+            // even on a rename of the same stem — that's what lets
+            // voiceNamesAlreadyApplied's guard see this as a new answer to
+            // apply rather than the one already on record.
+            rename: identityWindow && identityWindow.isRename === true,
         });
         try {
             const finalPath = writeVoiceNamesAnswer(OUTDIR, doc);

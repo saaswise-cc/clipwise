@@ -26,10 +26,17 @@ export type VoiceNamesAnswer = {
   stem?: string;
   answered_at?: string;
   voices?: VoiceNameEntry[] | null;
+  // Set only by the "Rename voices…" reopen (SAA-195, most-recent-named-
+  // call only). Ordinary first-time naming never sets this, and
+  // applyVoiceNames' already-named skip stays exactly as before for it —
+  // see the function's own comment for what changes when this is true.
+  rename?: boolean;
 };
 
 export type VoiceNamingApplication = {
-  applied: Array<{ voiceIndex: number; displayName: string; personId: string | null }>;
+  // displayName is null for a rename-to-"Not sure": an intentional clear,
+  // not a skip — the entry did change, just to no name.
+  applied: Array<{ voiceIndex: number; displayName: string | null; personId: string | null }>;
   skipped: Array<{ voiceIndex: number; reason: string }>;
 };
 
@@ -98,7 +105,15 @@ export async function storeVoiceNamesMetadata(
 // typed name that matches no attendee gets displayName only, exactly the
 // same no-invented-person rule applySpeakerNames already uses. Never
 // overwrites an existing displayName — a hand correction or an earlier
-// pass wins, the same reasoning applySpeakerNames uses for `them`.
+// pass wins, the same reasoning applySpeakerNames uses for `them` — UNLESS
+// answer.rename is set (SAA-195's "Rename voices..." item, the most recent
+// named call only). Checked before making this change: yes, this function
+// unconditionally skipped any voice whose speakers.displayName was already
+// set, for every caller -- there was no path that could ever overwrite a
+// name. rename changes that only here: an existing name is overwritten
+// with a new one, and a voice renamed to "Not sure" is actively cleared
+// (displayName and person_id both set back to null) rather than left as
+// whatever it was -- nothing is kept from the old name either way.
 export async function applyVoiceNames(
   executor: typeof db | Tx,
   recordingId: string,
@@ -123,6 +138,8 @@ export async function applyVoiceNames(
     if (key) attendeeByName.set(key, a.personId);
   }
 
+  const isRename = answer.rename === true;
+
   for (const entry of entries) {
     const label = voiceLabel(entry.voiceIndex);
     const speaker = speakers.find((s) => s.label === label);
@@ -132,10 +149,21 @@ export async function applyVoiceNames(
     }
     const name = clean(entry.name);
     if (!name) {
+      if (isRename && speaker.displayName) {
+        // Renamed to "Not sure": an active clear, not the ordinary "leave
+        // it unnamed" skip below — the old name and its person_id are both
+        // dropped, nothing carried forward.
+        await executor
+          .update(schema.speakers)
+          .set({ displayName: null, personId: null })
+          .where(eq(schema.speakers.id, speaker.id));
+        application.applied.push({ voiceIndex: entry.voiceIndex, displayName: null, personId: null });
+        continue;
+      }
       application.skipped.push({ voiceIndex: entry.voiceIndex, reason: "marked not sure — left unnamed" });
       continue;
     }
-    if (speaker.displayName) {
+    if (speaker.displayName && !isRename) {
       application.skipped.push({
         voiceIndex: entry.voiceIndex,
         reason: `already named ${JSON.stringify(speaker.displayName)}`,
@@ -154,7 +182,7 @@ export async function applyVoiceNames(
 
 export function describeVoiceNaming(application: VoiceNamingApplication): string {
   const applied = application.applied.length
-    ? application.applied.map((a) => `Voice${a.voiceIndex}→${a.displayName}`).join(", ")
+    ? application.applied.map((a) => `Voice${a.voiceIndex}→${a.displayName ?? "(cleared)"}`).join(", ")
     : "none";
   const skipped = application.skipped.length
     ? ` skipped=${application.skipped.map((s) => `Voice${s.voiceIndex} (${s.reason})`).join(", ")}`
